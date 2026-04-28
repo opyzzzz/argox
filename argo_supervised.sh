@@ -17,13 +17,12 @@ TOKENF="$WORKDIR/token"
 mkdir -p $WORKDIR
 
 # ==========================
-# 系统环境修复 (DNS & IPv6)
+# 系统环境修复 (DNS / 时间 / 网络)
 # ==========================
 fix_network_env() {
-    echo "[+] 正在优化网络与 DNS 环境..."
+    echo "[+] 正在优化网络环境..."
     
-    # 1. 修复/补全 DNS 配置 (防止 [::1]:53 拒绝连接)
-    # 强制增加公共 DNS，确保同时支持 v4 和 v6 解析
+    # 1. 修复 DNS 配置 (防止 [::1]:53 拒绝连接)
     cat > /etc/resolv.conf << EN_DNS
 nameserver 8.8.8.8
 nameserver 1.1.1.1
@@ -31,14 +30,31 @@ nameserver 2001:4860:4860::8888
 nameserver 2606:4700:4700::1111
 EN_DNS
 
-    # 2. 等待网络完全就绪
-    echo "[+] 等待网络连接..."
+    # 2. 等待网络完全就绪 (最长等待 30 秒)
     local retry=0
     while ! ping -c 1 -W 2 google.com >/dev/null 2>&1; do
         retry=$((retry + 1))
-        [ $retry -gt 15 ] && break
+        [ $retry -gt 15 ] && { echo "[-] 网络连接超时"; break; }
+        echo "[...] 等待网络连接 ($retry/15)"
         sleep 2
     done
+
+    # 3. 时间校准 (TLS 握手必须)
+    sync_time
+}
+
+sync_time() {
+    echo "[+] 正在同步系统时间..."
+    # 确保安装了 chrony
+    if ! command -v chronyd >/dev/null 2>&1; then
+        apk add --no-cache chrony >/dev/null 2>&1
+    fi
+    
+    # 停止服务模式，强制执行单次同步
+    # 使用多个 NTP 服务器以提高成功率
+    chronyd -q 'server pool.ntp.org iburst' 'server time.apple.com iburst' 'server ntp.aliyun.com iburst' >/dev/null 2>&1
+    
+    echo "[!] 当前系统时间: $(date)"
 }
 
 # ==========================
@@ -46,7 +62,7 @@ EN_DNS
 # ==========================
 install_base(){
     echo "[+] 安装必要依赖..."
-    apk add --no-cache curl wget unzip bash procps >/dev/null 2>&1
+    apk add --no-cache curl wget unzip bash procps chrony >/dev/null 2>&1
 }
 
 gen_uuid(){ [ ! -f $UUIDF ] && cat /proc/sys/kernel/random/uuid > $UUIDF; }
@@ -114,7 +130,6 @@ run_xray(){
 run_argo(){
     if ! pgrep -x "cloudflared" > /dev/null; then
         token=$(cat $TOKENF)
-        # 优化启动参数：自动检测IP版本，增加心跳间隔防止断连
         nohup $CF tunnel --no-autoupdate \
             --edge-ip-version auto \
             --protocol http2 \
@@ -135,13 +150,12 @@ stop_all(){
 # 保活 & 开机自启
 # ==========================
 keep_alive(){
-    fix_network_env # 保活检查时顺便检查网络
+    fix_network_env
     pgrep -x "xray" > /dev/null || run_xray
     pgrep -x "cloudflared" > /dev/null || run_argo
 }
 
 create_service(){
-    # 写入 OpenRC 脚本
     cat > /etc/init.d/argo <<EOS
 #!/sbin/openrc-run
 description="Argo with Xray Service"
@@ -152,7 +166,6 @@ depend() {
 
 start() {
     ebegin "Starting Argo"
-    # 执行脚本的启动命令
     /root/argo.sh start
     eend \$?
 }
@@ -166,7 +179,6 @@ EOS
     chmod +x /etc/init.d/argo
     rc-update add argo default >/dev/null 2>&1
 
-    # 写入 Crontab 保活 (每分钟检查)
     if ! crontab -l 2>/dev/null | grep -q "argo.sh cron"; then
         (crontab -l 2>/dev/null; echo "* * * * * /root/argo.sh cron") | crontab -
     fi
@@ -202,7 +214,8 @@ menu(){
     echo "3. 启动服务"
     echo "4. 停止服务"
     echo "5. 查看日志"
-    echo "6. 卸载"
+    echo "6. 强制同步时间"
+    echo "7. 卸载"
     echo "0. 退出"
     read -p "选择: " n
     case "$n" in
@@ -211,7 +224,8 @@ menu(){
         3) fix_network_env; run_xray; run_argo ;;
         4) stop_all ;;
         5) tail -f $WORKDIR/argo.log ;;
-        6) stop_all; rc-update del argo; crontab -l | grep -v "argo.sh cron" | crontab -; rm -rf $WORKDIR; rm -f /etc/init.d/argo; echo "已卸载" ;;
+        6) sync_time ;;
+        7) stop_all; rc-update del argo; crontab -l | grep -v "argo.sh cron" | crontab -; rm -rf $WORKDIR; rm -f /etc/init.d/argo; echo "已卸载" ;;
         0) exit ;;
     esac
 }
