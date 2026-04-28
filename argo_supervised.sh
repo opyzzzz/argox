@@ -15,7 +15,7 @@ CF_WRAP="$WORKDIR/cf.sh"
 mkdir -p "$WORKDIR"
 
 install_base(){
-  apk add --no-cache curl wget unzip >/dev/null 2>&1
+  apk add --no-cache curl wget unzip iputils busybox-suid >/dev/null 2>&1
 }
 
 gen_uuid(){
@@ -43,12 +43,12 @@ set_token(){
 }
 
 download_cf(){
-  wget -O "$CF" https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+  wget -q -O "$CF" https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
   chmod +x "$CF"
 }
 
 download_xray(){
-  wget -O "$WORKDIR/x.zip" https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+  wget -q -O "$WORKDIR/x.zip" https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
   unzip -o "$WORKDIR/x.zip" -d "$WORKDIR" >/dev/null 2>&1
   chmod +x "$XRAY"
 }
@@ -98,10 +98,11 @@ depend() {
 EOF
 
 # cloudflared
-cat > /etc/init.d/argo-cf <<EOF
+cat > /etc/init.d/argo-cf <<'EOF'
 #!/sbin/openrc-run
+
 name="argo-cf"
-command="$CF_WRAP"
+command="/root/argo/cf.sh"
 command_background=true
 pidfile="/run/argo-cf.pid"
 
@@ -113,12 +114,35 @@ depend() {
   need net
   after argo-xray
 }
+
+start_pre() {
+  ebegin "等待 IPv6 网络"
+
+  for i in $(seq 1 30); do
+    ping6 -c1 -W1 2606:4700:4700::1111 >/dev/null 2>&1 && break
+    sleep 2
+  done
+
+  eend 0
+}
 EOF
 
 chmod +x /etc/init.d/argo-*
 
 rc-update add argo-xray default >/dev/null 2>&1
 rc-update add argo-cf default >/dev/null 2>&1
+}
+
+setup_cron(){
+
+# 防重复写入
+crontab -l 2>/dev/null | grep -q "argo-cf" && return
+
+(
+crontab -l 2>/dev/null
+echo "* * * * * ping6 -c1 2606:4700:4700::1111 >/dev/null 2>&1 || rc-service argo-cf restart"
+echo "* * * * * pgrep cloudflared >/dev/null 2>&1 || rc-service argo-cf restart"
+) | crontab -
 }
 
 start_all(){
@@ -157,6 +181,7 @@ install_all(){
   write_conf
   write_wrapper
   create_services
+  setup_cron
   start_all
 
   show_info
@@ -174,7 +199,7 @@ read -p "选择: " n
 case "$n" in
 1) show_info ;;
 2) start_all ;;
-3) tail -f $WORKDIR/argo.log ;;
+3) tail -f /root/argo/argo.log ;;
 esac
 }
 
