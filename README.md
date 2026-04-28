@@ -1,3 +1,3 @@
 `````
-(curl -LfsS https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/argo_supervised.sh -o /usr/local/bin/sb || wget -q https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/argo_supervised.sh -O /usr/local/bin/sb) && chmod +x /usr/local/bin/sb && sb
+wget -O /root/argo.sh https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/argo_supervised.sh && chmod +x /root/argo.sh && sh /root/argo.sh install
 `````
