@@ -1,6 +1,9 @@
-#!/bin/sh
-set -eu
+cat > /root/argo.sh << 'EOF'
+#!/bin/bash
 
+# ==========================
+# 变量定义
+# ==========================
 WORKDIR="/root/argo"
 CF="$WORKDIR/cloudflared"
 XRAY="$WORKDIR/xray"
@@ -11,439 +14,231 @@ PORTF="$WORKDIR/port"
 DOMAINF="$WORKDIR/domain"
 TOKENF="$WORKDIR/token"
 
-CF_WRAP="$WORKDIR/cf.sh"
-XRAY_WRAP="$WORKDIR/xray.sh"
-CF_LOG="$WORKDIR/argo.log"
-XRAY_LOG="$WORKDIR/xray.log"
-DNSFIX_LOG="$WORKDIR/dnsfix.log"
+# 创建目录
+mkdir -p $WORKDIR
 
-XRAY_SERVICE="/etc/init.d/argo-xray"
-CF_SERVICE="/etc/init.d/argo-cf"
-DNSFIX_SERVICE="/etc/init.d/argo-dnsfix"
-
-mkdir -p "$WORKDIR"
-umask 077
-
-need_root() {
-  [ "$(id -u)" -eq 0 ] || {
-    echo "请用 root 执行"
-    exit 1
-  }
+# ==========================
+# 基础工具安装
+# ==========================
+install_base(){
+    echo "[+] 安装基础依赖..."
+    apk add --no-cache curl wget unzip bash procps >/dev/null 2>&1
 }
 
-detect_arch() {
-  case "$(uname -m)" in
-    x86_64|amd64)
-      return 0
-      ;;
-    *)
-      echo "此脚本当前按 x86_64/amd64 编写，其他架构请同步调整下载地址。"
-      exit 1
-      ;;
-  esac
+# ==========================
+# 配置逻辑
+# ==========================
+gen_uuid(){
+    [ ! -f $UUIDF ] && cat /proc/sys/kernel/random/uuid > $UUIDF
 }
 
-install_base() {
-  apk add --no-cache curl wget unzip iputils busybox-suid ca-certificates >/dev/null 2>&1
+set_port(){
+    read -p "请输入本地端口 (默认8080): " p
+    [ -z "$p" ] && p=8080
+    echo $p > $PORTF
 }
 
-gen_uuid() {
-  [ -s "$UUIDF" ] || cat /proc/sys/kernel/random/uuid > "$UUIDF"
+set_domain(){
+    read -p "请输入域名 (必须已接入CF): " d
+    [ -z "$d" ] && echo "域名不能为空" && exit 1
+    echo $d > $DOMAINF
 }
 
-set_port() {
-  while :; do
-    printf "端口(默认8080): "
-    read -r p || true
-    [ -z "${p:-}" ] && p=8080
-    case "$p" in
-      ''|*[!0-9]*)
-        echo "端口必须是数字"
-        ;;
-      *)
-        echo "$p" > "$PORTF"
-        break
-        ;;
-    esac
-  done
-}
-
-set_domain() {
-  while :; do
-    printf "域名(必须已接入CF): "
-    read -r d || true
-    [ -n "${d:-}" ] && {
-      echo "$d" > "$DOMAINF"
-      break
-    }
-    echo "域名不能为空"
-  done
-}
-
-set_token() {
-  while :; do
-    echo "粘贴Tunnel Token(整段也行):"
-    read -r input || true
-    token=$(printf '%s' "${input:-}" | grep -oE '[A-Za-z0-9_-]{120,}' | head -n1 || true)
-    if [ -n "${token:-}" ]; then
-      printf '%s\n' "$token" > "$TOKENF"
-      chmod 600 "$TOKENF" || true
-      break
+set_token(){
+    echo "粘贴 Tunnel Token (支持整段复制):"
+    read input
+    token=$(echo "$input" | grep -oE '[A-Za-z0-9_-]{120,}' | head -n1)
+    if [ -z "$token" ]; then
+        echo "[-] Token 识别失败"
+        set_token
+    else
+        echo $token > $TOKENF
     fi
-    echo "Token识别失败"
-  done
 }
 
-fix_ipv6_dns() {
-  resolv="/etc/resolv.conf"
-  tmp="$WORKDIR/resolv.conf.tmp"
-
-  # 如果已经包含 IPv6 nameserver，就不重复修复
-  if [ -f "$resolv" ] && grep -qE '^nameserver[[:space:]]+[0-9A-Fa-f:]+$' "$resolv" 2>/dev/null; then
-    echo "[+] IPv6 DNS 已存在，无需修复" >> "$DNSFIX_LOG" 2>/dev/null || true
-    return 0
-  fi
-
-  : > "$tmp"
-
-  if [ -f "$resolv" ]; then
-    cat "$resolv" > "$tmp"
-  fi
-
-  grep -q '^nameserver 2606:4700:4700::1111$' "$tmp" 2>/dev/null || \
-    printf '%s\n' 'nameserver 2606:4700:4700::1111' >> "$tmp"
-
-  grep -q '^nameserver 2606:4700:4700::1001$' "$tmp" 2>/dev/null || \
-    printf '%s\n' 'nameserver 2606:4700:4700::1001' >> "$tmp"
-
-  cat "$tmp" > "$resolv"
-  chmod 644 "$resolv" 2>/dev/null || true
-  rm -f "$tmp"
-
-  echo "[+] IPv6 DNS 已修复: $resolv" | tee -a "$DNSFIX_LOG" >/dev/null
+# ==========================
+# 下载逻辑 (带校验)
+# ==========================
+download_bin(){
+    echo "[+] 正在下载组件..."
+    # 下载 Cloudflared
+    if [ ! -f "$CF" ]; then
+        wget -O $CF https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+        chmod +x $CF
+    fi
+    # 下载 Xray
+    if [ ! -f "$XRAY" ]; then
+        wget -O $WORKDIR/x.zip https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+        unzip -o $WORKDIR/x.zip -d $WORKDIR >/dev/null 2>&1
+        chmod +x $XRAY
+        rm -f $WORKDIR/x.zip
+    fi
 }
 
-download_cf() {
-  wget -q -O "$CF" "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
-  chmod +x "$CF"
-}
-
-download_xray() {
-  wget -q -O "$WORKDIR/x.zip" "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip"
-  unzip -o "$WORKDIR/x.zip" -d "$WORKDIR" >/dev/null 2>&1
-  chmod +x "$XRAY"
-}
-
-write_conf() {
-  port=$(cat "$PORTF")
-  uuid=$(cat "$UUIDF")
-
-  cat > "$CONF" <<EOF
+write_conf(){
+    port=$(cat $PORTF)
+    uuid=$(cat $UUIDF)
+    cat > $CONF <<EOC
 {
-  "inbounds": [
-    {
-      "port": $port,
-      "protocol": "vless",
-      "settings": {
-        "clients": [
-          {
-            "id": "$uuid"
-          }
-        ],
-        "decryption": "none"
-      },
-      "streamSettings": {
-        "network": "ws",
-        "wsSettings": {
-          "path": "/"
-        }
-      }
-    }
-  ],
-  "outbounds": [
-    {
-      "protocol": "freedom"
-    }
-  ]
+    "inbounds": [{
+        "port": $port, "protocol": "vless",
+        "settings": {"clients": [{"id": "$uuid"}], "decryption": "none"},
+        "streamSettings": {"network": "ws", "wsSettings": {"path": "/"}}
+    }],
+    "outbounds": [{"protocol": "freedom"}]
 }
-EOF
+EOC
 }
 
-write_wrappers() {
-  cat > "$XRAY_WRAP" <<EOF
-#!/bin/sh
-exec "$XRAY" -config "$CONF" >> "$XRAY_LOG" 2>&1
-EOF
-  chmod +x "$XRAY_WRAP"
-
-  cat > "$CF_WRAP" <<EOF
-#!/bin/sh
-exec "$CF" tunnel --no-autoupdate --edge-ip-version 6 --protocol http2 run --token "\$(cat "$TOKENF")" >> "$CF_LOG" 2>&1
-EOF
-  chmod +x "$CF_WRAP"
-}
-
-write_dnsfix_service() {
-  cat > "$DNSFIX_SERVICE" <<EOF
-#!/sbin/openrc-run
-
-description="Argo IPv6 DNS Fix"
-name="argo-dnsfix"
-command="/bin/sh /root/argo.sh fix-dns"
-supervisor=supervise-daemon
-respawn_delay=10
-respawn_max=0
-
-depend() {
-  need net
-}
-EOF
-
-  chmod +x "$DNSFIX_SERVICE"
-  rc-update add argo-dnsfix default >/dev/null 2>&1 || true
-}
-
-write_services() {
-  cat > "$XRAY_SERVICE" <<EOF
-#!/sbin/openrc-run
-
-description="Argo Xray"
-name="argo-xray"
-command="$XRAY_WRAP"
-supervisor=supervise-daemon
-respawn_delay=3
-respawn_max=0
-
-depend() {
-  need net
-}
-EOF
-
-  cat > "$CF_SERVICE" <<'EOF'
-#!/sbin/openrc-run
-
-description="Argo Cloudflared"
-name="argo-cf"
-command="/root/argo/cf.sh"
-supervisor=supervise-daemon
-respawn_delay=5
-respawn_max=0
-healthcheck_delay=30
-healthcheck_timer=60
-
-depend() {
-  need net
-  after argo-xray
-  after argo-dnsfix
-}
-
-start_pre() {
-  ebegin "等待 IPv6 网络"
-  i=0
-  while [ "$i" -lt 30 ]; do
-    if ping6 -c1 -W1 2606:4700:4700::1111 >/dev/null 2>&1; then
-      eend 0
-      return 0
+# ==========================
+# 进程管理 (关键改进)
+# ==========================
+run_xray(){
+    if ! pgrep -x "xray" > /dev/null; then
+        nohup $XRAY -config $CONF >/dev/null 2>&1 &
+        sleep 1
+        echo "[!] Xray 已启动"
     fi
-    i=$((i + 1))
-    sleep 2
-  done
-  ewarn "IPv6 未就绪，将继续尝试启动"
-  eend 0
 }
 
-healthcheck() {
-  ping6 -c1 -W1 2606:4700:4700::1111 >/dev/null 2>&1 && pgrep -x cloudflared >/dev/null 2>&1
+run_argo(){
+    if ! pgrep -x "cloudflared" > /dev/null; then
+        token=$(cat $TOKENF)
+        nohup $CF tunnel --no-autoupdate --edge-ip-version 6 --protocol http2 run --token $token > $WORKDIR/argo.log 2>&1 &
+        sleep 1
+        echo "[!] Cloudflared 已启动"
+    fi
 }
+
+stop_all(){
+    pkill -9 xray 2>/dev/null
+    pkill -9 cloudflared 2>/dev/null
+    echo "[!] 服务已停止"
+}
+
+# ==========================
+# 保活逻辑 (类似 singbox-lite)
+# ==========================
+keep_alive(){
+    # 检查 Xray
+    pgrep -x "xray" > /dev/null || run_xray
+    # 检查 Cloudflared
+    pgrep -x "cloudflared" > /dev/null || run_argo
+}
+
+# ==========================
+# 开机自启 (OpenRC)
+# ==========================
+create_service(){
+    cat > /etc/init.d/argo <<EOS
+#!/sbin/openrc-run
+description="Argo with Xray Service"
+
+depend() {
+    need net
+    after firewall
+}
+
+start() {
+    ebegin "Starting Argo Service"
+    /root/argo.sh start
+    eend \$?
+}
+
+stop() {
+    ebegin "Stopping Argo Service"
+    /root/argo.sh stop
+    eend \$?
+}
+EOS
+    chmod +x /etc/init.d/argo
+    rc-update add argo default >/dev/null 2>&1
+    
+    # 添加 Crontab 保活 (每分钟检查一次)
+    if ! crontab -l 2>/dev/null | grep -q "argo.sh cron"; then
+        (crontab -l 2>/dev/null; echo "* * * * * /root/argo.sh cron") | crontab -
+    fi
+}
+
+# ==========================
+# 信息展示
+# ==========================
+show_status(){
+    echo "--- 进程状态 ---"
+    pgrep -x "xray" >/dev/null && echo "Xray: 运行中" || echo "Xray: 已停止"
+    pgrep -x "cloudflared" >/dev/null && echo "Argo: 运行中" || echo "Argo: 已停止"
+}
+
+show_info(){
+    uuid=$(cat $UUIDF)
+    domain=$(cat $DOMAINF)
+    port=$(cat $PORTF)
+    echo -e "\n======================"
+    echo "VLESS 节点信息"
+    echo "地址: $domain"
+    echo "端口: 443"
+    echo "UUID: $uuid"
+    echo "路径: /"
+    echo "TLS: 开启"
+    echo "本地端口: $port"
+    echo "======================"
+    echo "节点链接："
+    echo "vless://$uuid@$domain:443?encryption=none&security=tls&type=ws&host=$domain&path=%2F#$domain"
+}
+
+# ==========================
+# 安装 & 菜单
+# ==========================
+install_all(){
+    install_base
+    gen_uuid
+    set_port
+    set_domain
+    set_token
+    download_bin
+    write_conf
+    create_service
+    run_xray
+    run_argo
+    show_info
+    echo "alias argo='bash /root/argo.sh menu'" >> /etc/profile
+    echo -e "\n[+] 安装完成，输入 'argo' 呼出菜单"
+}
+
+menu(){
+    clear
+    echo "===== Argo 管理菜单 ====="
+    show_status
+    echo "------------------------"
+    echo "1. 查看节点信息"
+    echo "2. 修改配置 (端口/域名/Token)"
+    echo "3. 重启服务"
+    echo "4. 停止服务"
+    echo "5. 查看 Argo 日志"
+    echo "6. 卸载"
+    echo "0. 退出"
+    read -p "选择: " n
+    case "$n" in
+        1) show_info ;;
+        2) set_port; set_domain; set_token; write_conf; stop_all; run_xray; run_argo ;;
+        3) stop_all; run_xray; run_argo ;;
+        4) stop_all ;;
+        5) tail -f $WORKDIR/argo.log ;;
+        6) stop_all; rc-update del argo; crontab -l | grep -v "argo.sh cron" | crontab -; rm -rf $WORKDIR; rm -f /etc/init.d/argo; echo "已卸载" ;;
+        0) exit ;;
+    esac
+}
+
+# 命令分发
+case "$1" in
+    install) install_all ;;
+    menu)    menu ;;
+    start)   run_xray; run_argo ;;
+    stop)    stop_all ;;
+    cron)    keep_alive ;;
+    *)       echo "用法: $0 {install|menu|start|stop|cron}" ;;
+esac
 EOF
 
-  chmod +x "$XRAY_SERVICE" "$CF_SERVICE"
-
-  rc-update add argo-xray default >/dev/null 2>&1 || true
-  rc-update add argo-cf default >/dev/null 2>&1 || true
-}
-
-ensure_crond() {
-  rc-service crond start >/dev/null 2>&1 || true
-  rc-update add crond default >/dev/null 2>&1 || true
-}
-
-setup_cron() {
-  marker="argo-cf IPv6 self-heal"
-  current="$(crontab -l 2>/dev/null || true)"
-
-  printf '%s\n' "$current" | grep -q "$marker" && return 0
-
-  {
-    printf '%s\n' "$current"
-    printf '%s\n' "# $marker"
-    printf '%s\n' '* * * * * ping6 -c1 -W1 2606:4700:4700::1111 >/dev/null 2>&1 || rc-service argo-cf restart >/dev/null 2>&1'
-    printf '%s\n' '* * * * * pgrep -x cloudflared >/dev/null 2>&1 || rc-service argo-cf restart >/dev/null 2>&1'
-  } | crontab -
-}
-
-start_all() {
-  fix_ipv6_dns
-  rc-service argo-dnsfix start >/dev/null 2>&1 || true
-  rc-service argo-xray restart >/dev/null 2>&1 || rc-service argo-xray start
-  rc-service argo-cf restart >/dev/null 2>&1 || rc-service argo-cf start
-}
-
-show_info() {
-  uuid=$(cat "$UUIDF")
-  domain=$(cat "$DOMAINF")
-  port=$(cat "$PORTF")
-
-  cat <<EOM
-
-======================
-VLESS 节点信息
-地址: $domain
-端口: 443
-UUID: $uuid
-路径: /
-TLS: 开启
-本地端口: $port
-======================
-
-CF后台填写：
-http://localhost:$port
-
-节点链接：
-vless://$uuid@$domain:443?encryption=none&security=tls&type=ws&host=$domain&path=%2F#$domain
-
-EOM
-}
-
-status_all() {
-  rc-service argo-dnsfix status || true
-  rc-service argo-xray status || true
-  rc-service argo-cf status || true
-  rc-service crond status || true
-}
-
-show_logs() {
-  echo "=== xray.log ==="
-  tail -n 50 "$XRAY_LOG" 2>/dev/null || true
-  echo
-  echo "=== argo.log ==="
-  tail -n 80 "$CF_LOG" 2>/dev/null || true
-  echo
-  echo "=== dnsfix.log ==="
-  tail -n 50 "$DNSFIX_LOG" 2>/dev/null || true
-}
-
-remove_cron() {
-  crontab -l 2>/dev/null | grep -v 'argo-cf IPv6 self-heal' | grep -v 'ping6 -c1 -W1 2606:4700:4700::1111' | grep -v 'pgrep -x cloudflared' | crontab - 2>/dev/null || true
-}
-
-uninstall_all() {
-  rc-service argo-cf stop >/dev/null 2>&1 || true
-  rc-service argo-xray stop >/dev/null 2>&1 || true
-  rc-service argo-dnsfix stop >/dev/null 2>&1 || true
-  rc-update del argo-cf default >/dev/null 2>&1 || true
-  rc-update del argo-xray default >/dev/null 2>&1 || true
-  rc-update del argo-dnsfix default >/dev/null 2>&1 || true
-  rc-service crond restart >/dev/null 2>&1 || true
-  remove_cron
-
-  rm -f "$CF_SERVICE" "$XRAY_SERVICE" "$DNSFIX_SERVICE"
-  rm -f "$CF_WRAP" "$XRAY_WRAP" "$CONF" "$CF_LOG" "$XRAY_LOG" "$DNSFIX_LOG" "$UUIDF" "$PORTF" "$DOMAINF" "$TOKENF" "$WORKDIR/x.zip"
-  echo "[+] 已卸载"
-}
-
-install_all() {
-  need_root
-  detect_arch
-  install_base
-  gen_uuid
-  set_port
-  set_domain
-  set_token
-
-  fix_ipv6_dns
-  download_cf
-  download_xray
-  write_conf
-  write_wrappers
-  write_dnsfix_service
-  write_services
-  ensure_crond
-  setup_cron
-  start_all
-
-  show_info
-
-  if ! grep -q "alias argo='sh /root/argo.sh menu'" /etc/profile 2>/dev/null; then
-    echo "alias argo='sh /root/argo.sh menu'" >> /etc/profile
-  fi
-
-  echo "[+] 安装完成"
-  echo "执行: source /etc/profile"
-  echo "输入: argo 管理"
-}
-
-menu() {
-  while :; do
-    clear
-    echo "===== Argo 管理 ====="
-    echo "1. 查看节点"
-    echo "2. 修改端口"
-    echo "3. 修改UUID"
-    echo "4. 修改域名"
-    echo "5. 修改Token"
-    echo "6. 重启服务"
-    echo "7. 查看日志"
-    echo "8. 重装"
-    echo "9. 卸载"
-    echo "0. 退出"
-    printf "选择: "
-    read -r n || true
-
-    case "$n" in
-      1) show_info; printf "回车继续..."; read -r _ || true ;;
-      2) set_port; write_conf; start_all ;;
-      3) rm -f "$UUIDF"; gen_uuid; write_conf; start_all ;;
-      4) set_domain ;;
-      5) set_token; write_wrappers; start_all ;;
-      6) start_all ;;
-      7) show_logs; printf "回车继续..."; read -r _ || true ;;
-      8) install_all ;;
-      9) uninstall_all; exit 0 ;;
-      0) exit 0 ;;
-      *) echo "无效选择"; sleep 1 ;;
-    esac
-  done
-}
-
-case "${1:-}" in
-  install) install_all ;;
-  menu) menu ;;
-  start)
-    need_root
-    start_all
-    ;;
-  restart)
-    need_root
-    start_all
-    ;;
-  status)
-    need_root
-    status_all
-    ;;
-  logs)
-    need_root
-    show_logs
-    ;;
-  fix-dns)
-    need_root
-    fix_ipv6_dns
-    ;;
-  uninstall)
-    need_root
-    uninstall_all
-    ;;
-  *)
-    echo "用法: sh argo.sh install | menu | start | restart | status | logs | fix-dns | uninstall"
-    ;;
-esac
+chmod +x /root/argo.sh
+/root/argo.sh install
