@@ -11,6 +11,7 @@ DOMAINF="$WORKDIR/domain"
 TOKENF="$WORKDIR/token"
 
 CF_WRAP="$WORKDIR/cf.sh"
+CHECK_SCRIPT="$WORKDIR/check.sh"
 
 mkdir -p "$WORKDIR"
 
@@ -29,15 +30,13 @@ set_port(){
 }
 
 set_domain(){
-  read -p "域名(必须已接入CF): " d
+  read -p "域名: " d
   echo "$d" > "$DOMAINF"
 }
 
 set_token(){
-  echo "粘贴Tunnel Token:"
-  read input
+  read -p "Token: " input
   token=$(echo "$input" | grep -oE '[A-Za-z0-9_-]{120,}' | head -n1)
-
   [ -z "$token" ] && echo "Token错误" && exit 1
   echo "$token" > "$TOKENF"
 }
@@ -49,7 +48,7 @@ download_cf(){
 
 download_xray(){
   wget -q -O "$WORKDIR/x.zip" https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
-  unzip -o "$WORKDIR/x.zip" -d "$WORKDIR" >/dev/null 2>&1
+  unzip -o "$WORKDIR/x.zip" -d "$WORKDIR" >/dev/null
   chmod +x "$XRAY"
 }
 
@@ -59,52 +58,73 @@ write_conf(){
 
   cat > "$CONF" <<EOF
 {
-"inbounds":[
-{"port":$port,"protocol":"vless",
+"inbounds":[{"port":$port,"protocol":"vless",
 "settings":{"clients":[{"id":"$uuid"}],"decryption":"none"},
-"streamSettings":{"network":"ws","wsSettings":{"path":"/"}}}
-],
+"streamSettings":{"network":"ws","wsSettings":{"path":"/"}}}],
 "outbounds":[{"protocol":"freedom"}]
 }
 EOF
 }
 
+# ===== 核心1：严格网络检测 =====
+wait_ipv6(){
+  for i in $(seq 1 60); do
+    ping6 -c1 2606:4700:4700::1111 >/dev/null 2>&1 && return
+    sleep 2
+  done
+  return 1
+}
+
+# ===== 核心2：wrapper =====
 write_wrapper(){
 cat > "$CF_WRAP" <<EOF
 #!/bin/sh
+
+# 等IPv6真正可用
+for i in \$(seq 1 60); do
+  ping6 -c1 2606:4700:4700::1111 >/dev/null 2>&1 && break
+  sleep 2
+done
+
 exec $CF tunnel --no-autoupdate --edge-ip-version 6 --protocol http2 run --token \$(cat $TOKENF)
 EOF
 chmod +x "$CF_WRAP"
 }
 
+# ===== 核心3：主动探活脚本 =====
+write_check(){
+cat > "$CHECK_SCRIPT" <<'EOF'
+#!/bin/sh
+
+# CF进程不存在 → 重启
+pgrep cloudflared >/dev/null || rc-service argo-cf restart
+
+# IPv6挂了 → 重启
+ping6 -c1 2606:4700:4700::1111 >/dev/null || rc-service argo-cf restart
+
+# CF连接检测（关键）
+curl -6 --max-time 5 https://www.cloudflare.com >/dev/null 2>&1 || rc-service argo-cf restart
+EOF
+chmod +x "$CHECK_SCRIPT"
+}
+
 create_services(){
 
-# xray
 cat > /etc/init.d/argo-xray <<EOF
 #!/sbin/openrc-run
-name="argo-xray"
 command="$XRAY"
 command_args="-config $CONF"
 command_background=true
-pidfile="/run/argo-xray.pid"
 
 supervisor=supervise-daemon
 respawn_delay=3
 respawn_max=0
-
-depend() {
-  need net
-}
 EOF
 
-# cloudflared
-cat > /etc/init.d/argo-cf <<'EOF'
+cat > /etc/init.d/argo-cf <<EOF
 #!/sbin/openrc-run
-
-name="argo-cf"
-command="/root/argo/cf.sh"
+command="$CF_WRAP"
 command_background=true
-pidfile="/run/argo-cf.pid"
 
 supervisor=supervise-daemon
 respawn_delay=5
@@ -114,58 +134,28 @@ depend() {
   need net
   after argo-xray
 }
-
-start_pre() {
-  ebegin "等待 IPv6 网络"
-
-  for i in $(seq 1 30); do
-    ping6 -c1 -W1 2606:4700:4700::1111 >/dev/null 2>&1 && break
-    sleep 2
-  done
-
-  eend 0
-}
 EOF
 
 chmod +x /etc/init.d/argo-*
 
-rc-update add argo-xray default >/dev/null 2>&1
-rc-update add argo-cf default >/dev/null 2>&1
+rc-update add argo-xray default
+rc-update add argo-cf default
 }
 
+# ===== 核心4：crontab 保活 =====
 setup_cron(){
 
-# 防重复写入
-crontab -l 2>/dev/null | grep -q "argo-cf" && return
+crontab -l 2>/dev/null | grep -q check.sh && return
 
 (
 crontab -l 2>/dev/null
-echo "* * * * * ping6 -c1 2606:4700:4700::1111 >/dev/null 2>&1 || rc-service argo-cf restart"
-echo "* * * * * pgrep cloudflared >/dev/null 2>&1 || rc-service argo-cf restart"
+echo "* * * * * /root/argo/check.sh"
 ) | crontab -
 }
 
 start_all(){
   rc-service argo-xray restart
   rc-service argo-cf restart
-}
-
-show_info(){
-  uuid=$(cat "$UUIDF")
-  domain=$(cat "$DOMAINF")
-  port=$(cat "$PORTF")
-
-  echo "======================"
-  echo "地址: $domain"
-  echo "端口: 443"
-  echo "UUID: $uuid"
-  echo "路径: /"
-  echo "本地端口: $port"
-  echo "======================"
-
-  echo "CF填写: http://localhost:$port"
-  echo ""
-  echo "vless://$uuid@$domain:443?encryption=none&security=tls&type=ws&host=$domain&path=%2F#$domain"
 }
 
 install_all(){
@@ -180,31 +170,16 @@ install_all(){
 
   write_conf
   write_wrapper
+  write_check
   create_services
   setup_cron
+
   start_all
 
-  show_info
-
-  echo "alias argo='sh /root/argo.sh menu'" >> /etc/profile
-  echo "[+] 安装完成"
-}
-
-menu(){
-echo "1. 查看节点"
-echo "2. 重启服务"
-echo "3. 查看日志"
-read -p "选择: " n
-
-case "$n" in
-1) show_info ;;
-2) start_all ;;
-3) tail -f /root/argo/argo.log ;;
-esac
+  echo "[OK] 完成"
 }
 
 case "$1" in
 install) install_all ;;
-menu) menu ;;
 *) echo "用法: sh argo.sh install" ;;
 esac
