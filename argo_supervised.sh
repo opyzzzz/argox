@@ -15,9 +15,11 @@ CF_WRAP="$WORKDIR/cf.sh"
 XRAY_WRAP="$WORKDIR/xray.sh"
 CF_LOG="$WORKDIR/argo.log"
 XRAY_LOG="$WORKDIR/xray.log"
+DNSFIX_LOG="$WORKDIR/dnsfix.log"
 
 XRAY_SERVICE="/etc/init.d/argo-xray"
 CF_SERVICE="/etc/init.d/argo-cf"
+DNSFIX_SERVICE="/etc/init.d/argo-dnsfix"
 
 mkdir -p "$WORKDIR"
 umask 077
@@ -92,6 +94,35 @@ set_token() {
   done
 }
 
+fix_ipv6_dns() {
+  resolv="/etc/resolv.conf"
+  tmp="$WORKDIR/resolv.conf.tmp"
+
+  # 如果已经包含 IPv6 nameserver，就不重复修复
+  if [ -f "$resolv" ] && grep -qE '^nameserver[[:space:]]+[0-9A-Fa-f:]+$' "$resolv" 2>/dev/null; then
+    echo "[+] IPv6 DNS 已存在，无需修复" >> "$DNSFIX_LOG" 2>/dev/null || true
+    return 0
+  fi
+
+  : > "$tmp"
+
+  if [ -f "$resolv" ]; then
+    cat "$resolv" > "$tmp"
+  fi
+
+  grep -q '^nameserver 2606:4700:4700::1111$' "$tmp" 2>/dev/null || \
+    printf '%s\n' 'nameserver 2606:4700:4700::1111' >> "$tmp"
+
+  grep -q '^nameserver 2606:4700:4700::1001$' "$tmp" 2>/dev/null || \
+    printf '%s\n' 'nameserver 2606:4700:4700::1001' >> "$tmp"
+
+  cat "$tmp" > "$resolv"
+  chmod 644 "$resolv" 2>/dev/null || true
+  rm -f "$tmp"
+
+  echo "[+] IPv6 DNS 已修复: $resolv" | tee -a "$DNSFIX_LOG" >/dev/null
+}
+
 download_cf() {
   wget -q -O "$CF" "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
   chmod +x "$CF"
@@ -152,6 +183,26 @@ EOF
   chmod +x "$CF_WRAP"
 }
 
+write_dnsfix_service() {
+  cat > "$DNSFIX_SERVICE" <<EOF
+#!/sbin/openrc-run
+
+description="Argo IPv6 DNS Fix"
+name="argo-dnsfix"
+command="/bin/sh /root/argo.sh fix-dns"
+supervisor=supervise-daemon
+respawn_delay=10
+respawn_max=0
+
+depend() {
+  need net
+}
+EOF
+
+  chmod +x "$DNSFIX_SERVICE"
+  rc-update add argo-dnsfix default >/dev/null 2>&1 || true
+}
+
 write_services() {
   cat > "$XRAY_SERVICE" <<EOF
 #!/sbin/openrc-run
@@ -183,6 +234,7 @@ healthcheck_timer=60
 depend() {
   need net
   after argo-xray
+  after argo-dnsfix
 }
 
 start_pre() {
@@ -231,6 +283,8 @@ setup_cron() {
 }
 
 start_all() {
+  fix_ipv6_dns
+  rc-service argo-dnsfix start >/dev/null 2>&1 || true
   rc-service argo-xray restart >/dev/null 2>&1 || rc-service argo-xray start
   rc-service argo-cf restart >/dev/null 2>&1 || rc-service argo-cf start
 }
@@ -262,6 +316,7 @@ EOM
 }
 
 status_all() {
+  rc-service argo-dnsfix status || true
   rc-service argo-xray status || true
   rc-service argo-cf status || true
   rc-service crond status || true
@@ -273,6 +328,9 @@ show_logs() {
   echo
   echo "=== argo.log ==="
   tail -n 80 "$CF_LOG" 2>/dev/null || true
+  echo
+  echo "=== dnsfix.log ==="
+  tail -n 50 "$DNSFIX_LOG" 2>/dev/null || true
 }
 
 remove_cron() {
@@ -282,13 +340,15 @@ remove_cron() {
 uninstall_all() {
   rc-service argo-cf stop >/dev/null 2>&1 || true
   rc-service argo-xray stop >/dev/null 2>&1 || true
+  rc-service argo-dnsfix stop >/dev/null 2>&1 || true
   rc-update del argo-cf default >/dev/null 2>&1 || true
   rc-update del argo-xray default >/dev/null 2>&1 || true
+  rc-update del argo-dnsfix default >/dev/null 2>&1 || true
   rc-service crond restart >/dev/null 2>&1 || true
   remove_cron
 
-  rm -f "$CF_SERVICE" "$XRAY_SERVICE"
-  rm -f "$CF_WRAP" "$XRAY_WRAP" "$CONF" "$CF_LOG" "$XRAY_LOG" "$UUIDF" "$PORTF" "$DOMAINF" "$TOKENF" "$WORKDIR/x.zip"
+  rm -f "$CF_SERVICE" "$XRAY_SERVICE" "$DNSFIX_SERVICE"
+  rm -f "$CF_WRAP" "$XRAY_WRAP" "$CONF" "$CF_LOG" "$XRAY_LOG" "$DNSFIX_LOG" "$UUIDF" "$PORTF" "$DOMAINF" "$TOKENF" "$WORKDIR/x.zip"
   echo "[+] 已卸载"
 }
 
@@ -301,10 +361,12 @@ install_all() {
   set_domain
   set_token
 
+  fix_ipv6_dns
   download_cf
   download_xray
   write_conf
   write_wrappers
+  write_dnsfix_service
   write_services
   ensure_crond
   setup_cron
@@ -373,11 +435,15 @@ case "${1:-}" in
     need_root
     show_logs
     ;;
+  fix-dns)
+    need_root
+    fix_ipv6_dns
+    ;;
   uninstall)
     need_root
     uninstall_all
     ;;
   *)
-    echo "用法: sh argo.sh install | menu | start | restart | status | logs | uninstall"
+    echo "用法: sh argo.sh install | menu | start | restart | status | logs | fix-dns | uninstall"
     ;;
 esac
