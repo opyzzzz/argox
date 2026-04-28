@@ -1,5 +1,4 @@
-#!/usr/bin/env bash
-set -e
+#!/bin/sh
 
 WORKDIR="/root/argo"
 CF="$WORKDIR/cloudflared"
@@ -15,128 +14,119 @@ CF_WRAP="$WORKDIR/cf.sh"
 
 mkdir -p "$WORKDIR"
 
-install_base() {
-  if command -v apt >/dev/null; then
-    apt update -y && apt install -y curl wget unzip
-  elif command -v dnf >/dev/null; then
-    dnf install -y curl wget unzip
-  elif command -v yum >/dev/null; then
-    yum install -y curl wget unzip
-  else
-    echo "不支持的系统（需要 systemd）"
-    exit 1
-  fi
+install_base(){
+  apk add --no-cache curl wget unzip >/dev/null 2>&1
 }
 
-gen_uuid() {
+gen_uuid(){
   [ ! -f "$UUIDF" ] && cat /proc/sys/kernel/random/uuid > "$UUIDF"
 }
 
-set_port() {
-  read -rp "端口(默认8080): " p
+set_port(){
+  read -p "端口(默认8080): " p
   [ -z "$p" ] && p=8080
   echo "$p" > "$PORTF"
 }
 
-set_domain() {
-  read -rp "域名(必须已接入CF): " d
+set_domain(){
+  read -p "域名(必须已接入CF): " d
   echo "$d" > "$DOMAINF"
 }
 
-set_token() {
+set_token(){
   echo "粘贴Tunnel Token:"
-  read -r input
+  read input
   token=$(echo "$input" | grep -oE '[A-Za-z0-9_-]{120,}' | head -n1)
 
-  if [ -z "$token" ]; then
-    echo "Token错误"
-    exit 1
-  fi
-
+  [ -z "$token" ] && echo "Token错误" && exit 1
   echo "$token" > "$TOKENF"
 }
 
-download_cf() {
-  wget -q -O "$CF" https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+download_cf(){
+  wget -O "$CF" https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
   chmod +x "$CF"
 }
 
-download_xray() {
-  wget -q -O "$WORKDIR/x.zip" https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
-  unzip -o "$WORKDIR/x.zip" -d "$WORKDIR" >/dev/null
+download_xray(){
+  wget -O "$WORKDIR/x.zip" https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+  unzip -o "$WORKDIR/x.zip" -d "$WORKDIR" >/dev/null 2>&1
   chmod +x "$XRAY"
 }
 
-write_conf() {
+write_conf(){
   port=$(cat "$PORTF")
   uuid=$(cat "$UUIDF")
 
   cat > "$CONF" <<EOF
 {
-  "inbounds":[
-    {
-      "port":$port,
-      "protocol":"vless",
-      "settings":{"clients":[{"id":"$uuid"}],"decryption":"none"},
-      "streamSettings":{"network":"ws","wsSettings":{"path":"/"}}
-    }
-  ],
-  "outbounds":[{"protocol":"freedom"}]
+"inbounds":[
+{"port":$port,"protocol":"vless",
+"settings":{"clients":[{"id":"$uuid"}],"decryption":"none"},
+"streamSettings":{"network":"ws","wsSettings":{"path":"/"}}}
+],
+"outbounds":[{"protocol":"freedom"}]
 }
 EOF
 }
 
-write_wrapper() {
-  cat > "$CF_WRAP" <<EOF
+write_wrapper(){
+cat > "$CF_WRAP" <<EOF
 #!/bin/sh
 exec $CF tunnel --no-autoupdate --edge-ip-version 6 --protocol http2 run --token \$(cat $TOKENF)
 EOF
-  chmod +x "$CF_WRAP"
+chmod +x "$CF_WRAP"
 }
 
-create_services() {
+create_services(){
 
-cat > /etc/systemd/system/argo-xray.service <<EOF
-[Unit]
-Description=Argo Xray
-After=network-online.target
-Wants=network-online.target
+# xray
+cat > /etc/init.d/argo-xray <<EOF
+#!/sbin/openrc-run
+name="argo-xray"
+command="$XRAY"
+command_args="-config $CONF"
+command_background=true
+pidfile="/run/argo-xray.pid"
 
-[Service]
-ExecStart=$XRAY -config $CONF
-Restart=always
-RestartSec=3
-LimitNOFILE=1048576
+supervisor=supervise-daemon
+respawn_delay=3
+respawn_max=0
 
-[Install]
-WantedBy=multi-user.target
+depend() {
+  need net
+}
 EOF
 
-cat > /etc/systemd/system/argo-cf.service <<EOF
-[Unit]
-Description=Argo Cloudflared
-After=network-online.target argo-xray.service
-Requires=argo-xray.service
+# cloudflared
+cat > /etc/init.d/argo-cf <<EOF
+#!/sbin/openrc-run
+name="argo-cf"
+command="$CF_WRAP"
+command_background=true
+pidfile="/run/argo-cf.pid"
 
-[Service]
-ExecStart=$CF_WRAP
-Restart=always
-RestartSec=3
+supervisor=supervise-daemon
+respawn_delay=5
+respawn_max=0
 
-[Install]
-WantedBy=multi-user.target
+depend() {
+  need net
+  after argo-xray
+}
 EOF
 
-systemctl daemon-reload
-systemctl enable argo-xray argo-cf
+chmod +x /etc/init.d/argo-*
+
+rc-update add argo-xray default >/dev/null 2>&1
+rc-update add argo-cf default >/dev/null 2>&1
 }
 
-start_all() {
-  systemctl restart argo-xray
-  systemctl restart argo-cf
+start_all(){
+  rc-service argo-xray restart
+  rc-service argo-cf restart
 }
 
-show_info() {
+show_info(){
   uuid=$(cat "$UUIDF")
   domain=$(cat "$DOMAINF")
   port=$(cat "$PORTF")
@@ -154,7 +144,7 @@ show_info() {
   echo "vless://$uuid@$domain:443?encryption=none&security=tls&type=ws&host=$domain&path=%2F#$domain"
 }
 
-install_all() {
+install_all(){
   install_base
   gen_uuid
   set_port
@@ -171,25 +161,25 @@ install_all() {
 
   show_info
 
-  echo "alias argo='bash /root/argo.sh menu'" >> /etc/profile
+  echo "alias argo='sh /root/argo.sh menu'" >> /etc/profile
   echo "[+] 安装完成"
 }
 
-menu() {
-  echo "1. 查看节点"
-  echo "2. 重启服务"
-  echo "3. 查看日志"
-  read -rp "选择: " n
+menu(){
+echo "1. 查看节点"
+echo "2. 重启服务"
+echo "3. 查看日志"
+read -p "选择: " n
 
-  case "$n" in
-    1) show_info ;;
-    2) start_all ;;
-    3) journalctl -u argo-cf -f ;;
-  esac
+case "$n" in
+1) show_info ;;
+2) start_all ;;
+3) tail -f $WORKDIR/argo.log ;;
+esac
 }
 
 case "$1" in
-  install) install_all ;;
-  menu) menu ;;
-  *) echo "用法: bash argo.sh install" ;;
+install) install_all ;;
+menu) menu ;;
+*) echo "用法: sh argo.sh install" ;;
 esac
