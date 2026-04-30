@@ -5,5 +5,5 @@ wget -O /root/argo.sh https://raw.githubusercontent.com/opyzzzz/argox/refs/heads
 
 dns
 `````
-wget -qO- https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/dns.sh | bash
+wget -qO- https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/dns.sh | sh
 `````
