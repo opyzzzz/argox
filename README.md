@@ -10,5 +10,5 @@ wget -qO- https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/dns.sh
 
 dnsplus
 `````
-wget -qO- https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/dnsplus.sh | sh
+wget -qO- https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/dnsplus.sh | bash
 `````
