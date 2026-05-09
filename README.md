@@ -7,3 +7,8 @@ dns
 `````
 wget -qO- https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/dns.sh | sh
 `````
+
+dnsplus
+`````
+wget -qO- https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/dnsplus.sh | sh
+`````
