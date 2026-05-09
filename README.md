@@ -12,3 +12,8 @@ dnsplus
 `````
 wget -qO- https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/dnsplus.sh | bash
 `````
+
+check-dns
+`````
+wget -qO- https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/dns-check.sh | bash
+`````
