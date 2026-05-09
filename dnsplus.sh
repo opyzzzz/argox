@@ -1,59 +1,58 @@
 #!/bin/bash
 
 # =================================================================
-# 脚本功能：Stubby 加密 DNS (DoT) 一键部署及全接管
-# 支持系统：Debian / Ubuntu / Alpine (x86_64, ARM)
+# 脚本名称: Secure-DNS 一键部署 (Stubby 方案)
+# 适用系统: Debian / Ubuntu / Alpine (x86_64 / ARM)
+# 功能描述: 实现系统级加密 DNS 接管，支持代理集成、防篡改与自动恢复
 # =================================================================
 
-# --- 颜色定义 ---
+# --- 样式定义 ---
 INFO='\033[0;32m[INFO]\033[0m'
 OK='\033[0;34m[OK]\033[0m'
 WARN='\033[0;33m[WARN]\033[0m'
 ERROR='\033[0;31m[ERROR]\033[0m'
 
-# --- 路径与变量 ---
+# --- 变量定义 ---
 STUBBY_CONF="/etc/stubby/stubby.yml"
 RESOLV_CONF="/etc/resolv.conf"
 LOG_DIR="/var/log/secure-dns"
-BACKUP_CONF="/etc/stubby/.stubby.yml.bak"
 GUARD_SCRIPT="/usr/local/bin/dns_secure_guard.sh"
+BACKUP_CONF="/etc/stubby/.stubby.yml.bak"
+SHA_FILE="/etc/stubby/stubby.yml.sha256"
 
-# 1. 权限与架构检测
-if [[ $EUID -ne 0 ]]; then
-   echo -e "${ERROR} 必须以 root 权限运行此脚本。"
-   exit 1
-fi
-
-# 2. 系统环境检测与依赖安装
-install_deps() {
-    echo -e "${INFO} 正在安装系统依赖..."
+# 1. 环境检测
+check_env() {
+    [[ $EUID -ne 0 ]] && echo -e "${ERROR} 必须以 root 运行" && exit 1
     if [ -f /etc/alpine-release ]; then
         OS="Alpine"
-        apk add stubby ca-certificates openssl coreutils e2fsprogs-extra cronie bind-tools
-        rc-update add crond default && rc-service crond start
     elif [ -f /etc/debian_version ]; then
         OS="Debian"
-        apt-get update
-        # Debian 下 chattr 属于 e2fsprogs, nslookup 属于 dnsutils
-        apt-get install -y stubby ca-certificates openssl coreutils e2fsprogs cron dnsutils sed
-        # 停用干扰服务
-        systemctl stop systemd-resolved 2>/dev/null && systemctl disable systemd-resolved 2>/dev/null
     else
-        echo -e "${ERROR} 暂不支持的操作系统。" && exit 1
+        echo -e "${ERROR} 不支持的系统" && exit 1
+    fi
+}
+
+# 2. 依赖安装
+install_deps() {
+    echo -e "${INFO} 正在安装官方依赖..."
+    if [ "$OS" == "Alpine" ]; then
+        # 安装 e2fsprogs-extra 以获得 chattr，安装 cronie 解决 BusyBox cron 兼容性
+        apk add stubby ca-certificates openssl coreutils e2fsprogs-extra cronie bind-tools sed net-tools
+        rc-update add crond default && rc-service crond start
+    else
+        apt-get update
+        apt-get install -y stubby ca-certificates openssl coreutils e2fsprogs cron dnsutils sed net-tools
+        # 禁用干扰服务
+        systemctl stop systemd-resolved 2>/dev/null && systemctl disable systemd-resolved 2>/dev/null
     fi
     echo -e "${OK} 依赖安装完成。"
 }
 
-# 3. 初始化目录
-init_dirs() {
-    mkdir -p /etc/stubby
-    mkdir -p $LOG_DIR
-    chmod 750 $LOG_DIR
-}
-
-# 4. 生成 Stubby 配置 (DoT + 多上游轮询)
-gen_config() {
-    echo -e "${INFO} 正在配置 Stubby (监听 53 端口)..."
+# 3. 配置 Stubby (DoT + 多上游)
+config_stubby() {
+    echo -e "${INFO} 正在配置 Stubby 加密解析器..."
+    mkdir -p /etc/stubby $LOG_DIR
+    
     cat > $STUBBY_CONF <<EOF
 resolution_type: GETDNS_RESOLUTION_STUB
 dns_transport_list:
@@ -82,110 +81,119 @@ upstream_recursive_servers:
   - address_data: 9.9.9.9
     tls_auth_name: "dns.quad9.net"
 EOF
-    # 生成防篡改备份
-    sha256sum $STUBBY_CONF > "${STUBBY_CONF}.sha256"
+    # 记录指纹用于防篡改
+    sha256sum $STUBBY_CONF > $SHA_FILE
     cp $STUBBY_CONF $BACKUP_CONF
-    echo -e "${OK} Stubby 配置已生成。"
+    echo -e "${OK} 配置文件生成。"
 }
 
-# 5. 接管代理软件 (Xray / Sing-box)
+# 4. 接管 Xray / Sing-box
 integrate_proxy() {
-    echo -e "${INFO} 正在检查代理软件集成..."
-    # 定义常见路径
-    local paths=("/etc/xray/config.json" "/etc/sing-box/config.json" "/usr/local/etc/xray/config.json" "/root/sing-box/config.json")
-    
-    for p in "${paths[@]}"; do
-        if [ -f "$p" ]; then
-            echo -e "${OK} 发现配置: $p，正在接管 DNS..."
-            # 备份并修改配置，将 DNS 地址指向 127.0.0.1
-            cp "$p" "$p.bak"
-            sed -i 's/"address":\s*"[^"]*"/"address": "127.0.0.1"/g' "$p"
-            # 发送重载信号
+    echo -e "${INFO} 正在扫描代理软件配置..."
+    local cfgs=("/etc/xray/config.json" "/etc/sing-box/config.json" "/usr/local/etc/xray/config.json" "/root/sing-box/config.json")
+    for f in "${cfgs[@]}"; do
+        if [ -f "$f" ]; then
+            echo -e "${OK} 发现配置 $f，正在重定向 DNS..."
+            cp "$f" "$f.bak"
+            # 将 DNS address 指向本地，同时匹配 IPv4 和 IPv6 格式
+            sed -i 's/"address":\s*"[^"]*"/"address": "127.0.0.1"/g' "$f"
+            # 发送 HUP 信号触发 live reload
             pkill -HUP xray 2>/dev/null || pkill -HUP sing-box 2>/dev/null
         fi
     done
 }
 
-# 6. 系统服务启动与 DNS 强力锁定
+# 5. 启动服务与 DNS 锁定
 start_and_lock() {
-    echo -e "${INFO} 启动服务并锁定系统解析..."
+    echo -e "${INFO} 启动 Stubby 并执行全接管..."
     if [ "$OS" == "Alpine" ]; then
-        rc-update add stubby default && rc-service stubby restart
+        rc-update add stubby default
+        rc-service stubby restart
     else
         systemctl daemon-reload && systemctl enable stubby && systemctl restart stubby
     fi
 
-    # 等待建立 TLS 连接
+    # 等待 TLS 握手
     sleep 3
 
-    # 处理 resolv.conf (解决重启消失问题)
-    chattr -i $RESOLV_CONF 2>/dev/null
-    rm -f $RESOLV_CONF # 强制删除可能存在的软链接
+    # 接管 resolv.conf (强制覆盖并锁定)
+    chattr -i $RESOLV_CONF 2>/dev/null || chmod 644 $RESOLV_CONF
     echo -e "nameserver 127.0.0.1\nnameserver ::1\noptions timeout:2 attempts:1" > $RESOLV_CONF
     
-    # 尝试锁定，若不支持则降级
     if ! chattr +i $RESOLV_CONF 2>/dev/null; then
-        echo -e "${WARN} 文件系统不支持 chattr，已设为只读。"
+        echo -e "${WARN} 当前环境不支持 chattr 锁定，采用权限只读模式。"
         chmod 444 $RESOLV_CONF
     else
-        echo -e "${OK} 系统 DNS 已通过 chattr +i 强力锁定。"
+        echo -e "${OK} 系统 DNS 已锁定至 127.0.0.1。"
     fi
 }
 
-# 7. 部署安全卫士 (防篡改 + 自动恢复)
+# 6. 部署安全卫士 (支持日志自动清理)
 deploy_guard() {
-    echo -e "${INFO} 部署安全卫士脚本..."
+    echo -e "${INFO} 正在部署自动恢复卫士..."
     cat > $GUARD_SCRIPT <<EOF
-#!/bin/bash
-# 1. 校验 Stubby 配置
+#!/bin/sh
+# 1. 基于端口监听检测 Stubby (比进程名检测更准确)
+if ! netstat -tunlp | grep -q ":53 "; then
+    command -v rc-service >/dev/null && rc-service stubby restart || systemctl restart stubby
+fi
+
+# 2. 配置防篡改检测
 cd /etc/stubby
 sha256sum -c stubby.yml.sha256 > /dev/null 2>&1
 if [ \$? -ne 0 ]; then
     chattr -i $STUBBY_CONF 2>/dev/null
     cp $BACKUP_CONF $STUBBY_CONF
-    command -v rc-service &>/dev/null && rc-service stubby restart || systemctl restart stubby
-    echo "\$(date) - 配置已篡改并还原" >> $LOG_DIR/guard.log
+    command -v rc-service >/dev/null && rc-service stubby restart || systemctl restart stubby
 fi
 
-# 2. 检查 resolv.conf 是否消失或被改
-if [ ! -f "$RESOLV_CONF" ] || ! grep -q "127.0.0.1" "$RESOLV_CONF"; then
+# 3. 检查 resolv.conf 完整性
+if ! grep -q "127.0.0.1" "$RESOLV_CONF" 2>/dev/null; then
     chattr -i $RESOLV_CONF 2>/dev/null
     echo -e "nameserver 127.0.0.1\nnameserver ::1" > $RESOLV_CONF
     chattr +i $RESOLV_CONF 2>/dev/null
-    echo "\$(date) - resolv.conf 已修复" >> $LOG_DIR/guard.log
 fi
 
-# 3. 清理 30 天前日志
+# 4. 清理旧日志
 find $LOG_DIR -type f -mtime +30 -delete
 EOF
     chmod +x $GUARD_SCRIPT
-    # 加入定时任务 (每分钟运行一次)
-    (crontab -l 2>/dev/null | grep -v "$GUARD_SCRIPT"; echo "* * * * * $GUARD_SCRIPT") | crontab -
+
+    # 针对 Alpine 的 Crontab 写入优化，避免缓存目录报错
+    TMP_CRON="/tmp/cron_dns"
+    crontab -l > $TMP_CRON 2>/dev/null || true
+    if ! grep -q "$GUARD_SCRIPT" $TMP_CRON; then
+        echo "* * * * * $GUARD_SCRIPT" >> $TMP_CRON
+        crontab $TMP_CRON
+    fi
+    rm -f $TMP_CRON
 }
 
-# 8. 效果验证
+# 7. 最终校验
 verify() {
-    echo -e "\n${INFO} --- 自动化校验 ---"
-    # 进程检查
-    pgrep -x stubby > /dev/null && echo -e "${OK} Stubby 运行中" || echo -e "${ERROR} Stubby 未启动"
-    
-    # 解析测试
-    echo -ne "${INFO} Google 解析测试: "
-    if nslookup google.com 127.0.0.1 > /dev/null 2>&1; then
-        echo -e "${OK}成功"
+    echo -e "\n${INFO} --- 自动化部署校验 ---"
+    # 端口校验
+    if netstat -tunlp | grep -q ":53 "; then
+        echo -e "${OK} 服务监听: 正常"
     else
-        echo -e "${ERROR}失败 (请检查 853 端口出站连通性)"
+        echo -e "${ERROR} 服务监听: 失败"
+    fi
+
+    # 解析校验
+    if nslookup google.com 127.0.0.1 > /dev/null 2>&1; then
+        echo -e "${OK} DNS 解析: 正常 (DoT 链路已畅通)"
+    else
+        echo -e "${ERROR} DNS 解析: 失败"
     fi
 }
 
-# --- 执行流 ---
+# --- 执行主流程 ---
+check_env
 install_deps
-init_dirs
-gen_config
+config_stubby
 integrate_proxy
 start_and_lock
 deploy_guard
 verify
 
-echo -e "\n${OK} 加密 DNS 部署任务全部完成！"
-echo -e "${INFO} 所有 DNS 流量现已通过 Stubby (DoT) 加密。"
+echo -e "\n${OK} 部署完成！Stubby 已全面接管系统 DNS 流量。"
