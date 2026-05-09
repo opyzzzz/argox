@@ -5,7 +5,7 @@
 # xray/sing-box live reload
 # 多上游 DoH/DoT
 # Alpine/Debian x86_64 & ARM
-# 安装进度和效果校验
+# 安装进度、效果校验
 # =========================================================
 
 set -euo pipefail
@@ -17,15 +17,13 @@ DNS_MODE=${1:-"doh"}  # doh 或 dot
 LOG_DIR="/var/log/secure-dns"
 CONFIG_DIR="/etc/secure-dns"
 CONFIG_FILE="$CONFIG_DIR/stubby.yml"
-SERVICE_FILE="/etc/systemd/system/secure-dns.service"
-TIMER_FILE="/etc/systemd/system/secure-dns-check.timer"
 CHECK_SCRIPT="/usr/local/bin/secure-dns-check.sh"
 ARCH=$(uname -m)
 OS=$(awk -F= '/^ID=/{print $2}' /etc/os-release | tr -d '"')
 XRS_BOX_PATHS=("/etc/xray/config.json" "/etc/sing-box/config.json")
 
 # -------------------------
-# 进度显示函数
+# 颜色输出
 # -------------------------
 info() { echo -e "[\e[34mINFO\e[0m] $1"; }
 ok() { echo -e "[\e[32mOK\e[0m] $1"; }
@@ -38,8 +36,8 @@ info "开始部署增强版加密 DNS..."
 # 安装依赖
 # -------------------------
 info "检测系统并安装依赖..."
-install_debian() { apt-get update; apt-get install -y stubby curl jq systemd; }
-install_alpine() { apk update; apk add stubby curl jq; }
+install_debian() { apt-get update; apt-get install -y stubby curl jq dig systemd; }
+install_alpine() { apk update; apk add stubby curl jq bind-tools; }
 
 case "$OS" in
     alpine) install_alpine ;;
@@ -95,10 +93,32 @@ chmod 600 "$CONFIG_FILE"
 ok "Stubby 配置生成完成"
 
 # -------------------------
-# 创建 systemd 服务
+# 创建服务
 # -------------------------
-info "创建 systemd 服务..."
-cat > "$SERVICE_FILE" <<EOF
+if [[ "$OS" == "alpine" ]]; then
+    info "创建 OpenRC 服务..."
+    SERVICE_FILE="/etc/init.d/secure-dns"
+    cat > "$SERVICE_FILE" <<'EOF'
+#!/sbin/openrc-run
+name="Secure DNS Stubby"
+description="Secure DNS Stubby Service"
+
+command="/usr/sbin/stubby"
+command_args="-C /etc/secure-dns/stubby.yml -g /var/log/secure-dns/stubby.log"
+pidfile="/run/secure-dns.pid"
+
+depend() { need net }
+
+start_pre() { checkpath --directory --mode 700 /var/log/secure-dns }
+EOF
+    chmod +x "$SERVICE_FILE"
+    rc-update add secure-dns default
+    rc-service secure-dns start
+    ok "OpenRC 服务启动完成"
+else
+    info "创建 systemd 服务..."
+    SERVICE_FILE="/etc/systemd/system/secure-dns.service"
+    cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=Secure DNS Stubby Service
 After=network.target
@@ -118,19 +138,19 @@ PrivateTmp=yes
 [Install]
 WantedBy=multi-user.target
 EOF
-chmod 644 "$SERVICE_FILE"
-systemctl daemon-reload
-systemctl enable secure-dns.service
-systemctl restart secure-dns.service
-ok "Stubby 服务启动完成"
+    chmod 644 "$SERVICE_FILE"
+    systemctl daemon-reload
+    systemctl enable secure-dns.service
+    systemctl restart secure-dns.service
+    ok "Systemd 服务启动完成"
+fi
 
 # -------------------------
-# 防篡改检测脚本
+# 防篡改检测
 # -------------------------
 info "设置防篡改检测..."
 CONFIG_HASH=$(sha256sum "$CONFIG_FILE" | awk '{print $1}')
 echo "$CONFIG_HASH" > "$CONFIG_DIR/config.sha256"
-
 cat > "$CHECK_SCRIPT" <<'EOF'
 #!/usr/bin/env bash
 CONFIG_FILE="/etc/secure-dns/stubby.yml"
@@ -143,14 +163,23 @@ SAVED_HASH=$(cat "$HASH_FILE")
 if [ "$CURRENT_HASH" != "$SAVED_HASH" ]; then
     echo "$(date '+%F %T') [WARN] Stubby 配置被篡改，正在恢复..." >> "$LOG_FILE"
     cp "$CONFIG_FILE.bak" "$CONFIG_FILE"
-    systemctl restart secure-dns.service
+    if command -v systemctl >/dev/null; then
+        systemctl restart secure-dns.service
+    else
+        rc-service secure-dns restart
+    fi
     echo "$(date '+%F %T') [INFO] Stubby 已恢复并重启" >> "$LOG_FILE"
 fi
 EOF
 chmod +x "$CHECK_SCRIPT"
 cp "$CONFIG_FILE" "$CONFIG_FILE.bak"
 
-cat > "$TIMER_FILE" <<EOF
+# 创建定时器 / cron
+if [[ "$OS" == "alpine" ]]; then
+    CRON_FILE="/etc/periodic/daily/secure-dns-check"
+else
+    TIMER_FILE="/etc/systemd/system/secure-dns-check.timer"
+    cat > "$TIMER_FILE" <<EOF
 [Unit]
 Description=Daily Secure DNS config check
 
@@ -161,15 +190,20 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 EOF
-systemctl daemon-reload
-systemctl enable --now secure-dns-check.timer
+    systemctl daemon-reload
+    systemctl enable --now secure-dns-check.timer
+fi
 ok "防篡改检测设置完成"
 
 # -------------------------
 # 日志清理
 # -------------------------
 info "安装日志清理任务..."
-CRON_JOB="/etc/cron.daily/secure-dns-log-clean"
+if [[ "$OS" == "alpine" ]]; then
+    CRON_JOB="/etc/periodic/daily/secure-dns-log-clean"
+else
+    CRON_JOB="/etc/cron.daily/secure-dns-log-clean"
+fi
 cat > "$CRON_JOB" <<'EOF'
 #!/bin/sh
 LOG_DIR="/var/log/secure-dns"
@@ -196,15 +230,14 @@ done
 # 效果校验
 # -------------------------
 info "进行部署效果校验..."
-if systemctl is-active --quiet secure-dns.service; then
-    ok "Stubby 服务正在运行"
+if [[ "$OS" == "alpine" ]]; then
+    rc-service secure-dns status >/dev/null && ok "Stubby 服务正在运行" || warn "Stubby 服务未运行"
 else
-    warn "Stubby 服务未运行"
+    systemctl is-active --quiet secure-dns.service && ok "Stubby 服务正在运行" || warn "Stubby 服务未运行"
 fi
 
 # 测试 IPv4/IPv6 DNS 解析
-TEST_DOMAINS=("google.com" "cloudflare.com")
-for d in "${TEST_DOMAINS[@]}"; do
+for d in google.com cloudflare.com; do
     if dig +short @"127.0.0.1" "$d" A >/dev/null 2>&1; then
         ok "IPv4 解析 $d 成功"
     else
