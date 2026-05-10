@@ -1,29 +1,21 @@
 #!/usr/bin/env bash
 
 # =========================================================
-# Secure-DNS Lite v1.4
+# Secure-DNS Lite v1.5
 # 自适应 DNS over TLS 自动部署脚本
 #
-# 支持:
-#   - Alpine
-#   - Debian / Ubuntu
-#
-# 特点:
-#   - 自动检测 IPv4 / IPv6 本地监听能力
-#   - 多重容器 / capability 检测
+# 特性:
+#   - 自动检测 IPv4 / IPv6 可用性
+#   - 自动检测 IPv6 外网可达性
+#   - 自动适配容器 / VPS / NAT 环境
 #   - 自动 fallback root compatibility mode
-#   - 保留 IPv6 upstream
+#   - Alpine / Debian 双兼容
+#   - Cloudflare + Google DoT
 #   - 无 watchdog
 #   - 无无限循环
 #   - 无 chattr
-#   - 无暴力 systemd-resolved mask
-#   - 兼容 xray / sing-box
 #
-# 上游:
-#   - Cloudflare
-#   - Google
-#
-# Version: 1.4
+# Version: 1.5
 # =========================================================
 
 set -Eeuo pipefail
@@ -40,21 +32,22 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 # =========================================================
-# 路径
-# =========================================================
-
-STUBBY_CONF="/etc/stubby/stubby.yml"
-RESOLV_CONF="/etc/resolv.conf"
-
-# =========================================================
-# 全局状态
+# 全局变量
 # =========================================================
 
 OS=""
 VIRT_TYPE="none"
 
+IPV4_AVAILABLE=false
 IPV6_AVAILABLE=false
+
+IPV4_UPSTREAM=false
+IPV6_UPSTREAM=false
+
 USE_ROOT_STUBBY=false
+
+STUBBY_CONF="/etc/stubby/stubby.yml"
+RESOLV_CONF="/etc/resolv.conf"
 
 # =========================================================
 # 日志
@@ -90,7 +83,7 @@ check_root() {
 }
 
 # =========================================================
-# 系统检测
+# 检测系统
 # =========================================================
 
 detect_os() {
@@ -110,94 +103,32 @@ detect_os() {
 }
 
 # =========================================================
-# 虚拟化 / 容器检测
+# 检测虚拟化
 # =========================================================
 
 detect_virtualization() {
 
     log_step "检测运行环境"
 
-    # -----------------------------------------------------
-    # systemd-detect-virt
-    # -----------------------------------------------------
-
     if command -v systemd-detect-virt >/dev/null 2>&1; then
 
-        DETECTED=$(
-            systemd-detect-virt 2>/dev/null || true
-        )
+        DETECTED=$(systemd-detect-virt 2>/dev/null || true)
 
         case "$DETECTED" in
-            lxc|openvz|docker|podman|container-other)
+            lxc|docker|podman|openvz)
                 VIRT_TYPE="$DETECTED"
                 ;;
         esac
     fi
 
-    # -----------------------------------------------------
-    # cgroup
-    # -----------------------------------------------------
+    grep -qaE 'lxc|incus' /proc/1/cgroup \
+        2>/dev/null && VIRT_TYPE="lxc"
 
-    if [ "$VIRT_TYPE" = "none" ]; then
+    [ -f /.dockerenv ] && VIRT_TYPE="docker"
 
-        if grep -qaE \
-            'docker|podman|containerd' \
-            /proc/1/cgroup 2>/dev/null; then
-
-            VIRT_TYPE="docker"
-        fi
-
-        if grep -qaE \
-            'lxc|incus' \
-            /proc/1/cgroup 2>/dev/null; then
-
-            VIRT_TYPE="lxc"
-        fi
-    fi
-
-    # -----------------------------------------------------
-    # 环境文件
-    # -----------------------------------------------------
-
-    if [ "$VIRT_TYPE" = "none" ]; then
-
-        [ -f /.dockerenv ] && VIRT_TYPE="docker"
-
-        [ -f /run/.containerenv ] && \
-            VIRT_TYPE="container"
-    fi
-
-    # -----------------------------------------------------
-    # OpenVZ
-    # -----------------------------------------------------
-
-    if [ "$VIRT_TYPE" = "none" ]; then
-
-        [ -d /proc/vz ] && \
-        [ ! -d /proc/bc ] && \
-            VIRT_TYPE="openvz"
-    fi
-
-    # -----------------------------------------------------
-    # DMI
-    # -----------------------------------------------------
-
-    if [ "$VIRT_TYPE" = "none" ]; then
-
-        if command -v dmidecode >/dev/null 2>&1; then
-
-            DMI=$(dmidecode -s system-product-name \
-                2>/dev/null || true)
-
-            echo "$DMI" | grep -qiE \
-                'openvz|lxc|docker|kvm' && \
-                VIRT_TYPE="virtualized"
-        fi
-    fi
-
-    # -----------------------------------------------------
-    # 输出
-    # -----------------------------------------------------
+    [ -d /proc/vz ] && \
+    [ ! -d /proc/bc ] && \
+        VIRT_TYPE="openvz"
 
     log_info "环境: ${VIRT_TYPE}"
 }
@@ -219,8 +150,8 @@ install_deps() {
                 stubby-openrc \
                 bind-tools \
                 openssl \
-                ca-certificates \
                 iproute2 \
+                ca-certificates \
                 python3
             ;;
 
@@ -234,8 +165,8 @@ install_deps() {
                 stubby \
                 dnsutils \
                 openssl \
-                ca-certificates \
                 iproute2 \
+                ca-certificates \
                 python3
             ;;
     esac
@@ -244,12 +175,40 @@ install_deps() {
 }
 
 # =========================================================
-# IPv6 检测
+# 检测 IPv4
+# =========================================================
+
+detect_ipv4() {
+
+    log_step "检测 IPv4 环境"
+
+    if ip -4 addr show lo | grep -q "127.0.0.1"; then
+
+        IPV4_AVAILABLE=true
+
+        log_info "IPv4 loopback 可用"
+    fi
+
+    if timeout 5 ping -4 -c1 1.1.1.1 \
+        >/dev/null 2>&1; then
+
+        IPV4_UPSTREAM=true
+
+        log_info "IPv4 外网可达"
+
+    else
+
+        log_warn "IPv4 外网不可达"
+    fi
+}
+
+# =========================================================
+# 检测 IPv6
 # =========================================================
 
 detect_ipv6() {
 
-    log_step "检测 IP 环境"
+    log_step "检测 IPv6 环境"
 
     if ip -6 addr show lo 2>/dev/null | \
         grep -q "::1"; then
@@ -270,84 +229,133 @@ EOF
     fi
 
     if [ "$IPV6_AVAILABLE" = true ]; then
-        log_info "本地 IPv6 bind 可用"
+
+        log_info "IPv6 loopback 可用"
+
     else
-        log_warn "本地 IPv6 bind 不可用"
+
+        log_warn "IPv6 loopback 不可用"
+    fi
+
+    if timeout 5 ping6 -c1 \
+        2606:4700:4700::1111 \
+        >/dev/null 2>&1; then
+
+        IPV6_UPSTREAM=true
+
+        log_info "IPv6 外网可达"
+
+    else
+
+        log_warn "IPv6 外网不可达"
     fi
 }
 
 # =========================================================
-# capability 检测
+# 检测 capability
 # =========================================================
 
-detect_capability_issues() {
+detect_capability() {
 
     if [ "$OS" != "alpine" ]; then
         return
     fi
 
-    log_step "检测 Stubby capability 兼容性"
+    log_step "检测 capability 兼容性"
 
     SCORE=0
 
-    # -----------------------------------------------------
-    # 容器环境
-    # -----------------------------------------------------
-
     case "$VIRT_TYPE" in
-        lxc|openvz|docker|podman|container|container-other)
+        lxc|docker|openvz|podman)
 
             SCORE=$((SCORE + 2))
-
-            log_warn "检测到受限容器环境"
             ;;
     esac
 
-    # -----------------------------------------------------
-    # IPv6 permission denied
-    # -----------------------------------------------------
-
-    if dmesg 2>/dev/null | \
-        grep -qi 'permission denied'; then
-
+    dmesg 2>/dev/null | \
+        grep -qi "permission denied" && \
         SCORE=$((SCORE + 1))
-    fi
-
-    # -----------------------------------------------------
-    # capability 支持
-    # -----------------------------------------------------
-
-    if ! command -v getcap >/dev/null 2>&1; then
-        SCORE=$((SCORE + 1))
-    fi
-
-    # -----------------------------------------------------
-    # OpenRC supervise-daemon
-    # -----------------------------------------------------
-
-    if command -v supervise-daemon >/dev/null 2>&1; then
-
-        if ! supervise-daemon --help \
-            >/dev/null 2>&1; then
-
-            SCORE=$((SCORE + 1))
-        fi
-    fi
-
-    # -----------------------------------------------------
-    # 判定
-    # -----------------------------------------------------
 
     if [ "$SCORE" -ge 2 ]; then
 
         USE_ROOT_STUBBY=true
 
-        log_warn "检测到 capability 兼容性风险"
+        log_warn "检测到受限环境"
         log_warn "将启用 Root Compatibility Mode"
 
     else
 
-        log_info "capability 兼容性正常"
+        log_info "capability 正常"
+    fi
+}
+
+# =========================================================
+# 生成监听地址
+# =========================================================
+
+generate_listen() {
+
+    LISTEN_CONFIG="listen_addresses:"
+
+    if [ "$IPV4_AVAILABLE" = true ]; then
+
+        LISTEN_CONFIG="${LISTEN_CONFIG}
+  - 127.0.0.1@53"
+    fi
+
+    if [ "$IPV6_AVAILABLE" = true ]; then
+
+        LISTEN_CONFIG="${LISTEN_CONFIG}
+  - 0::1@53"
+    fi
+}
+
+# =========================================================
+# 生成 upstream
+# =========================================================
+
+generate_upstreams() {
+
+    UPSTREAMS=""
+
+    # IPv4 upstream
+    if [ "$IPV4_UPSTREAM" = true ]; then
+
+        UPSTREAMS="${UPSTREAMS}
+
+  # Cloudflare IPv4
+  - address_data: 1.1.1.1
+    tls_auth_name: \"cloudflare-dns.com\"
+
+  - address_data: 1.0.0.1
+    tls_auth_name: \"cloudflare-dns.com\"
+
+  # Google IPv4
+  - address_data: 8.8.8.8
+    tls_auth_name: \"dns.google\"
+
+  - address_data: 8.8.4.4
+    tls_auth_name: \"dns.google\""
+    fi
+
+    # IPv6 upstream
+    if [ "$IPV6_UPSTREAM" = true ]; then
+
+        UPSTREAMS="${UPSTREAMS}
+
+  # Cloudflare IPv6
+  - address_data: 2606:4700:4700::1111
+    tls_auth_name: \"cloudflare-dns.com\"
+
+  - address_data: 2606:4700:4700::1001
+    tls_auth_name: \"cloudflare-dns.com\"
+
+  # Google IPv6
+  - address_data: 2001:4860:4860::8888
+    tls_auth_name: \"dns.google\"
+
+  - address_data: 2001:4860:4860::8844
+    tls_auth_name: \"dns.google\""
     fi
 }
 
@@ -361,24 +369,8 @@ config_stubby() {
 
     mkdir -p /etc/stubby
 
-    if [ "$IPV6_AVAILABLE" = true ]; then
-
-        LISTEN=$(cat << EOF
-listen_addresses:
-  - 127.0.0.1@53
-  - 0::1@53
-EOF
-)
-
-    else
-
-        LISTEN=$(cat << EOF
-listen_addresses:
-  - 127.0.0.1@53
-EOF
-)
-
-    fi
+    generate_listen
+    generate_upstreams
 
     cat > "$STUBBY_CONF" << EOF
 resolution_type: GETDNS_RESOLUTION_STUB
@@ -404,37 +396,10 @@ tls_backoff_time: 900
 
 dnssec: GETDNS_EXTENSION_TRUE
 
-${LISTEN}
+${LISTEN_CONFIG}
 
 upstream_recursive_servers:
-
-  # Cloudflare IPv4
-  - address_data: 1.1.1.1
-    tls_auth_name: "cloudflare-dns.com"
-
-  - address_data: 1.0.0.1
-    tls_auth_name: "cloudflare-dns.com"
-
-  # Cloudflare IPv6
-  - address_data: 2606:4700:4700::1111
-    tls_auth_name: "cloudflare-dns.com"
-
-  - address_data: 2606:4700:4700::1001
-    tls_auth_name: "cloudflare-dns.com"
-
-  # Google IPv4
-  - address_data: 8.8.8.8
-    tls_auth_name: "dns.google"
-
-  - address_data: 8.8.4.4
-    tls_auth_name: "dns.google"
-
-  # Google IPv6
-  - address_data: 2001:4860:4860::8888
-    tls_auth_name: "dns.google"
-
-  - address_data: 2001:4860:4860::8844
-    tls_auth_name: "dns.google"
+${UPSTREAMS}
 EOF
 
     chmod 640 "$STUBBY_CONF"
@@ -443,10 +408,10 @@ EOF
 }
 
 # =========================================================
-# 修复 Alpine capability
+# 修复 Alpine Stubby
 # =========================================================
 
-fix_alpine_service() {
+fix_alpine_stubby() {
 
     if [ "$OS" != "alpine" ]; then
         return
@@ -456,7 +421,7 @@ fix_alpine_service() {
         return
     fi
 
-    log_step "修复 Alpine Stubby 服务"
+    log_step "修复 Alpine Stubby"
 
     if [ -f /etc/init.d/stubby ]; then
 
@@ -470,7 +435,7 @@ fix_alpine_service() {
         sed -i '/capabilities=/d' \
             /etc/init.d/stubby
 
-        log_info "已启用 Root Compatibility Mode"
+        log_info "Root Compatibility Mode 已启用"
     fi
 }
 
@@ -482,24 +447,26 @@ setup_dns() {
 
     log_step "配置系统 DNS"
 
-    if [ "$IPV6_AVAILABLE" = true ]; then
+    DNS_CONTENT=""
 
-        DNS_BLOCK=$(cat << EOF
-nameserver 127.0.0.1
-nameserver ::1
-EOF
-)
+    if [ "$IPV4_AVAILABLE" = true ]; then
 
-    else
-
-        DNS_BLOCK=$(cat << EOF
-nameserver 127.0.0.1
-EOF
-)
-
+        DNS_CONTENT="${DNS_CONTENT}
+nameserver 127.0.0.1"
     fi
 
-    # dhcpcd
+    if [ "$IPV6_AVAILABLE" = true ]; then
+
+        DNS_CONTENT="${DNS_CONTENT}
+nameserver ::1"
+    fi
+
+    DNS_CONTENT="${DNS_CONTENT}
+
+options edns0
+options timeout:2
+options attempts:2"
+
     if [ -f /etc/dhcpcd.conf ]; then
 
         sed -i \
@@ -511,50 +478,13 @@ EOF
 # Secure-DNS Lite
 static domain_name_servers=127.0.0.1
 EOF
-
-        log_info "已配置 dhcpcd"
-    fi
-
-    # resolvconf
-    if [ -d /etc/resolvconf/resolv.conf.d ]; then
-
-        cat > /etc/resolvconf/resolv.conf.d/head << EOF
-${DNS_BLOCK}
-options edns0
-options timeout:2
-options attempts:2
-EOF
-
-        command -v resolvconf >/dev/null 2>&1 && \
-            resolvconf -u || true
-    fi
-
-    # systemd-resolved
-    if command -v systemctl >/dev/null 2>&1; then
-
-        systemctl is-active systemd-resolved \
-            >/dev/null 2>&1 && \
-            systemctl disable --now \
-            systemd-resolved >/dev/null 2>&1 || true
     fi
 
     [ -L "$RESOLV_CONF" ] && rm -f "$RESOLV_CONF"
 
-    cat > "$RESOLV_CONF" << EOF
-${DNS_BLOCK}
-options edns0
-options timeout:2
-options attempts:2
-EOF
+    echo "$DNS_CONTENT" > "$RESOLV_CONF"
 
     chmod 644 "$RESOLV_CONF"
-
-    if [ "$OS" = "alpine" ]; then
-
-        command -v rc-service >/dev/null 2>&1 && \
-            rc-service dhcpcd restart \
-            >/dev/null 2>&1 || true
-    fi
 
     log_info "系统 DNS 已配置"
 }
@@ -569,14 +499,6 @@ start_stubby() {
 
     case "$OS" in
 
-        debian)
-
-            systemctl enable stubby \
-                >/dev/null 2>&1 || true
-
-            systemctl restart stubby
-            ;;
-
         alpine)
 
             rc-update add stubby default \
@@ -584,13 +506,17 @@ start_stubby() {
 
             rc-service stubby restart
             ;;
+
+        debian)
+
+            systemctl enable stubby \
+                >/dev/null 2>&1 || true
+
+            systemctl restart stubby
+            ;;
     esac
 
     sleep 3
-
-    # -----------------------------------------------------
-    # 首次检测
-    # -----------------------------------------------------
 
     if dig cloudflare.com @127.0.0.1 +short \
         >/dev/null 2>&1; then
@@ -599,19 +525,15 @@ start_stubby() {
         return
     fi
 
-    # -----------------------------------------------------
-    # Alpine fallback
-    # -----------------------------------------------------
-
+    # fallback
     if [ "$OS" = "alpine" ] && \
        [ "$USE_ROOT_STUBBY" != true ]; then
 
-        log_warn "检测到 Stubby 启动异常"
         log_warn "尝试 fallback Root Mode"
 
         USE_ROOT_STUBBY=true
 
-        fix_alpine_service
+        fix_alpine_stubby
 
         rc-service stubby restart
 
@@ -620,16 +542,12 @@ start_stubby() {
         if dig cloudflare.com @127.0.0.1 +short \
             >/dev/null 2>&1; then
 
-            log_info "Fallback Root Mode 启动成功"
+            log_info "Fallback Root Mode 成功"
             return
         fi
     fi
 
-    # -----------------------------------------------------
-    # 失败日志
-    # -----------------------------------------------------
-
-    log_error "Stubby 未正常响应 DNS 查询"
+    log_error "Stubby 启动失败"
 
     echo ""
     echo "========== stubby 日志 =========="
@@ -638,7 +556,6 @@ start_stubby() {
         2>/dev/null || true
 
     echo "================================"
-    echo ""
 
     exit 1
 }
@@ -649,35 +566,19 @@ start_stubby() {
 
 test_dns() {
 
-    log_step "执行 DNS 测试"
+    log_step "测试 DNS"
 
-    TIME_MS=$(
-        dig cloudflare.com @127.0.0.1 \
-        2>/dev/null \
-        | awk '/Query time:/ {print $4}'
-    )
+    RESULT=$(dig cloudflare.com @127.0.0.1 +short)
 
-    log_info "DNS 解析正常 (${TIME_MS:-N/A} ms)"
-}
+    if [ -n "$RESULT" ]; then
 
-# =========================================================
-# DoT 测试
-# =========================================================
+        log_info "DNS 解析成功"
 
-test_dot() {
-
-    log_step "测试 DoT 连通性"
-
-    if timeout 5 openssl s_client \
-        -connect 1.1.1.1:853 \
-        -servername cloudflare-dns.com \
-        </dev/null >/dev/null 2>&1; then
-
-        log_info "DoT 853 连接正常"
+        echo "$RESULT"
 
     else
 
-        log_warn "DoT 853 连接失败"
+        log_error "DNS 解析失败"
     fi
 }
 
@@ -700,36 +601,35 @@ show_info() {
 
     echo ""
 
-    echo "  监听地址:"
+    echo "监听地址:"
 
-    if [ "$IPV6_AVAILABLE" = true ]; then
-        echo "    127.0.0.1:53"
-        echo "    [::1]:53"
-    else
-        echo "    127.0.0.1:53"
-    fi
+    [ "$IPV4_AVAILABLE" = true ] && \
+        echo "  127.0.0.1:53"
 
-    echo ""
-    echo "  上游 DNS:"
-    echo "    Cloudflare DoT"
-    echo "    Google DoT"
+    [ "$IPV6_AVAILABLE" = true ] && \
+        echo "  [::1]:53"
 
     echo ""
-    echo "  运行模式:"
+    echo "Upstream:"
+
+    [ "$IPV4_UPSTREAM" = true ] && \
+        echo "  IPv4 DoT"
+
+    [ "$IPV6_UPSTREAM" = true ] && \
+        echo "  IPv6 DoT"
+
+    echo ""
+    echo "模式:"
 
     if [ "$USE_ROOT_STUBBY" = true ]; then
-        echo "    Root Compatibility Mode"
+        echo "  Root Compatibility Mode"
     else
-        echo "    Capability Mode"
+        echo "  Capability Mode"
     fi
 
     echo ""
-    echo "  配置文件:"
-    echo "    ${STUBBY_CONF}"
-
-    echo ""
-    echo "  测试命令:"
-    echo "    dig cloudflare.com @127.0.0.1"
+    echo "测试命令:"
+    echo "  dig cloudflare.com @127.0.0.1"
 
     echo ""
 }
@@ -746,10 +646,10 @@ main() {
 "${BLUE}╔══════════════════════════════════════╗${NC}"
 
     echo -e \
-"${BLUE}║        Secure-DNS Lite v1.4         ║${NC}"
+"${BLUE}║        Secure-DNS Lite v1.5         ║${NC}"
 
     echo -e \
-"${BLUE}║    Adaptive DoT Deployment System   ║${NC}"
+"${BLUE}║   Adaptive IPv4/IPv6 DoT Resolver   ║${NC}"
 
     echo -e \
 "${BLUE}╚══════════════════════════════════════╝${NC}"
@@ -762,21 +662,21 @@ main() {
 
     install_deps
 
+    detect_ipv4
+
     detect_ipv6
 
-    detect_capability_issues
+    detect_capability
 
     config_stubby
 
-    fix_alpine_service
+    fix_alpine_stubby
 
     setup_dns
 
     start_stubby
 
     test_dns
-
-    test_dot
 
     show_info
 }
