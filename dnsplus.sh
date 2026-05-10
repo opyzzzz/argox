@@ -1,20 +1,26 @@
 #!/usr/bin/env bash
 
 # =========================================================
-# Secure-DNS Unbound Auto Installer v4.0
+# Secure-DNS Unbound Stable Edition v5.0
 #
-# 功能:
-# - 自动安装/升级稳定版 Unbound
-# - Alpine / Debian / Ubuntu 自动适配
-# - 自动检测 IPv4 / IPv6
-# - 自动检测 systemd/OpenRC
-# - 自动检测并安装依赖
-# - 自动处理 systemd-resolved
-# - 自动处理 dhcpcd
-# - 自动兼容旧版/新版 Unbound
-# - 自动启用 DNS over TLS
-# - Cloudflare + Google
-# - DNS Cache 优化
+# 稳定特性:
+# - Debian / Ubuntu / Alpine
+# - systemd / OpenRC 自动兼容
+# - 自动安装/升级 Unbound
+# - 自动 IPv4 / IPv6 检测
+# - 自动适配 IPv4-only / IPv6-only / 双栈
+# - 自动关闭 systemd-resolved
+# - 自动防止 dhcpcd 覆盖 resolv.conf
+# - Cloudflare + Google DNS over TLS
+# - 稳定优先
+#
+# 不使用:
+# - tcp-fastopen
+# - prefetch-key
+# - daemon 死循环
+# - chattr
+# - capability hack
+# - Root fallback
 #
 # =========================================================
 
@@ -32,7 +38,7 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 # =========================================================
-# 全局变量
+# 变量
 # =========================================================
 
 OS=""
@@ -41,8 +47,7 @@ INIT_SYSTEM=""
 ENABLE_IPV4=false
 ENABLE_IPV6=false
 
-SUPPORT_TCP_FASTOPEN=false
-SUPPORT_PREFETCH_KEY=false
+PREFER_IPV6="no"
 
 UNBOUND_CONF="/etc/unbound/unbound.conf"
 RESOLV_CONF="/etc/resolv.conf"
@@ -93,7 +98,7 @@ detect_system() {
     elif [ -f /etc/debian_version ]; then
         OS="debian"
     else
-        log_error "不支持的系统"
+        log_error "暂不支持当前系统"
         exit 1
     fi
 
@@ -102,7 +107,7 @@ detect_system() {
     elif command -v rc-service >/dev/null 2>&1; then
         INIT_SYSTEM="openrc"
     else
-        log_error "不支持的 init 系统"
+        log_error "无法识别 init 系统"
         exit 1
     fi
 
@@ -131,8 +136,7 @@ install_dependencies() {
                 openssl \
                 ca-certificates \
                 curl \
-                iproute2 \
-                drill
+                iproute2
             ;;
 
         debian)
@@ -157,7 +161,7 @@ install_dependencies() {
 }
 
 # =========================================================
-# 更新 Unbound
+# 升级 Unbound
 # =========================================================
 
 upgrade_unbound() {
@@ -168,41 +172,23 @@ upgrade_unbound() {
 
         alpine)
 
-            apk upgrade unbound \
+            apk upgrade \
+                unbound \
                 unbound-libs \
                 >/dev/null 2>&1 || true
             ;;
 
         debian)
 
-            apt-get install --only-upgrade -y \
+            apt-get install \
+                --only-upgrade \
+                -y \
                 unbound \
                 >/dev/null 2>&1 || true
             ;;
     esac
 
     log_info "Unbound 已更新"
-}
-
-# =========================================================
-# 检测 Unbound 功能
-# =========================================================
-
-detect_unbound_features() {
-
-    log_step "检测 Unbound 功能"
-
-    unbound -V | head -1
-
-    if unbound -V 2>&1 | grep -qi "TCP Fastopen"; then
-        SUPPORT_TCP_FASTOPEN=true
-        log_info "支持 TCP Fast Open"
-    fi
-
-    if unbound -V 2>&1 | grep -qi "subnetcache"; then
-        SUPPORT_PREFETCH_KEY=true
-        log_info "支持 Prefetch Key"
-    fi
 }
 
 # =========================================================
@@ -217,6 +203,7 @@ detect_ipv4() {
         >/dev/null 2>&1; then
 
         ENABLE_IPV4=true
+
         log_info "IPv4 可用"
 
     else
@@ -238,6 +225,9 @@ detect_ipv6() {
         >/dev/null 2>&1; then
 
         ENABLE_IPV6=true
+
+        PREFER_IPV6="yes"
+
         log_info "IPv6 可用"
 
     else
@@ -247,7 +237,7 @@ detect_ipv6() {
 }
 
 # =========================================================
-# 关闭 systemd-resolved
+# systemd-resolved
 # =========================================================
 
 disable_systemd_resolved() {
@@ -256,7 +246,7 @@ disable_systemd_resolved() {
 
         log_step "处理 systemd-resolved"
 
-        if systemctl is-active systemd-resolved \
+        if systemctl is-enabled systemd-resolved \
             >/dev/null 2>&1; then
 
             systemctl disable \
@@ -270,7 +260,7 @@ disable_systemd_resolved() {
 }
 
 # =========================================================
-# 防 DNS 覆盖
+# dhcpcd
 # =========================================================
 
 protect_resolvconf() {
@@ -284,12 +274,12 @@ protect_resolvconf() {
             || echo 'nohook resolv.conf' \
             >> /etc/dhcpcd.conf
 
-        log_info "已禁用 dhcpcd DNS 覆盖"
+        log_info "已禁用 dhcpcd 覆盖 DNS"
     fi
 }
 
 # =========================================================
-# 生成 Interface
+# Interface
 # =========================================================
 
 generate_interfaces() {
@@ -308,7 +298,7 @@ generate_interfaces() {
 }
 
 # =========================================================
-# 生成上游
+# Forwarders
 # =========================================================
 
 generate_forwarders() {
@@ -347,18 +337,6 @@ configure_unbound() {
     generate_interfaces
     generate_forwarders
 
-    EXTRA_CFG=""
-
-    if [ "$SUPPORT_TCP_FASTOPEN" = true ]; then
-        EXTRA_CFG="${EXTRA_CFG}
-    tcp-fastopen: yes"
-    fi
-
-    if [ "$SUPPORT_PREFETCH_KEY" = true ]; then
-        EXTRA_CFG="${EXTRA_CFG}
-    prefetch-key: yes"
-    fi
-
     cat > "$UNBOUND_CONF" << EOF
 server:
 
@@ -374,7 +352,7 @@ ${INTERFACE_CFG}
     do-udp: yes
     do-tcp: yes
 
-    prefer-ip6: yes
+    prefer-ip6: ${PREFER_IPV6}
 
     tls-cert-bundle: /etc/ssl/certs/ca-certificates.crt
 
@@ -386,7 +364,7 @@ ${INTERFACE_CFG}
     prefetch: yes
 
     cache-max-ttl: 86400
-    cache-min-ttl: 600
+    cache-min-ttl: 300
 
     rrset-roundrobin: yes
 
@@ -399,7 +377,9 @@ ${INTERFACE_CFG}
     harden-glue: yes
     harden-dnssec-stripped: yes
 
-${EXTRA_CFG}
+    unwanted-reply-threshold: 10000
+
+    interface-automatic: no
 
 forward-zone:
 
@@ -432,34 +412,28 @@ check_config() {
 }
 
 # =========================================================
-# 配置 DNS
+# 配置系统 DNS
 # =========================================================
 
 configure_dns() {
 
     log_step "配置系统 DNS"
 
-    DNS_CONTENT=""
-
-    if [ "$ENABLE_IPV4" = true ]; then
-        DNS_CONTENT="${DNS_CONTENT}
-nameserver 127.0.0.1"
-    fi
-
-    if [ "$ENABLE_IPV6" = true ]; then
-        DNS_CONTENT="${DNS_CONTENT}
-nameserver ::1"
-    fi
-
-    DNS_CONTENT="${DNS_CONTENT}
-
-options timeout:2
-options attempts:2
-options edns0"
-
     [ -L "$RESOLV_CONF" ] && rm -f "$RESOLV_CONF"
 
-    echo "$DNS_CONTENT" > "$RESOLV_CONF"
+    {
+        [ "$ENABLE_IPV4" = true ] && \
+            echo "nameserver 127.0.0.1"
+
+        [ "$ENABLE_IPV6" = true ] && \
+            echo "nameserver ::1"
+
+        echo ""
+        echo "options timeout:2"
+        echo "options attempts:2"
+        echo "options edns0"
+
+    } > "$RESOLV_CONF"
 
     chmod 644 "$RESOLV_CONF"
 
@@ -467,7 +441,7 @@ options edns0"
 }
 
 # =========================================================
-# 启动 Unbound
+# 启动
 # =========================================================
 
 start_unbound() {
@@ -523,13 +497,18 @@ test_dns() {
         echo ""
         echo "========== Unbound 日志 =========="
 
-        journalctl -u unbound \
-            -n 50 \
-            --no-pager \
-            2>/dev/null || true
+        if [ "$INIT_SYSTEM" = "systemd" ]; then
 
-        tail -n 50 /var/log/messages \
-            2>/dev/null || true
+            journalctl -u unbound \
+                -n 50 \
+                --no-pager \
+                2>/dev/null || true
+
+        else
+
+            tail -n 50 /var/log/messages \
+                2>/dev/null || true
+        fi
 
         echo "================================"
 
@@ -570,7 +549,7 @@ show_info() {
 "${CYAN}═══════════════════════════════════════${NC}"
 
     echo -e \
-"${CYAN}   Secure-DNS Unbound 部署完成${NC}"
+"${CYAN}      Secure-DNS 部署完成${NC}"
 
     echo -e \
 "${CYAN}═══════════════════════════════════════${NC}"
@@ -593,8 +572,8 @@ show_info() {
 
     echo ""
 
-    echo "测试命令:"
-    echo "  dig cloudflare.com @127.0.0.1"
+    echo "IPv6 优先:"
+    echo "  ${PREFER_IPV6}"
 
     echo ""
 
@@ -602,10 +581,15 @@ show_info() {
     echo "  ${UNBOUND_CONF}"
 
     echo ""
+
+    echo "测试命令:"
+    echo "  dig cloudflare.com @127.0.0.1"
+
+    echo ""
 }
 
 # =========================================================
-# 主流程
+# MAIN
 # =========================================================
 
 main() {
@@ -616,10 +600,7 @@ main() {
 "${BLUE}╔══════════════════════════════════════╗${NC}"
 
     echo -e \
-"${BLUE}║ Secure-DNS Unbound Auto Installer   ║${NC}"
-
-    echo -e \
-"${BLUE}║              v4.0                   ║${NC}"
+"${BLUE}║    Secure-DNS Unbound Stable v5.0   ║${NC}"
 
     echo -e \
 "${BLUE}╚══════════════════════════════════════╝${NC}"
@@ -633,8 +614,6 @@ main() {
     install_dependencies
 
     upgrade_unbound
-
-    detect_unbound_features
 
     detect_ipv4
 
