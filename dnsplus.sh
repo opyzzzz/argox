@@ -9,20 +9,19 @@
 #   - Alpine Linux
 #
 # 特点:
-#   - 轻量
 #   - 无 watchdog
 #   - 无无限循环
 #   - 无 chattr
-#   - 无暴力 systemd-resolved mask
-#   - 兼容 VPS / Docker / LXC
+#   - 无 systemd-resolved mask
+#   - VPS / NAT / OpenRC 兼容优化
+#   - 保留 IPv6 DNS 支持
 #   - 兼容 sing-box / xray
 #
 # 上游:
 #   - Cloudflare
 #   - Google
 #
-# Author: ChatGPT
-# Version: v1.0
+# Version: v1.1
 # =========================================================
 
 set -Eeuo pipefail
@@ -82,6 +81,7 @@ check_root() {
 # =========================================================
 
 detect_os() {
+
     if [ -f /etc/alpine-release ]; then
         OS="alpine"
     elif [ -f /etc/debian_version ]; then
@@ -91,7 +91,8 @@ detect_os() {
         exit 1
     fi
 
-    if [ -f /.dockerenv ] || grep -qaE 'docker|lxc|kubepods' /proc/1/cgroup 2>/dev/null; then
+    if [ -f /.dockerenv ] || \
+       grep -qaE 'docker|lxc|kubepods' /proc/1/cgroup 2>/dev/null; then
         CONTAINER="yes"
     else
         CONTAINER="no"
@@ -106,15 +107,19 @@ detect_os() {
 # =========================================================
 
 install_deps() {
+
     log_step "安装依赖"
 
     case "$OS" in
+
         alpine)
             apk add --no-cache \
                 stubby \
+                stubby-openrc \
                 ca-certificates \
                 bind-tools \
-                openssl
+                openssl \
+                iproute2
             ;;
 
         debian)
@@ -126,7 +131,8 @@ install_deps() {
                 stubby \
                 dnsutils \
                 ca-certificates \
-                openssl
+                openssl \
+                iproute2
             ;;
     esac
 
@@ -138,6 +144,7 @@ install_deps() {
 # =========================================================
 
 config_stubby() {
+
     log_step "配置 Stubby"
 
     mkdir -p /etc/stubby
@@ -207,22 +214,40 @@ EOF
 }
 
 # =========================================================
-# 配置 resolv.conf
+# 配置系统 DNS
 # =========================================================
 
 setup_resolv() {
+
     log_step "配置系统 DNS"
 
+    # -----------------------------------------------------
     # Alpine dhcpcd
+    # -----------------------------------------------------
+
     if [ -f /etc/dhcpcd.conf ]; then
-        if ! grep -q "^nohook resolv.conf" /etc/dhcpcd.conf 2>/dev/null; then
-            echo "nohook resolv.conf" >> /etc/dhcpcd.conf
-            log_info "已禁用 dhcpcd 自动覆盖 DNS"
-        fi
+
+        # 删除旧配置
+        sed -i '/^nohook resolv.conf/d' /etc/dhcpcd.conf
+        sed -i '/^static domain_name_servers=/d' /etc/dhcpcd.conf
+
+        # 添加静态 DNS
+        cat >> /etc/dhcpcd.conf << EOF
+
+# Secure-DNS Lite
+static domain_name_servers=127.0.0.1 ::1
+
+EOF
+
+        log_info "已配置 dhcpcd 静态 DNS"
     fi
 
+    # -----------------------------------------------------
     # resolvconf
+    # -----------------------------------------------------
+
     if [ -d /etc/resolvconf/resolv.conf.d ]; then
+
         cat > /etc/resolvconf/resolv.conf.d/head << EOF
 nameserver 127.0.0.1
 nameserver ::1
@@ -238,17 +263,27 @@ EOF
         log_info "已配置 resolvconf"
     fi
 
+    # -----------------------------------------------------
     # systemd-resolved
-    if systemctl is-active systemd-resolved >/dev/null 2>&1; then
+    # -----------------------------------------------------
 
-        log_warn "检测到 systemd-resolved"
+    if command -v systemctl >/dev/null 2>&1; then
 
-        systemctl disable --now systemd-resolved 2>/dev/null || true
+        if systemctl is-active systemd-resolved >/dev/null 2>&1; then
 
-        log_info "已停止 systemd-resolved"
+            log_warn "检测到 systemd-resolved"
+
+            systemctl disable --now systemd-resolved \
+                >/dev/null 2>&1 || true
+
+            log_info "已停止 systemd-resolved"
+        fi
     fi
 
-    # 解除软链接
+    # -----------------------------------------------------
+    # resolv.conf
+    # -----------------------------------------------------
+
     if [ -L "$RESOLV_CONF" ]; then
         rm -f "$RESOLV_CONF"
     fi
@@ -263,6 +298,17 @@ EOF
 
     chmod 644 "$RESOLV_CONF"
 
+    # -----------------------------------------------------
+    # Alpine 重载 dhcpcd
+    # -----------------------------------------------------
+
+    if [ "$OS" = "alpine" ]; then
+
+        if command -v rc-service >/dev/null 2>&1; then
+            rc-service dhcpcd restart >/dev/null 2>&1 || true
+        fi
+    fi
+
     log_info "系统 DNS 已指向 127.0.0.1"
 }
 
@@ -271,27 +317,45 @@ EOF
 # =========================================================
 
 start_stubby() {
+
     log_step "启动 Stubby"
 
     case "$OS" in
 
         debian)
+
             systemctl enable stubby >/dev/null 2>&1 || true
             systemctl restart stubby
             ;;
 
         alpine)
+
             rc-update add stubby default >/dev/null 2>&1 || true
             rc-service stubby restart
             ;;
     esac
 
-    sleep 2
+    sleep 3
 
-    if pgrep -x stubby >/dev/null 2>&1; then
-        log_info "Stubby 已启动"
+    # -----------------------------------------------------
+    # 使用真实 DNS 查询检测
+    # 避免 pgrep Alpine 误判
+    # -----------------------------------------------------
+
+    if dig google.com @127.0.0.1 +short >/dev/null 2>&1; then
+
+        log_info "Stubby 已正常工作"
+
     else
-        log_error "Stubby 启动失败"
+
+        log_error "Stubby 未正常响应 DNS 查询"
+
+        echo ""
+        echo "========== stubby 日志 =========="
+        tail -n 20 /var/log/messages 2>/dev/null || true
+        echo "================================"
+        echo ""
+
         exit 1
     fi
 }
@@ -301,26 +365,31 @@ start_stubby() {
 # =========================================================
 
 test_dns() {
+
     log_step "执行 DNS 测试"
 
     if dig google.com @127.0.0.1 +short >/dev/null 2>&1; then
 
-        TIME_MS=$(dig google.com @127.0.0.1 2>/dev/null \
-            | awk '/Query time:/ {print $4}')
+        TIME_MS=$(
+            dig google.com @127.0.0.1 2>/dev/null \
+            | awk '/Query time:/ {print $4}'
+        )
 
         log_info "DNS 解析正常 (${TIME_MS:-N/A} ms)"
 
     else
+
         log_error "DNS 解析失败"
         exit 1
     fi
 }
 
 # =========================================================
-# DoT 连通性测试
+# DoT 测试
 # =========================================================
 
 test_dot() {
+
     log_step "测试 DoT 连通性"
 
     if command -v openssl >/dev/null 2>&1; then
@@ -333,13 +402,14 @@ test_dot() {
             log_info "DoT 853 连接正常"
 
         else
+
             log_warn "DoT 853 连接失败"
         fi
     fi
 }
 
 # =========================================================
-# 信息显示
+# 信息
 # =========================================================
 
 show_info() {
@@ -350,16 +420,17 @@ show_info() {
     echo -e "${CYAN}═══════════════════════════════════════${NC}"
     echo ""
 
-    echo -e "  DNS:"
+    echo -e "  本地 DNS:"
     echo -e "    127.0.0.1"
+    echo -e "    ::1"
     echo ""
 
-    echo -e "  上游:"
+    echo -e "  上游 DNS:"
     echo -e "    Cloudflare DoT"
     echo -e "    Google DoT"
     echo ""
 
-    echo -e "  配置:"
+    echo -e "  配置文件:"
     echo -e "    ${STUBBY_CONF}"
     echo ""
 
@@ -368,6 +439,7 @@ show_info() {
     echo ""
 
     echo -e "  查看状态:"
+
     case "$OS" in
         debian)
             echo -e "    systemctl status stubby"
@@ -389,8 +461,9 @@ show_info() {
 main() {
 
     echo ""
+
     echo -e "${BLUE}╔══════════════════════════════════════╗${NC}"
-    echo -e "${BLUE}║        Secure-DNS Lite v1.0         ║${NC}"
+    echo -e "${BLUE}║        Secure-DNS Lite v1.1         ║${NC}"
     echo -e "${BLUE}║         DNS over TLS Setup          ║${NC}"
     echo -e "${BLUE}╚══════════════════════════════════════╝${NC}"
 
