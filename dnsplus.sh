@@ -1,22 +1,21 @@
 #!/usr/bin/env bash
 
 # =========================================================
-# Secure-DNS Unbound Edition v1.0
+# Secure-DNS Unbound Edition v2.0
 #
-# 功能:
-# - Unbound + DNS over TLS
+# 生产级 DNS over TLS 自动部署
+#
+# 特性:
+# - Alpine / Debian / Ubuntu
 # - 自动检测 IPv4 / IPv6
-# - 自动适配 Alpine / Debian
 # - 自动适配 LXC / Docker / KVM
-# - Cloudflare + Google DoT
+# - Unbound + DoT
+# - Cloudflare + Google
+# - DNS 缓存优化
+# - 防 resolv.conf 覆盖
 # - 无 watchdog
 # - 无死循环
 # - 无 stubby/getdns bug
-#
-# 支持:
-# - Alpine
-# - Debian
-# - Ubuntu
 #
 # =========================================================
 
@@ -66,7 +65,7 @@ log_step() {
 }
 
 # =========================================================
-# root
+# Root 检测
 # =========================================================
 
 check_root() {
@@ -186,7 +185,7 @@ detect_ipv6() {
 # 生成监听配置
 # =========================================================
 
-generate_interface() {
+generate_interfaces() {
 
     INTERFACE_CFG=""
 
@@ -204,7 +203,7 @@ generate_interface() {
 }
 
 # =========================================================
-# 生成 forward 配置
+# 生成上游配置
 # =========================================================
 
 generate_forwarders() {
@@ -240,7 +239,7 @@ config_unbound() {
 
     mkdir -p /etc/unbound
 
-    generate_interface
+    generate_interfaces
     generate_forwarders
 
     cat > "$UNBOUND_CONF" << EOF
@@ -268,17 +267,23 @@ ${INTERFACE_CFG}
     qname-minimisation: yes
 
     prefetch: yes
+    prefetch-key: yes
 
-    cache-max-ttl: 14400
-    cache-min-ttl: 300
-
-    edns-buffer-size: 1232
+    cache-max-ttl: 86400
+    cache-min-ttl: 600
 
     rrset-roundrobin: yes
 
-    num-threads: 1
+    edns-buffer-size: 1232
+
+    tcp-fastopen: yes
 
     so-reuseport: yes
+
+    num-threads: 1
+
+    harden-glue: yes
+    harden-dnssec-stripped: yes
 
 forward-zone:
 
@@ -295,47 +300,55 @@ EOF
 }
 
 # =========================================================
-# 配置 resolv.conf
+# 防止 resolv.conf 被覆盖
+# =========================================================
+
+protect_resolvconf() {
+
+    log_step "保护 resolv.conf"
+
+    if [ -f /etc/dhcpcd.conf ]; then
+
+        grep -q '^nohook resolv.conf' \
+            /etc/dhcpcd.conf \
+            || echo 'nohook resolv.conf' \
+            >> /etc/dhcpcd.conf
+
+        log_info "已禁用 dhcpcd 覆盖 DNS"
+    fi
+}
+
+# =========================================================
+# 配置系统 DNS
 # =========================================================
 
 setup_dns() {
 
     log_step "配置系统 DNS"
 
-    DNS=""
+    DNS_CONTENT=""
 
     if [ "$ENABLE_IPV4" = true ]; then
 
-        DNS="${DNS}
+        DNS_CONTENT="${DNS_CONTENT}
 nameserver 127.0.0.1"
     fi
 
     if [ "$ENABLE_IPV6" = true ]; then
 
-        DNS="${DNS}
+        DNS_CONTENT="${DNS_CONTENT}
 nameserver ::1"
     fi
 
-    DNS="${DNS}
+    DNS_CONTENT="${DNS_CONTENT}
 
 options timeout:2
 options attempts:2
 options edns0"
 
-    if [ -f /etc/dhcpcd.conf ]; then
-
-        sed -i \
-            '/^static domain_name_servers=/d' \
-            /etc/dhcpcd.conf
-
-        echo \
-"static domain_name_servers=127.0.0.1" \
-            >> /etc/dhcpcd.conf
-    fi
-
     [ -L "$RESOLV_CONF" ] && rm -f "$RESOLV_CONF"
 
-    echo "$DNS" > "$RESOLV_CONF"
+    echo "$DNS_CONTENT" > "$RESOLV_CONF"
 
     chmod 644 "$RESOLV_CONF"
 
@@ -370,30 +383,6 @@ start_unbound() {
     esac
 
     sleep 5
-
-    if dig cloudflare.com \
-        @127.0.0.1 \
-        +short \
-        +time=3 \
-        +tries=1 \
-        >/dev/null 2>&1; then
-
-        log_info "Unbound 工作正常"
-
-    else
-
-        log_error "Unbound 启动失败"
-
-        echo ""
-        echo "========== Unbound 日志 =========="
-
-        tail -n 50 /var/log/messages \
-            2>/dev/null || true
-
-        echo "================================"
-
-        exit 1
-    fi
 }
 
 # =========================================================
@@ -419,6 +408,48 @@ test_dns() {
     else
 
         log_error "DNS 解析失败"
+
+        echo ""
+        echo "========== Unbound 日志 =========="
+
+        tail -n 50 /var/log/messages \
+            2>/dev/null || true
+
+        journalctl -u unbound \
+            -n 50 \
+            --no-pager \
+            2>/dev/null || true
+
+        echo "================================"
+
+        exit 1
+    fi
+}
+
+# =========================================================
+# 状态检测
+# =========================================================
+
+show_status() {
+
+    log_step "运行状态"
+
+    if ss -lnptu 2>/dev/null | grep -q ':53'; then
+
+        log_info "53 端口监听正常"
+
+    else
+
+        log_warn "53 端口未监听"
+    fi
+
+    if pgrep unbound >/dev/null 2>&1; then
+
+        log_info "Unbound 进程正常"
+
+    else
+
+        log_warn "Unbound 未运行"
     fi
 }
 
@@ -457,8 +488,21 @@ show_info() {
 
     echo ""
 
+    echo "特性:"
+    echo "  DNS Cache"
+    echo "  TCP Fast Open"
+    echo "  QNAME Minimisation"
+    echo "  DNS Hardening"
+
+    echo ""
+
     echo "测试命令:"
     echo "  dig cloudflare.com @127.0.0.1"
+
+    echo ""
+
+    echo "配置文件:"
+    echo "  ${UNBOUND_CONF}"
 
     echo ""
 }
@@ -475,13 +519,15 @@ main() {
 "${BLUE}╔══════════════════════════════════════╗${NC}"
 
     echo -e \
-"${BLUE}║    Secure-DNS Unbound Edition       ║${NC}"
+"${BLUE}║   Secure-DNS Unbound Edition v2.0   ║${NC}"
 
     echo -e \
 "${BLUE}║         DNS over TLS                ║${NC}"
 
     echo -e \
 "${BLUE}╚══════════════════════════════════════╝${NC}"
+
+    echo ""
 
     check_root
 
@@ -495,11 +541,15 @@ main() {
 
     config_unbound
 
+    protect_resolvconf
+
     setup_dns
 
     start_unbound
 
     test_dns
+
+    show_status
 
     show_info
 }
