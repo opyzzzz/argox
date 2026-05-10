@@ -1,21 +1,20 @@
 #!/usr/bin/env bash
 
 # =========================================================
-# Secure-DNS Unbound Edition v2.0
+# Secure-DNS Unbound Auto Installer v4.0
 #
-# 生产级 DNS over TLS 自动部署
-#
-# 特性:
-# - Alpine / Debian / Ubuntu
+# 功能:
+# - 自动安装/升级稳定版 Unbound
+# - Alpine / Debian / Ubuntu 自动适配
 # - 自动检测 IPv4 / IPv6
-# - 自动适配 LXC / Docker / KVM
-# - Unbound + DoT
+# - 自动检测 systemd/OpenRC
+# - 自动检测并安装依赖
+# - 自动处理 systemd-resolved
+# - 自动处理 dhcpcd
+# - 自动兼容旧版/新版 Unbound
+# - 自动启用 DNS over TLS
 # - Cloudflare + Google
-# - DNS 缓存优化
-# - 防 resolv.conf 覆盖
-# - 无 watchdog
-# - 无死循环
-# - 无 stubby/getdns bug
+# - DNS Cache 优化
 #
 # =========================================================
 
@@ -37,8 +36,13 @@ NC='\033[0m'
 # =========================================================
 
 OS=""
+INIT_SYSTEM=""
+
 ENABLE_IPV4=false
 ENABLE_IPV6=false
+
+SUPPORT_TCP_FASTOPEN=false
+SUPPORT_PREFETCH_KEY=false
 
 UNBOUND_CONF="/etc/unbound/unbound.conf"
 RESOLV_CONF="/etc/resolv.conf"
@@ -65,7 +69,7 @@ log_step() {
 }
 
 # =========================================================
-# Root 检测
+# Root
 # =========================================================
 
 check_root() {
@@ -80,30 +84,37 @@ check_root() {
 # 系统检测
 # =========================================================
 
-detect_os() {
+detect_system() {
+
+    log_step "检测系统"
 
     if [ -f /etc/alpine-release ]; then
-
         OS="alpine"
-
     elif [ -f /etc/debian_version ]; then
-
         OS="debian"
-
     else
-
         log_error "不支持的系统"
         exit 1
     fi
 
+    if command -v systemctl >/dev/null 2>&1; then
+        INIT_SYSTEM="systemd"
+    elif command -v rc-service >/dev/null 2>&1; then
+        INIT_SYSTEM="openrc"
+    else
+        log_error "不支持的 init 系统"
+        exit 1
+    fi
+
     log_info "系统: ${OS}"
+    log_info "Init: ${INIT_SYSTEM}"
 }
 
 # =========================================================
 # 安装依赖
 # =========================================================
 
-install_deps() {
+install_dependencies() {
 
     log_step "安装依赖"
 
@@ -111,13 +122,17 @@ install_deps() {
 
         alpine)
 
+            apk update
+
             apk add --no-cache \
                 unbound \
                 unbound-openrc \
                 bind-tools \
                 openssl \
                 ca-certificates \
-                iproute2
+                curl \
+                iproute2 \
+                drill
             ;;
 
         debian)
@@ -131,15 +146,67 @@ install_deps() {
                 dnsutils \
                 openssl \
                 ca-certificates \
+                curl \
                 iproute2
             ;;
     esac
+
+    update-ca-certificates >/dev/null 2>&1 || true
 
     log_info "依赖安装完成"
 }
 
 # =========================================================
-# IPv4 检测
+# 更新 Unbound
+# =========================================================
+
+upgrade_unbound() {
+
+    log_step "升级 Unbound"
+
+    case "$OS" in
+
+        alpine)
+
+            apk upgrade unbound \
+                unbound-libs \
+                >/dev/null 2>&1 || true
+            ;;
+
+        debian)
+
+            apt-get install --only-upgrade -y \
+                unbound \
+                >/dev/null 2>&1 || true
+            ;;
+    esac
+
+    log_info "Unbound 已更新"
+}
+
+# =========================================================
+# 检测 Unbound 功能
+# =========================================================
+
+detect_unbound_features() {
+
+    log_step "检测 Unbound 功能"
+
+    unbound -V | head -1
+
+    if unbound -V 2>&1 | grep -qi "TCP Fastopen"; then
+        SUPPORT_TCP_FASTOPEN=true
+        log_info "支持 TCP Fast Open"
+    fi
+
+    if unbound -V 2>&1 | grep -qi "subnetcache"; then
+        SUPPORT_PREFETCH_KEY=true
+        log_info "支持 Prefetch Key"
+    fi
+}
+
+# =========================================================
+# IPv4
 # =========================================================
 
 detect_ipv4() {
@@ -150,7 +217,6 @@ detect_ipv4() {
         >/dev/null 2>&1; then
 
         ENABLE_IPV4=true
-
         log_info "IPv4 可用"
 
     else
@@ -160,7 +226,7 @@ detect_ipv4() {
 }
 
 # =========================================================
-# IPv6 检测
+# IPv6
 # =========================================================
 
 detect_ipv6() {
@@ -172,7 +238,6 @@ detect_ipv6() {
         >/dev/null 2>&1; then
 
         ENABLE_IPV6=true
-
         log_info "IPv6 可用"
 
     else
@@ -182,7 +247,49 @@ detect_ipv6() {
 }
 
 # =========================================================
-# 生成监听配置
+# 关闭 systemd-resolved
+# =========================================================
+
+disable_systemd_resolved() {
+
+    if [ "$INIT_SYSTEM" = "systemd" ]; then
+
+        log_step "处理 systemd-resolved"
+
+        if systemctl is-active systemd-resolved \
+            >/dev/null 2>&1; then
+
+            systemctl disable \
+                --now \
+                systemd-resolved \
+                >/dev/null 2>&1 || true
+
+            log_info "已关闭 systemd-resolved"
+        fi
+    fi
+}
+
+# =========================================================
+# 防 DNS 覆盖
+# =========================================================
+
+protect_resolvconf() {
+
+    log_step "保护 resolv.conf"
+
+    if [ -f /etc/dhcpcd.conf ]; then
+
+        grep -q '^nohook resolv.conf' \
+            /etc/dhcpcd.conf \
+            || echo 'nohook resolv.conf' \
+            >> /etc/dhcpcd.conf
+
+        log_info "已禁用 dhcpcd DNS 覆盖"
+    fi
+}
+
+# =========================================================
+# 生成 Interface
 # =========================================================
 
 generate_interfaces() {
@@ -190,20 +297,18 @@ generate_interfaces() {
     INTERFACE_CFG=""
 
     if [ "$ENABLE_IPV4" = true ]; then
-
         INTERFACE_CFG="${INTERFACE_CFG}
     interface: 127.0.0.1"
     fi
 
     if [ "$ENABLE_IPV6" = true ]; then
-
         INTERFACE_CFG="${INTERFACE_CFG}
     interface: ::1"
     fi
 }
 
 # =========================================================
-# 生成上游配置
+# 生成上游
 # =========================================================
 
 generate_forwarders() {
@@ -233,7 +338,7 @@ FORWARD_CFG="${FORWARD_CFG}
 # 配置 Unbound
 # =========================================================
 
-config_unbound() {
+configure_unbound() {
 
     log_step "配置 Unbound"
 
@@ -241,6 +346,18 @@ config_unbound() {
 
     generate_interfaces
     generate_forwarders
+
+    EXTRA_CFG=""
+
+    if [ "$SUPPORT_TCP_FASTOPEN" = true ]; then
+        EXTRA_CFG="${EXTRA_CFG}
+    tcp-fastopen: yes"
+    fi
+
+    if [ "$SUPPORT_PREFETCH_KEY" = true ]; then
+        EXTRA_CFG="${EXTRA_CFG}
+    prefetch-key: yes"
+    fi
 
     cat > "$UNBOUND_CONF" << EOF
 server:
@@ -267,7 +384,6 @@ ${INTERFACE_CFG}
     qname-minimisation: yes
 
     prefetch: yes
-    prefetch-key: yes
 
     cache-max-ttl: 86400
     cache-min-ttl: 600
@@ -276,14 +392,14 @@ ${INTERFACE_CFG}
 
     edns-buffer-size: 1232
 
-    tcp-fastopen: yes
-
     so-reuseport: yes
 
     num-threads: 1
 
     harden-glue: yes
     harden-dnssec-stripped: yes
+
+${EXTRA_CFG}
 
 forward-zone:
 
@@ -300,42 +416,37 @@ EOF
 }
 
 # =========================================================
-# 防止 resolv.conf 被覆盖
+# 检查配置
 # =========================================================
 
-protect_resolvconf() {
+check_config() {
 
-    log_step "保护 resolv.conf"
+    log_step "检查配置"
 
-    if [ -f /etc/dhcpcd.conf ]; then
-
-        grep -q '^nohook resolv.conf' \
-            /etc/dhcpcd.conf \
-            || echo 'nohook resolv.conf' \
-            >> /etc/dhcpcd.conf
-
-        log_info "已禁用 dhcpcd 覆盖 DNS"
+    if unbound-checkconf "$UNBOUND_CONF"; then
+        log_info "配置正常"
+    else
+        log_error "配置错误"
+        exit 1
     fi
 }
 
 # =========================================================
-# 配置系统 DNS
+# 配置 DNS
 # =========================================================
 
-setup_dns() {
+configure_dns() {
 
     log_step "配置系统 DNS"
 
     DNS_CONTENT=""
 
     if [ "$ENABLE_IPV4" = true ]; then
-
         DNS_CONTENT="${DNS_CONTENT}
 nameserver 127.0.0.1"
     fi
 
     if [ "$ENABLE_IPV6" = true ]; then
-
         DNS_CONTENT="${DNS_CONTENT}
 nameserver ::1"
     fi
@@ -363,22 +474,22 @@ start_unbound() {
 
     log_step "启动 Unbound"
 
-    case "$OS" in
+    case "$INIT_SYSTEM" in
 
-        alpine)
-
-            rc-update add unbound default \
-                >/dev/null 2>&1 || true
-
-            rc-service unbound restart
-            ;;
-
-        debian)
+        systemd)
 
             systemctl enable unbound \
                 >/dev/null 2>&1 || true
 
             systemctl restart unbound
+            ;;
+
+        openrc)
+
+            rc-update add unbound default \
+                >/dev/null 2>&1 || true
+
+            rc-service unbound restart
             ;;
     esac
 
@@ -401,23 +512,23 @@ test_dns() {
 
     if [ -n "$RESULT" ]; then
 
-        log_info "DNS 解析成功"
+        log_info "DNS 工作正常"
 
         echo "$RESULT"
 
     else
 
-        log_error "DNS 解析失败"
+        log_error "DNS 测试失败"
 
         echo ""
         echo "========== Unbound 日志 =========="
 
-        tail -n 50 /var/log/messages \
-            2>/dev/null || true
-
         journalctl -u unbound \
             -n 50 \
             --no-pager \
+            2>/dev/null || true
+
+        tail -n 50 /var/log/messages \
             2>/dev/null || true
 
         echo "================================"
@@ -427,34 +538,28 @@ test_dns() {
 }
 
 # =========================================================
-# 状态检测
+# 状态
 # =========================================================
 
 show_status() {
 
     log_step "运行状态"
 
-    if ss -lnptu 2>/dev/null | grep -q ':53'; then
-
-        log_info "53 端口监听正常"
-
+    if pgrep unbound >/dev/null 2>&1; then
+        log_info "Unbound 正常运行"
     else
-
-        log_warn "53 端口未监听"
+        log_warn "Unbound 未运行"
     fi
 
-    if pgrep unbound >/dev/null 2>&1; then
-
-        log_info "Unbound 进程正常"
-
+    if ss -lnptu | grep -q ':53'; then
+        log_info "53 端口监听正常"
     else
-
-        log_warn "Unbound 未运行"
+        log_warn "53 端口未监听"
     fi
 }
 
 # =========================================================
-# 显示信息
+# 信息
 # =========================================================
 
 show_info() {
@@ -465,7 +570,7 @@ show_info() {
 "${CYAN}═══════════════════════════════════════${NC}"
 
     echo -e \
-"${CYAN}     Secure-DNS Unbound 已部署${NC}"
+"${CYAN}   Secure-DNS Unbound 部署完成${NC}"
 
     echo -e \
 "${CYAN}═══════════════════════════════════════${NC}"
@@ -485,14 +590,6 @@ show_info() {
     echo "上游 DNS:"
     echo "  Cloudflare DoT"
     echo "  Google DoT"
-
-    echo ""
-
-    echo "特性:"
-    echo "  DNS Cache"
-    echo "  TCP Fast Open"
-    echo "  QNAME Minimisation"
-    echo "  DNS Hardening"
 
     echo ""
 
@@ -519,10 +616,10 @@ main() {
 "${BLUE}╔══════════════════════════════════════╗${NC}"
 
     echo -e \
-"${BLUE}║   Secure-DNS Unbound Edition v2.0   ║${NC}"
+"${BLUE}║ Secure-DNS Unbound Auto Installer   ║${NC}"
 
     echo -e \
-"${BLUE}║         DNS over TLS                ║${NC}"
+"${BLUE}║              v4.0                   ║${NC}"
 
     echo -e \
 "${BLUE}╚══════════════════════════════════════╝${NC}"
@@ -531,19 +628,27 @@ main() {
 
     check_root
 
-    detect_os
+    detect_system
 
-    install_deps
+    install_dependencies
+
+    upgrade_unbound
+
+    detect_unbound_features
 
     detect_ipv4
 
     detect_ipv6
 
-    config_unbound
+    disable_systemd_resolved
 
     protect_resolvconf
 
-    setup_dns
+    configure_unbound
+
+    check_config
+
+    configure_dns
 
     start_unbound
 
