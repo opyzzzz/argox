@@ -2,26 +2,27 @@
 
 # =========================================================
 # Secure-DNS Lite
-# 轻量级 DNS over TLS 自动部署脚本
+# 自适应 DNS over TLS 自动部署脚本
 #
 # 支持:
 #   - Debian / Ubuntu
 #   - Alpine Linux
 #
 # 特点:
+#   - 自动检测 IPv4 / IPv6 本地监听能力
+#   - 自动适配 LXC / Incus / NAT VPS
+#   - 保留 IPv6 上游 DNS
 #   - 无 watchdog
 #   - 无无限循环
 #   - 无 chattr
 #   - 无 systemd-resolved mask
-#   - VPS / NAT / OpenRC 兼容优化
-#   - 保留 IPv6 DNS 支持
 #   - 兼容 sing-box / xray
 #
 # 上游:
 #   - Cloudflare
 #   - Google
 #
-# Version: v1.1
+# Version: v1.2
 # =========================================================
 
 set -Eeuo pipefail
@@ -43,6 +44,13 @@ NC='\033[0m'
 
 STUBBY_CONF="/etc/stubby/stubby.yml"
 RESOLV_CONF="/etc/resolv.conf"
+
+# =========================================================
+# 默认能力
+# =========================================================
+
+IPV4_AVAILABLE=true
+IPV6_AVAILABLE=false
 
 # =========================================================
 # 日志
@@ -92,7 +100,7 @@ detect_os() {
     fi
 
     if [ -f /.dockerenv ] || \
-       grep -qaE 'docker|lxc|kubepods' /proc/1/cgroup 2>/dev/null; then
+       grep -qaE 'docker|lxc|kubepods|incus' /proc/1/cgroup 2>/dev/null; then
         CONTAINER="yes"
     else
         CONTAINER="no"
@@ -113,16 +121,18 @@ install_deps() {
     case "$OS" in
 
         alpine)
+
             apk add --no-cache \
                 stubby \
                 stubby-openrc \
-                ca-certificates \
                 bind-tools \
+                ca-certificates \
                 openssl \
                 iproute2
             ;;
 
         debian)
+
             export DEBIAN_FRONTEND=noninteractive
 
             apt-get update -qq
@@ -140,6 +150,51 @@ install_deps() {
 }
 
 # =========================================================
+# 检测 IPv6 本地监听能力
+# =========================================================
+
+detect_ip_capability() {
+
+    log_step "检测 IP 环境"
+
+    # -----------------------------------------------------
+    # 检查本地 IPv6 loopback
+    # -----------------------------------------------------
+
+    if ip -6 addr show lo 2>/dev/null | grep -q "::1"; then
+
+        # -------------------------------------------------
+        # 测试是否允许 bind IPv6 localhost
+        # -------------------------------------------------
+
+        if python3 - << 'EOF' >/dev/null 2>&1
+import socket
+s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+try:
+    s.bind(("::1", 53535))
+    s.close()
+    exit(0)
+except:
+    exit(1)
+EOF
+        then
+            IPV6_AVAILABLE=true
+        fi
+    fi
+
+    # -----------------------------------------------------
+    # 输出结果
+    # -----------------------------------------------------
+
+    if [ "$IPV6_AVAILABLE" = true ]; then
+        log_info "本地 IPv6 bind 可用"
+    else
+        log_warn "本地 IPv6 bind 不可用"
+        log_warn "将仅监听 127.0.0.1"
+    fi
+}
+
+# =========================================================
 # 配置 Stubby
 # =========================================================
 
@@ -149,7 +204,34 @@ config_stubby() {
 
     mkdir -p /etc/stubby
 
-    cat > "$STUBBY_CONF" << 'EOF'
+    # -----------------------------------------------------
+    # 监听地址
+    # -----------------------------------------------------
+
+    if [ "$IPV6_AVAILABLE" = true ]; then
+
+        LISTEN_BLOCK=$(cat << EOF
+listen_addresses:
+  - 127.0.0.1@53
+  - 0::1@53
+EOF
+)
+
+    else
+
+        LISTEN_BLOCK=$(cat << EOF
+listen_addresses:
+  - 127.0.0.1@53
+EOF
+)
+
+    fi
+
+    # -----------------------------------------------------
+    # 写入配置
+    # -----------------------------------------------------
+
+    cat > "$STUBBY_CONF" << EOF
 resolution_type: GETDNS_RESOLUTION_STUB
 
 dns_transport_list:
@@ -173,9 +255,7 @@ tls_backoff_time: 900
 
 dnssec: GETDNS_EXTENSION_TRUE
 
-listen_addresses:
-  - 127.0.0.1@53
-  - 0::1@53
+${LISTEN_BLOCK}
 
 upstream_recursive_servers:
 
@@ -222,24 +302,43 @@ setup_resolv() {
     log_step "配置系统 DNS"
 
     # -----------------------------------------------------
+    # 生成 nameserver
+    # -----------------------------------------------------
+
+    if [ "$IPV6_AVAILABLE" = true ]; then
+
+        DNS_SERVERS=$(cat << EOF
+nameserver 127.0.0.1
+nameserver ::1
+EOF
+)
+
+    else
+
+        DNS_SERVERS=$(cat << EOF
+nameserver 127.0.0.1
+EOF
+)
+
+    fi
+
+    # -----------------------------------------------------
     # Alpine dhcpcd
     # -----------------------------------------------------
 
     if [ -f /etc/dhcpcd.conf ]; then
 
-        # 删除旧配置
-        sed -i '/^nohook resolv.conf/d' /etc/dhcpcd.conf
-        sed -i '/^static domain_name_servers=/d' /etc/dhcpcd.conf
+        sed -i '/^static domain_name_servers=/d' \
+            /etc/dhcpcd.conf
 
-        # 添加静态 DNS
         cat >> /etc/dhcpcd.conf << EOF
 
 # Secure-DNS Lite
-static domain_name_servers=127.0.0.1 ::1
+static domain_name_servers=127.0.0.1
 
 EOF
 
-        log_info "已配置 dhcpcd 静态 DNS"
+        log_info "已配置 dhcpcd"
     fi
 
     # -----------------------------------------------------
@@ -249,8 +348,7 @@ EOF
     if [ -d /etc/resolvconf/resolv.conf.d ]; then
 
         cat > /etc/resolvconf/resolv.conf.d/head << EOF
-nameserver 127.0.0.1
-nameserver ::1
+${DNS_SERVERS}
 options edns0
 options timeout:2
 options attempts:2
@@ -269,7 +367,8 @@ EOF
 
     if command -v systemctl >/dev/null 2>&1; then
 
-        if systemctl is-active systemd-resolved >/dev/null 2>&1; then
+        if systemctl is-active systemd-resolved \
+            >/dev/null 2>&1; then
 
             log_warn "检测到 systemd-resolved"
 
@@ -289,8 +388,7 @@ EOF
     fi
 
     cat > "$RESOLV_CONF" << EOF
-nameserver 127.0.0.1
-nameserver ::1
+${DNS_SERVERS}
 options edns0
 options timeout:2
 options attempts:2
@@ -309,7 +407,7 @@ EOF
         fi
     fi
 
-    log_info "系统 DNS 已指向 127.0.0.1"
+    log_info "系统 DNS 已配置"
 }
 
 # =========================================================
@@ -338,11 +436,11 @@ start_stubby() {
     sleep 3
 
     # -----------------------------------------------------
-    # 使用真实 DNS 查询检测
-    # 避免 pgrep Alpine 误判
+    # DNS 查询检测
     # -----------------------------------------------------
 
-    if dig google.com @127.0.0.1 +short >/dev/null 2>&1; then
+    if dig google.com @127.0.0.1 +short \
+        >/dev/null 2>&1; then
 
         log_info "Stubby 已正常工作"
 
@@ -352,7 +450,9 @@ start_stubby() {
 
         echo ""
         echo "========== stubby 日志 =========="
-        tail -n 20 /var/log/messages 2>/dev/null || true
+
+        tail -n 30 /var/log/messages 2>/dev/null || true
+
         echo "================================"
         echo ""
 
@@ -368,10 +468,11 @@ test_dns() {
 
     log_step "执行 DNS 测试"
 
-    if dig google.com @127.0.0.1 +short >/dev/null 2>&1; then
+    if dig cloudflare.com @127.0.0.1 +short \
+        >/dev/null 2>&1; then
 
         TIME_MS=$(
-            dig google.com @127.0.0.1 2>/dev/null \
+            dig cloudflare.com @127.0.0.1 2>/dev/null \
             | awk '/Query time:/ {print $4}'
         )
 
@@ -409,7 +510,7 @@ test_dot() {
 }
 
 # =========================================================
-# 信息
+# 显示信息
 # =========================================================
 
 show_info() {
@@ -420,9 +521,15 @@ show_info() {
     echo -e "${CYAN}═══════════════════════════════════════${NC}"
     echo ""
 
-    echo -e "  本地 DNS:"
-    echo -e "    127.0.0.1"
-    echo -e "    ::1"
+    echo -e "  本地监听:"
+
+    if [ "$IPV6_AVAILABLE" = true ]; then
+        echo -e "    127.0.0.1:53"
+        echo -e "    [::1]:53"
+    else
+        echo -e "    127.0.0.1:53"
+    fi
+
     echo ""
 
     echo -e "  上游 DNS:"
@@ -435,7 +542,7 @@ show_info() {
     echo ""
 
     echo -e "  测试命令:"
-    echo -e "    dig google.com @127.0.0.1"
+    echo -e "    dig cloudflare.com @127.0.0.1"
     echo ""
 
     echo -e "  查看状态:"
@@ -463,8 +570,8 @@ main() {
     echo ""
 
     echo -e "${BLUE}╔══════════════════════════════════════╗${NC}"
-    echo -e "${BLUE}║        Secure-DNS Lite v1.1         ║${NC}"
-    echo -e "${BLUE}║         DNS over TLS Setup          ║${NC}"
+    echo -e "${BLUE}║        Secure-DNS Lite v1.2         ║${NC}"
+    echo -e "${BLUE}║       Adaptive DoT Deployment       ║${NC}"
     echo -e "${BLUE}╚══════════════════════════════════════╝${NC}"
 
     check_root
@@ -472,6 +579,8 @@ main() {
     detect_os
 
     install_deps
+
+    detect_ip_capability
 
     config_stubby
 
