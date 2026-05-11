@@ -1,24 +1,23 @@
 #!/usr/bin/env bash
 
 # =========================================================
-# Secure-DNS Unbound Stable Edition v5.1
+# Secure-DNS Unbound Lite Stable
 #
-# 修复版:
-# - Debian / Ubuntu / Alpine
-# - systemd / OpenRC
-# - 自动安装或升级 Unbound
+# 功能:
+# - 系统检测
+# - 自动安装依赖
 # - 自动检测 IPv4 / IPv6
-# - 自动适配 IPv4-only / IPv6-only / DualStack
-# - 正确兼容 dhcpcd / resolvconf / 容器
-# - 使用 resolv.conf.head 持久化 DNS
-# - Cloudflare + Google DNS over TLS
+# - 配置 Unbound + DoT
+# - 禁止 DHCP 注入 resolv.conf
+# - 配置 resolv.conf.head
+# - 启动服务
+# - DNS 自检
 #
-# 特点:
-# - 不强改 resolv.conf
-# - 不使用 chattr
-# - 不使用 daemon 死循环
-# - 不使用 root fallback hack
-# - Alpine / Incus / LXC 稳定
+# 支持:
+# - Debian / Ubuntu
+# - Alpine
+# - systemd / OpenRC
+# - IPv4-only / IPv6-only / DualStack
 #
 # =========================================================
 
@@ -44,8 +43,6 @@ INIT_SYSTEM=""
 
 ENABLE_IPV4=false
 ENABLE_IPV6=false
-
-PREFER_IPV6="no"
 
 UNBOUND_CONF="/etc/unbound/unbound.conf"
 
@@ -95,7 +92,7 @@ detect_system() {
     elif [ -f /etc/debian_version ]; then
         OS="debian"
     else
-        log_error "暂不支持当前系统"
+        log_error "不支持当前系统"
         exit 1
     fi
 
@@ -116,7 +113,7 @@ detect_system() {
 # 安装依赖
 # =========================================================
 
-install_dependencies() {
+install_deps() {
 
     log_step "安装依赖"
 
@@ -130,9 +127,9 @@ install_dependencies() {
                 unbound \
                 unbound-openrc \
                 bind-tools \
-                openssl \
                 ca-certificates \
                 curl \
+                openssl \
                 iproute2
             ;;
 
@@ -145,9 +142,9 @@ install_dependencies() {
             apt-get install -y -qq \
                 unbound \
                 dnsutils \
-                openssl \
                 ca-certificates \
                 curl \
+                openssl \
                 iproute2
             ;;
     esac
@@ -155,37 +152,6 @@ install_dependencies() {
     update-ca-certificates >/dev/null 2>&1 || true
 
     log_info "依赖安装完成"
-}
-
-# =========================================================
-# 升级 Unbound
-# =========================================================
-
-upgrade_unbound() {
-
-    log_step "升级 Unbound"
-
-    case "$OS" in
-
-        alpine)
-
-            apk upgrade \
-                unbound \
-                unbound-libs \
-                >/dev/null 2>&1 || true
-            ;;
-
-        debian)
-
-            apt-get install \
-                --only-upgrade \
-                -y \
-                unbound \
-                >/dev/null 2>&1 || true
-            ;;
-    esac
-
-    log_info "Unbound 已更新"
 }
 
 # =========================================================
@@ -200,7 +166,6 @@ detect_ipv4() {
         >/dev/null 2>&1; then
 
         ENABLE_IPV4=true
-
         log_info "IPv4 可用"
 
     else
@@ -222,8 +187,6 @@ detect_ipv6() {
         >/dev/null 2>&1; then
 
         ENABLE_IPV6=true
-        PREFER_IPV6="yes"
-
         log_info "IPv6 可用"
 
     else
@@ -233,14 +196,26 @@ detect_ipv6() {
 }
 
 # =========================================================
-# systemd-resolved
+# 禁止 DHCP 注入 resolv.conf
 # =========================================================
 
-disable_systemd_resolved() {
+disable_dhcp_dns_override() {
 
-    if [ "$INIT_SYSTEM" = "systemd" ]; then
+    log_step "禁止 DHCP 注入 resolv.conf"
 
-        log_step "处理 systemd-resolved"
+    # dhcpcd
+    if [ -f /etc/dhcpcd.conf ]; then
+
+        grep -q '^nohook resolv.conf' \
+            /etc/dhcpcd.conf \
+            || echo 'nohook resolv.conf' \
+            >> /etc/dhcpcd.conf
+
+        log_info "dhcpcd 已禁止覆盖 resolv.conf"
+    fi
+
+    # systemd-resolved
+    if command -v systemctl >/dev/null 2>&1; then
 
         if systemctl is-enabled systemd-resolved \
             >/dev/null 2>&1; then
@@ -250,13 +225,13 @@ disable_systemd_resolved() {
                 systemd-resolved \
                 >/dev/null 2>&1 || true
 
-            log_info "已关闭 systemd-resolved"
+            log_info "systemd-resolved 已关闭"
         fi
     fi
 }
 
 # =========================================================
-# Interface
+# 生成 interface
 # =========================================================
 
 generate_interfaces() {
@@ -275,7 +250,7 @@ generate_interfaces() {
 }
 
 # =========================================================
-# Forwarders
+# 生成 forward
 # =========================================================
 
 generate_forwarders() {
@@ -329,8 +304,6 @@ ${INTERFACE_CFG}
     do-udp: yes
     do-tcp: yes
 
-    prefer-ip6: ${PREFER_IPV6}
-
     tls-cert-bundle: /etc/ssl/certs/ca-certificates.crt
 
     hide-identity: yes
@@ -340,10 +313,10 @@ ${INTERFACE_CFG}
 
     prefetch: yes
 
+    rrset-roundrobin: yes
+
     cache-max-ttl: 86400
     cache-min-ttl: 300
-
-    rrset-roundrobin: yes
 
     edns-buffer-size: 1232
 
@@ -389,14 +362,12 @@ check_config() {
 }
 
 # =========================================================
-# DNS 持久化配置
+# 配置 resolv.conf.head
 # =========================================================
 
-configure_dns() {
+configure_resolv_head() {
 
-    log_step "配置系统 DNS"
-
-    mkdir -p /etc
+    log_step "配置 resolv.conf.head"
 
     cat > /etc/resolv.conf.head << EOF
 nameserver 127.0.0.1
@@ -406,19 +377,7 @@ EOF
         echo "nameserver ::1" >> /etc/resolv.conf.head
     fi
 
-    # Alpine dhcpcd
-    if [ -f /etc/dhcpcd.conf ]; then
-
-        grep -q '^nohook resolv.conf' \
-            /etc/dhcpcd.conf || true
-
-        if command -v rc-service >/dev/null 2>&1; then
-            rc-service dhcpcd restart \
-                >/dev/null 2>&1 || true
-        fi
-    fi
-
-    # Debian resolvconf
+    # resolvconf
     if [ -d /etc/resolvconf/resolv.conf.d ]; then
 
         cp /etc/resolv.conf.head \
@@ -429,25 +388,20 @@ EOF
         fi
     fi
 
-    # fallback
-    if [ ! -f /etc/resolv.conf ] || \
-       ! grep -q '127.0.0.1' /etc/resolv.conf 2>/dev/null; then
-
-        cat > /etc/resolv.conf << EOF
-nameserver 127.0.0.1
-EOF
-
-        if [ "$ENABLE_IPV6" = true ]; then
-            echo "nameserver ::1" >> /etc/resolv.conf
-        fi
-
-        echo "" >> /etc/resolv.conf
-        echo "options timeout:2" >> /etc/resolv.conf
-        echo "options attempts:2" >> /etc/resolv.conf
-        echo "options edns0" >> /etc/resolv.conf
+    # dhcpcd
+    if command -v rc-service >/dev/null 2>&1; then
+        rc-service dhcpcd restart \
+            >/dev/null 2>&1 || true
     fi
 
-    log_info "DNS 优先级已设置为本地 Unbound"
+    # fallback
+    if [ ! -f /etc/resolv.conf ]; then
+
+        cp /etc/resolv.conf.head \
+           /etc/resolv.conf
+    fi
+
+    log_info "resolv.conf.head 已配置"
 }
 
 # =========================================================
@@ -478,10 +432,17 @@ start_unbound() {
     esac
 
     sleep 5
+
+    if pgrep unbound >/dev/null 2>&1; then
+        log_info "Unbound 已启动"
+    else
+        log_error "Unbound 启动失败"
+        exit 1
+    fi
 }
 
 # =========================================================
-# DNS 测试
+# 测试 DNS
 # =========================================================
 
 test_dns() {
@@ -504,46 +465,14 @@ test_dns() {
 
         log_error "DNS 测试失败"
 
-        echo ""
-        echo "========== Unbound 日志 =========="
-
-        if [ "$INIT_SYSTEM" = "systemd" ]; then
+        if command -v journalctl >/dev/null 2>&1; then
 
             journalctl -u unbound \
-                -n 50 \
-                --no-pager \
-                2>/dev/null || true
-
-        else
-
-            tail -n 50 /var/log/messages \
-                2>/dev/null || true
+                -n 30 \
+                --no-pager || true
         fi
 
-        echo "================================"
-
         exit 1
-    fi
-}
-
-# =========================================================
-# 状态
-# =========================================================
-
-show_status() {
-
-    log_step "运行状态"
-
-    if pgrep unbound >/dev/null 2>&1; then
-        log_info "Unbound 正常运行"
-    else
-        log_warn "Unbound 未运行"
-    fi
-
-    if ss -lnptu | grep -q ':53'; then
-        log_info "53 端口监听正常"
-    else
-        log_warn "53 端口未监听"
     fi
 }
 
@@ -582,16 +511,6 @@ show_info() {
 
     echo ""
 
-    echo "IPv6 优先:"
-    echo "  ${PREFER_IPV6}"
-
-    echo ""
-
-    echo "配置文件:"
-    echo "  ${UNBOUND_CONF}"
-
-    echo ""
-
     echo "当前 resolv.conf:"
     cat /etc/resolv.conf || true
 
@@ -615,7 +534,7 @@ main() {
 "${BLUE}╔══════════════════════════════════════╗${NC}"
 
     echo -e \
-"${BLUE}║    Secure-DNS Unbound Stable v5.1   ║${NC}"
+"${BLUE}║      Secure-DNS Unbound Lite        ║${NC}"
 
     echo -e \
 "${BLUE}╚══════════════════════════════════════╝${NC}"
@@ -626,27 +545,23 @@ main() {
 
     detect_system
 
-    install_dependencies
-
-    upgrade_unbound
+    install_deps
 
     detect_ipv4
 
     detect_ipv6
 
-    disable_systemd_resolved
+    disable_dhcp_dns_override
 
     configure_unbound
 
     check_config
 
-    configure_dns
+    configure_resolv_head
 
     start_unbound
 
     test_dns
-
-    show_status
 
     show_info
 }
