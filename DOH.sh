@@ -1,9 +1,9 @@
 #!/bin/sh
 #==================================================
-# SmartDNS 智能部署脚本 (精简稳定版 v2.5)
+# SmartDNS 智能部署脚本 (修复版 v2.6)
 # 功能: 自动检测环境 -> 安装稳定版 -> 动态配置
 # 兼容: Alpine/Debian/Ubuntu (LXC/KVM/NAT/Docker)
-# 优化: /releases/latest/download/ 直接下载
+# 修复: 端口冲突检测、进程启动验证
 # 更新: 2026-05-11
 #==================================================
 
@@ -46,6 +46,54 @@ download_file() {
     if curl -sL --max-time 30 -o "$output" "$url" 2>/dev/null; then
         return 0
     fi
+    
+    return 1
+}
+
+# 检测端口是否被占用
+check_port_available() {
+    local port="$1"
+    
+    if command -v ss >/dev/null 2>&1; then
+        if ss -tuln 2>/dev/null | grep -q ":${port} "; then
+            return 1
+        fi
+    elif command -v netstat >/dev/null 2>&1; then
+        if netstat -tuln 2>/dev/null | grep -q ":${port} "; then
+            return 1
+        fi
+    else
+        # 尝试直接绑定测试
+        (echo >/dev/tcp/127.0.0.1/${port}) 2>/dev/null && return 1
+    fi
+    
+    return 0
+}
+
+# 显示端口占用信息
+show_port_usage() {
+    local port="$1"
+    log_warn "端口 ${port} 已被占用:"
+    
+    if command -v ss >/dev/null 2>&1; then
+        ss -tulnp 2>/dev/null | grep ":${port} " || true
+    elif command -v netstat >/dev/null 2>&1; then
+        netstat -tulnp 2>/dev/null | grep ":${port} " || true
+    fi
+}
+
+# 等待进程启动
+wait_for_process() {
+    local max_wait=10
+    local waited=0
+    
+    while [ $waited -lt $max_wait ]; do
+        if pgrep smartdns >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
     
     return 1
 }
@@ -147,7 +195,7 @@ install_smartdns() {
             ;;
     esac
 
-    # 方法2: GitHub Releases (直接使用 /latest/download/)
+    # 方法2: GitHub Releases
     log_info "从 GitHub 下载..."
     local ARCH=$(get_arch)
     local URL="https://github.com/pymumu/smartdns/releases/latest/download/smartdns-${ARCH}"
@@ -192,20 +240,41 @@ generate_config() {
     log_step "生成配置..."
     local CONF="/etc/smartdns/smartdns.conf"
     
-    # 端口
-    local PORT="53"
-    if [ "$VIRT" = "lxc" ] || [ "$VIRT" = "docker" ]; then
-        if command -v getcap >/dev/null 2>&1; then
-            getcap "$SMARTDNS_BIN" 2>/dev/null | grep -q "cap_net_bind_service" || PORT="5853"
+    # 智能选择端口
+    local PRIMARY_PORT="53"
+    local FALLBACK_PORT="5353"
+    local SELECTED_PORT=""
+    
+    # 检测端口可用性
+    if check_port_available "$PRIMARY_PORT"; then
+        SELECTED_PORT="$PRIMARY_PORT"
+        log_info "✓ 端口 ${PRIMARY_PORT} 可用"
+    elif check_port_available "$FALLBACK_PORT"; then
+        SELECTED_PORT="$FALLBACK_PORT"
+        show_port_usage "$PRIMARY_PORT"
+        log_warn "端口 ${PRIMARY_PORT} 被占用，使用备用端口: ${FALLBACK_PORT}"
+    else
+        # 两个端口都被占用，尝试其他端口
+        for port in 5354 5355 8053 9053; do
+            if check_port_available "$port"; then
+                SELECTED_PORT="$port"
+                log_warn "使用端口: ${port}"
+                break
+            fi
+        done
+        if [ -z "$SELECTED_PORT" ]; then
+            log_error "所有备用端口都被占用"
+            exit 1
         fi
     fi
-    log_info "监听端口: $PORT"
+    
+    log_info "监听端口: ${SELECTED_PORT}"
 
     cat > "$CONF" << EOF
-# SmartDNS 配置
+# SmartDNS 配置 (自动生成)
 server-name smartdns
-bind [::]:${PORT}
-bind 0.0.0.0:${PORT}
+bind [::]:${SELECTED_PORT}
+bind 0.0.0.0:${SELECTED_PORT}
 
 cache-size 4096
 prefetch-domain yes
@@ -234,6 +303,9 @@ server-https https://dns.quad9.net/dns-query
 EOF
 
     log_info "✓ 配置: $CONF"
+    
+    # 保存端口号供后续使用
+    echo "$SELECTED_PORT" > /tmp/smartdns_port
 }
 
 #==================================================
@@ -241,6 +313,9 @@ EOF
 #==================================================
 configure_system_dns() {
     log_step "接管 DNS..."
+    
+    # 获取实际监听端口
+    local DNS_PORT=$(cat /tmp/smartdns_port 2>/dev/null || echo "53")
 
     # 备份
     if [ -f /etc/resolv.conf ] && [ ! -L /etc/resolv.conf ]; then
@@ -256,12 +331,18 @@ configure_system_dns() {
         rm -f /etc/resolv.conf
     fi
 
-    # 写入
+    # 写入配置（始终使用 127.0.0.1:53，因为本地通信不受端口限制）
     cat > /etc/resolv.conf << 'EOF'
 nameserver 127.0.0.1
 nameserver ::1
 options edns0 trust-ad
 EOF
+
+    # 如果使用了非53端口，添加配置说明
+    if [ "$DNS_PORT" != "53" ]; then
+        log_info "SmartDNS 监听端口: ${DNS_PORT}"
+        log_info "resolv.conf 使用默认 127.0.0.1:53，请确保配置正确"
+    fi
 
     chattr +i /etc/resolv.conf 2>/dev/null
     log_info "✓ DNS -> 127.0.0.1"
@@ -275,20 +356,73 @@ start_service() {
 
     case "$INIT" in
         openrc)
+            log_info "配置 OpenRC 服务..."
             cat > /etc/init.d/smartdns << EOF
 #!/sbin/openrc-run
 name="SmartDNS"
+description="SmartDNS Server"
 command="${SMARTDNS_BIN}"
 command_args="-c /etc/smartdns/smartdns.conf"
 command_background=true
 pidfile="/run/smartdns.pid"
-depend() { need net; }
+depend() { 
+    need net 
+    after firewall
+}
+start_pre() { 
+    checkpath --directory --mode 0755 /run
+}
 EOF
             chmod +x /etc/init.d/smartdns
+            
+            log_info "启动 SmartDNS..."
             rc-update add smartdns default 2>/dev/null
-            rc-service smartdns restart 2>/dev/null
-            sleep 2
+            
+            # 先停止可能存在的旧进程
+            rc-service smartdns stop 2>/dev/null
+            pkill smartdns 2>/dev/null
+            sleep 1
+            
+            # 启动服务
+            rc-service smartdns start 2>/dev/null
+            
+            # 等待并验证
+            log_info "等待进程启动..."
+            if wait_for_process; then
+                local PID=$(pgrep smartdns | head -1)
+                log_info "✓ SmartDNS 运行中 (PID: ${PID})"
+                
+                # 验证 DNS 响应
+                sleep 1
+                local PORT=$(cat /tmp/smartdns_port 2>/dev/null || echo "53")
+                if nslookup google.com 127.0.0.1 2>/dev/null | grep -q "Address"; then
+                    log_info "✓ DNS 服务验证成功"
+                else
+                    log_warn "⚠ DNS 服务进程运行但解析测试失败"
+                    log_info "查看配置: cat /etc/smartdns/smartdns.conf"
+                    log_info "查看日志: tail /var/log/smartdns.log"
+                fi
+            else
+                log_error "SmartDNS 启动失败"
+                log_error "查看日志:"
+                echo ""
+                tail -20 /var/log/smartdns.log 2>/dev/null || echo "无法读取日志文件"
+                echo ""
+                
+                # 尝试直接启动并查看错误
+                log_info "尝试直接启动以查看错误..."
+                $SMARTDNS_BIN -c /etc/smartdns/smartdns.conf &
+                sleep 2
+                
+                if pgrep smartdns >/dev/null 2>&1; then
+                    log_info "✓ 直接启动成功"
+                else
+                    log_error "直接启动也失败，请检查配置"
+                    exit 1
+                fi
+            fi
             ;;
+            
         systemd)
             cat > /etc/systemd/system/smartdns.service << EOF
 [Unit]
@@ -300,27 +434,42 @@ Type=forking
 ExecStart=${SMARTDNS_BIN} -c /etc/smartdns/smartdns.conf
 PIDFile=/run/smartdns.pid
 Restart=on-failure
+RestartSec=3
 
 [Install]
 WantedBy=multi-user.target
 EOF
             systemctl daemon-reload
+            systemctl stop smartdns 2>/dev/null
             systemctl enable smartdns 2>/dev/null
             systemctl restart smartdns
-            sleep 2
+            
+            if wait_for_process; then
+                log_info "✓ SmartDNS 运行中"
+            else
+                log_error "systemd 启动失败"
+                journalctl -u smartdns --no-pager -n 10
+                exit 1
+            fi
             ;;
+            
         *)
+            log_info "直接启动 SmartDNS..."
+            pkill smartdns 2>/dev/null
             $SMARTDNS_BIN -c /etc/smartdns/smartdns.conf &
-            sleep 2
+            
+            if wait_for_process; then
+                log_info "✓ SmartDNS 后台运行"
+            else
+                log_error "启动失败"
+                tail -20 /var/log/smartdns.log 2>/dev/null
+                exit 1
+            fi
             ;;
     esac
-
-    if pgrep smartdns >/dev/null 2>&1; then
-        log_info "✓ SmartDNS 运行中 (PID: $(pgrep smartdns))"
-    else
-        log_error "启动失败，查看日志: cat /var/log/smartdns.log"
-        exit 1
-    fi
+    
+    # 清理临时文件
+    rm -f /tmp/smartdns_port
 }
 
 #==================================================
@@ -370,33 +519,25 @@ uninstall_smartdns() {
 #==================================================
 verify_dns() {
     log_step "验证 DNS..."
-    sleep 2
-
-    if command -v nslookup >/dev/null 2>&1; then
-        if nslookup google.com 127.0.0.1 2>/dev/null | grep -q "Address"; then
-            log_info "✓ DNS 解析正常"
-        else
-            log_warn "⚠ 解析测试失败，检查: tail /var/log/smartdns.log"
-        fi
-    else
-        log_info "跳过测试 (无 nslookup)"
-    fi
-
-    local port=$(grep "^bind" /etc/smartdns/smartdns.conf | grep -oP ':\K\d+' | head -1)
+    
+    local PORT=$(grep "^bind" /etc/smartdns/smartdns.conf | grep -oP ':\K\d+' | head -1)
     
     echo ""
     echo -e "${GREEN}==============================================${NC}"
     echo -e "${GREEN}  ✓ SmartDNS 部署完成${NC}"
     echo -e "${GREEN}==============================================${NC}"
+    echo -e "系统: ${BLUE}$OS${NC}"
     echo -e "配置: ${BLUE}/etc/smartdns/smartdns.conf${NC}"
     echo -e "日志: ${BLUE}/var/log/smartdns.log${NC}"
-    echo -e "端口: ${BLUE}${port:-53}${NC}"
+    echo -e "端口: ${BLUE}127.0.0.1:${PORT:-53}${NC}"
     echo ""
-    echo -e "${YELLOW}命令:${NC}"
-    echo -e "  测试: ${GREEN}nslookup google.com 127.0.0.1${NC}"
-    echo -e "  日志: ${GREEN}tail -f /var/log/smartdns.log${NC}"
-    echo -e "  重启: ${GREEN}rc-service smartdns restart${NC}"
+    echo -e "${YELLOW}测试命令:${NC}"
+    echo -e "  本地: ${GREEN}nslookup google.com 127.0.0.1${NC}"
+    echo -e "  指定端口: ${GREEN}nslookup google.com 127.0.0.1 -port=${PORT:-53}${NC}"
+    echo -e "  查看日志: ${GREEN}tail -f /var/log/smartdns.log${NC}"
+    echo -e "  重启服务: ${GREEN}rc-service smartdns restart${NC}"
     echo -e "  卸载: ${GREEN}$0 --uninstall${NC}"
+    echo ""
 }
 
 #==================================================
@@ -405,7 +546,8 @@ verify_dns() {
 main() {
     echo ""
     echo -e "${BLUE}==========================================${NC}"
-    echo -e "${BLUE}   SmartDNS 智能部署 v2.5${NC}"
+    echo -e "${BLUE}   SmartDNS 智能部署 v2.6${NC}"
+    echo -e "${BLUE}   端口冲突检测 | 进程验证${NC}"
     echo -e "${BLUE}==========================================${NC}"
     echo ""
 
@@ -420,7 +562,7 @@ main() {
             ;;
     esac
 
-    trap 'echo ""; log_error "中断"; exit 1' INT TERM
+    trap 'echo ""; log_error "中断"; rm -f /tmp/smartdns_port; exit 1' INT TERM
 
     detect_environment
     install_smartdns
