@@ -1,24 +1,28 @@
 #!/usr/bin/env bash
 # =========================================================
-# Secure-DNS SmartDNS + DoH Installer
-# 适配:
-#   - Debian / Ubuntu
-#   - Alpine
-#   - KVM / LXC / OpenVZ / NAT VPS
+# SmartDNS Auto Installer + DoH Auto Detect
 #
-# 功能:
-#   - 自动安装 SmartDNS
-#   - 自动检测 IPv4/IPv6
-#   - 使用 DoH (443)
+# 自动检测:
+#   - Alpine / Debian
+#   - systemd / OpenRC
+#   - LXC / Docker / NAT
+#   - IPv4 / IPv6
+#   - SmartDNS version
+#   - DoH support
+#
+# 自动:
+#   - 安装 SmartDNS
+#   - 动态生成配置
 #   - 接管 resolv.conf
 #   - 接管 dhcpcd DNS
-#   - 自动兼容 systemd / OpenRC
 #
-# DoH:
-#   - Cloudflare
-#   - Google
+# 兼容:
+#   - Alpine
+#   - Debian
+#   - Ubuntu
+#   - LXC
+#   - NAT VPS
 #
-# Author: ChatGPT
 # =========================================================
 
 set -euo pipefail
@@ -30,12 +34,18 @@ BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
-SMARTDNS_CONF="/etc/smartdns/smartdns.conf"
-RESOLV="/etc/resolv.conf"
-
+OS=""
+INIT_SYSTEM=""
+IS_LXC=0
+IS_DOCKER=0
+IS_NAT=0
 HAS_IPV4=0
 HAS_IPV6=0
-OS="unknown"
+HAS_DOH=0
+SMARTDNS_VERSION=""
+
+SMARTDNS_BIN="/usr/sbin/smartdns"
+SMARTDNS_CONF="/etc/smartdns/smartdns.conf"
 
 log() {
     echo -e "${GREEN}[✓]${NC} $1"
@@ -55,13 +65,13 @@ step() {
 }
 
 require_root() {
-    if [ "$(id -u)" != "0" ]; then
+    [ "$(id -u)" = "0" ] || {
         err "请使用 root 运行"
         exit 1
-    fi
+    }
 }
 
-detect_os() {
+detect_system() {
     step "检测系统"
 
     if [ -f /etc/alpine-release ]; then
@@ -69,14 +79,35 @@ detect_os() {
     elif [ -f /etc/debian_version ]; then
         OS="debian"
     else
-        err "不支持的系统"
+        err "不支持系统"
         exit 1
     fi
 
     log "系统: $OS"
 
-    if grep -qaE 'lxc|docker|kubepods|container' /proc/1/cgroup 2>/dev/null; then
-        warn "检测到容器环境"
+    if command -v systemctl >/dev/null 2>&1; then
+        INIT_SYSTEM="systemd"
+    else
+        INIT_SYSTEM="openrc"
+    fi
+
+    log "Init: $INIT_SYSTEM"
+
+    if grep -qaE 'lxc|incus' /proc/1/cgroup 2>/dev/null; then
+        IS_LXC=1
+        warn "LXC/Incus 容器"
+    fi
+
+    if grep -qa docker /proc/1/cgroup 2>/dev/null; then
+        IS_DOCKER=1
+        warn "Docker 容器"
+    fi
+
+    GW=$(ip route | awk '/default/ {print $3}' | head -n1)
+
+    if echo "$GW" | grep -Eq '^10\.|^172\.|^192\.168\.'; then
+        IS_NAT=1
+        warn "NAT 网络"
     fi
 }
 
@@ -84,11 +115,13 @@ install_deps() {
     step "安装依赖"
 
     case "$OS" in
+
         alpine)
             apk update
+
             apk add --no-cache \
-                smartdns \
                 curl \
+                tar \
                 bind-tools \
                 iproute2 \
                 ca-certificates
@@ -98,8 +131,8 @@ install_deps() {
             apt-get update -y
 
             apt-get install -y \
-                smartdns \
                 curl \
+                tar \
                 dnsutils \
                 iproute2 \
                 ca-certificates
@@ -107,6 +140,64 @@ install_deps() {
     esac
 
     log "依赖安装完成"
+}
+
+install_smartdns() {
+    step "安装 SmartDNS"
+
+    if command -v smartdns >/dev/null 2>&1; then
+        SMARTDNS_VERSION=$(smartdns -v 2>/dev/null | head -n1 || true)
+
+        log "已安装: ${SMARTDNS_VERSION:-unknown}"
+        return
+    fi
+
+    ARCH=$(uname -m)
+
+    case "$ARCH" in
+        x86_64)
+            PKG_ARCH="x86_64"
+            ;;
+        aarch64)
+            PKG_ARCH="aarch64"
+            ;;
+        *)
+            err "不支持架构: $ARCH"
+            exit 1
+            ;;
+    esac
+
+    TMP_DIR=$(mktemp -d)
+
+    cd "$TMP_DIR"
+
+    curl -L -o smartdns.tar.gz \
+    https://github.com/pymumu/smartdns/releases/latest/download/smartdns.1.2025.1.${PKG_ARCH}-linux-all.tar.gz
+
+    tar -xzf smartdns.tar.gz
+
+    install -m 755 smartdns/usr/sbin/smartdns "$SMARTDNS_BIN"
+
+    mkdir -p /etc/smartdns
+
+    cd /
+
+    rm -rf "$TMP_DIR"
+
+    SMARTDNS_VERSION=$("$SMARTDNS_BIN" -v 2>/dev/null | head -n1 || true)
+
+    log "安装完成: ${SMARTDNS_VERSION:-unknown}"
+}
+
+detect_doh_support() {
+    step "检测 DoH 支持"
+
+    if "$SMARTDNS_BIN" -h 2>&1 | grep -qi https; then
+        HAS_DOH=1
+        log "支持 DoH"
+    else
+        warn "当前版本不支持 DoH"
+    fi
 }
 
 detect_network() {
@@ -130,63 +221,83 @@ detect_network() {
 }
 
 stop_conflict_dns() {
-    step "处理系统 DNS 服务"
+    step "关闭冲突 DNS"
 
-    if command -v systemctl >/dev/null 2>&1; then
+    if [ "$INIT_SYSTEM" = "systemd" ]; then
         systemctl stop systemd-resolved 2>/dev/null || true
         systemctl disable systemd-resolved 2>/dev/null || true
         systemctl mask systemd-resolved 2>/dev/null || true
 
-        log "已关闭 systemd-resolved"
+        log "systemd-resolved 已关闭"
     fi
 }
 
-configure_smartdns() {
-    step "配置 SmartDNS"
+generate_config() {
+    step "生成 SmartDNS 配置"
 
     mkdir -p /etc/smartdns
 
     cat > "$SMARTDNS_CONF" <<EOF
-# =====================================================
-# SmartDNS Secure Config
-# =====================================================
-
 bind 127.0.0.1:53
 
 cache-size 4096
 prefetch-domain yes
 serve-expired yes
 
-speed-check-mode ping,tcp:80,tcp:443
-response-mode fastest-ip
-
-dualstack-ip-selection yes
-
 log-level error
+
+response-mode fastest-ip
+speed-check-mode ping,tcp:80,tcp:443
 
 EOF
 
     if [ "$HAS_IPV6" = "1" ]; then
         cat >> "$SMARTDNS_CONF" <<EOF
 bind [::1]:53
-force-AAAA-SOA no
+dualstack-ip-selection yes
 EOF
     fi
 
-    cat >> "$SMARTDNS_CONF" <<EOF
+    echo >> "$SMARTDNS_CONF"
 
-# =====================================================
-# DNS over HTTPS
-# =====================================================
+    if [ "$HAS_DOH" = "1" ]; then
 
-server-https https://1.1.1.1/dns-query
-server-https https://1.0.0.1/dns-query
-server-https https://dns.google/dns-query
-server-https https://8.8.8.8/dns-query
-
+        cat >> "$SMARTDNS_CONF" <<EOF
+server https://1.1.1.1/dns-query
+server https://1.0.0.1/dns-query
+server https://dns.google/dns-query
+server https://8.8.8.8/dns-query
 EOF
 
-    log "SmartDNS 配置完成"
+        if [ "$HAS_IPV6" = "1" ]; then
+            cat >> "$SMARTDNS_CONF" <<EOF
+server https://[2606:4700:4700::1111]/dns-query
+server https://[2001:4860:4860::8888]/dns-query
+EOF
+        fi
+
+        log "已启用 DoH"
+
+    else
+
+        cat >> "$SMARTDNS_CONF" <<EOF
+server 1.1.1.1
+server 1.0.0.1
+server 8.8.8.8
+server 8.8.4.4
+EOF
+
+        if [ "$HAS_IPV6" = "1" ]; then
+            cat >> "$SMARTDNS_CONF" <<EOF
+server 2606:4700:4700::1111
+server 2001:4860:4860::8888
+EOF
+        fi
+
+        warn "已 fallback 普通 DNS"
+    fi
+
+    log "配置生成完成"
 }
 
 take_over_resolv() {
@@ -211,14 +322,12 @@ EOF
 }
 
 take_over_dhcpcd() {
-    step "接管 dhcpcd DNS"
+    step "接管 dhcpcd"
 
     if [ -f /etc/dhcpcd.conf ]; then
 
         grep -q "nohook resolv.conf" /etc/dhcpcd.conf || \
             echo "nohook resolv.conf" >> /etc/dhcpcd.conf
-
-        mkdir -p /etc
 
         cat > /etc/resolv.conf.head <<EOF
 nameserver 127.0.0.1
@@ -228,33 +337,70 @@ EOF
             echo "nameserver ::1" >> /etc/resolv.conf.head
         fi
 
-        log "dhcpcd DNS 已接管"
+        log "dhcpcd 已接管"
     else
         warn "未发现 dhcpcd"
     fi
 }
 
+create_service() {
+    step "创建服务"
+
+    if [ "$INIT_SYSTEM" = "systemd" ]; then
+
+cat > /etc/systemd/system/smartdns.service <<EOF
+[Unit]
+Description=SmartDNS
+After=network.target
+
+[Service]
+ExecStart=${SMARTDNS_BIN} -f -c ${SMARTDNS_CONF}
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+        systemctl daemon-reload
+        systemctl enable smartdns >/dev/null 2>&1
+
+    else
+
+cat > /etc/init.d/smartdns <<EOF
+#!/sbin/openrc-run
+
+command="${SMARTDNS_BIN}"
+command_args="-f -c ${SMARTDNS_CONF}"
+pidfile="/run/smartdns.pid"
+
+depend() {
+    need net
+}
+EOF
+
+        chmod +x /etc/init.d/smartdns
+
+        rc-update add smartdns default >/dev/null 2>&1 || true
+    fi
+
+    log "服务创建完成"
+}
+
 start_service() {
     step "启动 SmartDNS"
 
-    case "$OS" in
-        alpine)
-            rc-update add smartdns default >/dev/null 2>&1 || true
-            rc-service smartdns restart
-            ;;
-
-        debian)
-            systemctl enable smartdns >/dev/null 2>&1 || true
-            systemctl restart smartdns
-            ;;
-    esac
+    if [ "$INIT_SYSTEM" = "systemd" ]; then
+        systemctl restart smartdns
+    else
+        rc-service smartdns restart
+    fi
 
     sleep 2
 
     if ss -lnup | grep -q ":53"; then
-        log "SmartDNS 已监听 53"
+        log "53 端口监听正常"
     else
-        err "SmartDNS 启动失败"
+        err "启动失败"
         exit 1
     fi
 }
@@ -263,7 +409,7 @@ test_dns() {
     step "测试 DNS"
 
     if dig cloudflare.com @127.0.0.1 +short >/dev/null 2>&1; then
-        log "DNS 解析成功"
+        log "DNS 正常"
     else
         err "DNS 解析失败"
     fi
@@ -272,11 +418,31 @@ test_dns() {
 show_result() {
     echo
     echo "═══════════════════════════════════════"
-    echo "      SmartDNS + DoH 部署完成"
+    echo "      SmartDNS 部署完成"
     echo "═══════════════════════════════════════"
     echo
 
-    echo "监听地址:"
+    echo "系统:"
+    echo "  $OS"
+
+    echo
+    echo "Init:"
+    echo "  $INIT_SYSTEM"
+
+    echo
+    echo "SmartDNS:"
+    echo "  ${SMARTDNS_VERSION:-unknown}"
+
+    echo
+    echo "DoH:"
+    if [ "$HAS_DOH" = "1" ]; then
+        echo "  Enabled"
+    else
+        echo "  Disabled"
+    fi
+
+    echo
+    echo "监听:"
     echo "  127.0.0.1:53"
 
     if [ "$HAS_IPV6" = "1" ]; then
@@ -284,18 +450,11 @@ show_result() {
     fi
 
     echo
-    echo "DoH 上游:"
-    echo "  Cloudflare"
-    echo "  Google"
-
-    echo
-    echo "当前 resolv.conf:"
-    echo
-
+    echo "resolv.conf:"
     cat /etc/resolv.conf
 
     echo
-    echo "测试命令:"
+    echo "测试:"
     echo "  dig cloudflare.com @127.0.0.1"
     echo
 }
@@ -304,18 +463,21 @@ main() {
     clear
 
     echo "╔══════════════════════════════════════╗"
-    echo "║       SmartDNS + DoH Installer      ║"
-    echo "║         Stable DNS Solution         ║"
+    echo "║       SmartDNS Auto Installer       ║"
+    echo "║         DoH Auto Detect             ║"
     echo "╚══════════════════════════════════════╝"
 
     require_root
-    detect_os
+    detect_system
     install_deps
+    install_smartdns
+    detect_doh_support
     detect_network
     stop_conflict_dns
-    configure_smartdns
+    generate_config
     take_over_resolv
     take_over_dhcpcd
+    create_service
     start_service
     test_dns
     show_result
