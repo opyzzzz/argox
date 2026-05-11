@@ -19,7 +19,13 @@ wget -qO- https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/DOH.sh
 `````
 
 
-check-dns
+check-doh dns
+`````
+wget -qO- https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/doh-check.sh | bash
+`````
+
+
+check-dot dns
 `````
 wget -qO- https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/dns-check.sh | bash
 `````
