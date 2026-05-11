@@ -1,7 +1,8 @@
 #!/bin/sh
 #==================================================
-# SmartDNS 智能部署脚本 v4.0
+# SmartDNS 智能部署脚本 v4.1
 # 策略: GitHub最新版优先 -> 包管理器备用
+# 修复: 特性检测bug、兼容旧版配置生成
 # 兼容: Alpine/Debian/Ubuntu (LXC/KVM/NAT/Docker)
 # 更新: 2026-05-11
 #==================================================
@@ -99,53 +100,28 @@ port_available() {
     return 0
 }
 
-# 检测 SmartDNS 版本支持的特性
-detect_features() {
+# 检测 SmartDNS 版本号
+get_version_number() {
     local bin="$1"
-    local ver
+    local ver_output
+    local major_ver=0
     
-    ver=$("$bin" -v 2>&1 | grep -oP '[\d]+\.?[\d]*' | head -1 2>/dev/null)
-    ver=$(echo "$ver" | grep -o '^[0-9]*' 2>/dev/null)
-    [ -z "$ver" ] && ver=0
+    # 尝试多种版本格式
+    # Release47.1 -> 47
+    # 1.2025.11.09-1443 -> 提取主版本
+    # 40+dfsg-1 -> 40
+    ver_output=$("$bin" -v 2>&1)
     
-    FEAT_EDNS=false
-    FEAT_FORCE_AAAA=false
-    FEAT_DOH=false
-    FEAT_SERVE_EXPIRED=false
-    FEAT_SPEED_CHECK=false
-    
-    # 版本 >= 42 支持所有新特性
-    if [ "$ver" -ge 42 ] 2>/dev/null; then
-        FEAT_EDNS=true
-        FEAT_FORCE_AAAA=true
-        FEAT_DOH=true
-        FEAT_SERVE_EXPIRED=true
-        FEAT_SPEED_CHECK=true
-        return
+    # 先尝试提取 ReleaseXX
+    if echo "$ver_output" | grep -qi "Release\([0-9]\+\)"; then
+        major_ver=$(echo "$ver_output" | grep -oi "Release\([0-9]\+\)" | grep -o '[0-9]*' | head -1)
+    # 再尝试提取 smartdns X.X.X 格式
+    elif echo "$ver_output" | grep -q "smartdns [0-9]"; then
+        major_ver=$(echo "$ver_output" | grep -oP 'smartdns \K[0-9]+' | head -1)
     fi
     
-    # 旧版本逐个检测
-    "$bin" -h 2>&1 | grep -q "edns" && FEAT_EDNS=true
-    
-    # 通过测试配置文件检测
-    local tmpconf="/tmp/smartdns-test-$$.conf"
-    echo "force-AAAA-SOA yes" > "$tmpconf" 2>/dev/null
-    timeout 1 "$bin" -c "$tmpconf" -f >/dev/null 2>&1
-    [ $? -eq 0 ] 2>/dev/null && FEAT_FORCE_AAAA=true
-    
-    echo "server-https https://example.com" > "$tmpconf" 2>/dev/null
-    timeout 1 "$bin" -c "$tmpconf" -f >/dev/null 2>&1
-    [ $? -eq 0 ] 2>/dev/null && FEAT_DOH=true
-    
-    echo "serve-expired yes" > "$tmpconf" 2>/dev/null
-    timeout 1 "$bin" -c "$tmpconf" -f >/dev/null 2>&1
-    [ $? -eq 0 ] 2>/dev/null && FEAT_SERVE_EXPIRED=true
-    
-    echo "speed-check-mode ping,tcp:443" > "$tmpconf" 2>/dev/null
-    timeout 1 "$bin" -c "$tmpconf" -f >/dev/null 2>&1
-    [ $? -eq 0 ] 2>/dev/null && FEAT_SPEED_CHECK=true
-    
-    rm -f "$tmpconf"
+    [ -z "$major_ver" ] && major_ver=0
+    echo "$major_ver"
 }
 
 #==================================================
@@ -172,7 +148,6 @@ else
 fi
 log_info "Init: $INIT"
 
-# 虚拟化
 if grep -q "container=lxc" /proc/1/environ 2>/dev/null; then
     VIRT="lxc"
 elif grep -q "docker" /proc/1/cgroup 2>/dev/null || [ -f /.dockerenv ]; then
@@ -182,7 +157,6 @@ else
 fi
 log_info "虚拟化: $VIRT"
 
-# IPv6
 HAS_IPV6=false
 ip route get 2606:4700:4700::1111 >/dev/null 2>&1 && HAS_IPV6=true
 BINDV6ONLY=$(sysctl net.ipv6.bindv6only 2>/dev/null | awk '{print $3}')
@@ -196,8 +170,9 @@ log_step "安装 SmartDNS"
 
 SMARTDNS_BIN=""
 SMARTDNS_SOURCE=""
+SMARTDNS_VER_NUM=0
 
-# 策略1: GitHub 最新版（优先）
+# 策略1: GitHub 最新版
 ARCH=$(get_arch)
 GITHUB_URL="https://github.com/pymumu/smartdns/releases/latest/download/smartdns-${ARCH}"
 
@@ -212,7 +187,7 @@ if download_file "$GITHUB_URL" "/tmp/smartdns" 2>/dev/null; then
     fi
 fi
 
-# 策略2: 包管理器（备用）
+# 策略2: 包管理器
 if [ -z "$SMARTDNS_BIN" ]; then
     log_warn "GitHub 下载失败，尝试包管理器..."
     
@@ -237,20 +212,30 @@ if [ -z "$SMARTDNS_BIN" ]; then
             ;;
     esac
     
-    [ -n "$SMARTDNS_BIN" ] && log_ok "包管理器安装成功" || {
+    if [ -n "$SMARTDNS_BIN" ]; then
+        log_ok "包管理器安装成功"
+    else
         log_err "所有安装方式均失败"
         log_err "请手动下载: $GITHUB_URL"
         exit 1
-    }
+    fi
 fi
 
-# 检测版本特性
+# 获取版本信息
 SMARTDNS_VER=$("$SMARTDNS_BIN" -v 2>&1 | head -1)
+SMARTDNS_VER_NUM=$(get_version_number "$SMARTDNS_BIN")
 log_info "版本: $SMARTDNS_VER"
 log_info "来源: $SMARTDNS_SOURCE"
+log_info "主版本号: $SMARTDNS_VER_NUM"
 
-detect_features "$SMARTDNS_BIN"
-log_info "特性: edns=$FEAT_EDNS force-AAAA=$FEAT_FORCE_AAAA doh=$FEAT_DOH"
+# 版本 >= 42 支持所有新特性
+if [ "$SMARTDNS_VER_NUM" -ge 42 ] 2>/dev/null; then
+    IS_NEW_VERSION=true
+    log_ok "检测到新版本 (>=42)，启用完整功能"
+else
+    IS_NEW_VERSION=false
+    log_warn "检测到旧版本 (<42)，将裁剪配置"
+fi
 
 #==================================================
 # 第3步: 动态生成兼容配置
@@ -272,9 +257,9 @@ else
     log_info "端口53可用"
 fi
 
-# 生成配置
+# 生成基础配置
 cat > /etc/smartdns/smartdns.conf << EOF
-# SmartDNS 配置 (v4.0 自动生成)
+# SmartDNS 配置 (v4.1 自动生成)
 # 版本: $SMARTDNS_VER
 # 来源: $SMARTDNS_SOURCE
 # 时间: $(date '+%Y-%m-%d %H:%M:%S')
@@ -292,53 +277,50 @@ else
     echo "bind 0.0.0.0:${PORT}" >> /etc/smartdns/smartdns.conf
 fi
 
+# 基础配置（所有版本通用）
 cat >> /etc/smartdns/smartdns.conf << EOF
 cache-size 4096
 prefetch-domain yes
-EOF
-
-# 条件配置
-$FEAT_SERVE_EXPIRED && echo "serve-expired yes" >> /etc/smartdns/smartdns.conf
-
-cat >> /etc/smartdns/smartdns.conf << EOF
 log-level info
 log-file /var/log/smartdns.log
-EOF
-
-# 旧版本不支持 log-size
-if [ "$SMARTDNS_SOURCE" = "GitHub" ]; then
-    echo "log-size 2m" >> /etc/smartdns/smartdns.conf
-    echo "log-num 2" >> /etc/smartdns/smartdns.conf
-fi
-
-$FEAT_SPEED_CHECK && echo "speed-check-mode ping,tcp:443" >> /etc/smartdns/smartdns.conf
-echo "response-mode fastest-ip" >> /etc/smartdns/smartdns.conf
-
-cat >> /etc/smartdns/smartdns.conf << EOF
+response-mode fastest-ip
 rr-ttl 300
 rr-ttl-min 60
 EOF
 
-$FEAT_FORCE_AAAA && $HAS_IPV6 || echo "force-AAAA-SOA yes" >> /etc/smartdns/smartdns.conf
-$FEAT_EDNS && echo "edns-client-subnet" >> /etc/smartdns/smartdns.conf
+# 新版本独有配置
+if [ "$IS_NEW_VERSION" = true ]; then
+    cat >> /etc/smartdns/smartdns.conf << EOF
+serve-expired yes
+log-size 2m
+log-num 2
+speed-check-mode ping,tcp:443
+force-AAAA-SOA yes
+edns-client-subnet
+EOF
+fi
 
-# 上游 DNS
+# 上游 DNS（所有版本）
 cat >> /etc/smartdns/smartdns.conf << EOF
 
-# 上游 DNS
+# 上游 DNS 服务器
 server 1.1.1.1
 server 8.8.8.8
+server 9.9.9.9
 EOF
 
-$FEAT_DOH && cat >> /etc/smartdns/smartdns.conf << EOF
+# DoH（仅新版本）
+if [ "$IS_NEW_VERSION" = true ]; then
+    cat >> /etc/smartdns/smartdns.conf << EOF
 server-https https://cloudflare-dns.com/dns-query
 server-https https://dns.google/dns-query
 EOF
+fi
 
 log_ok "配置已生成"
 echo ""
 echo -e "${BOLD}配置摘要:${NC}"
-grep -E "^bind|^server|^server-https|^force-AAAA|^edns|^speed-check|^serve-expired" /etc/smartdns/smartdns.conf 2>/dev/null
+grep -E "^bind|^server|^server-https|^force-AAAA|^edns|^speed-check|^serve-expired" /etc/smartdns/smartdns.conf 2>/dev/null || echo "  (基础配置)"
 
 #==================================================
 # 第4步: 配置系统 DNS
@@ -430,7 +412,6 @@ EOF
         pgrep smartdns >/dev/null 2>&1 && STARTED=true && log_ok "已启动 (OpenRC)"
         ;;
     systemd)
-        # 使用已存在的服务文件或创建新的
         if [ -f /lib/systemd/system/smartdns.service ]; then
             SYSTEMD_FILE="/lib/systemd/system/smartdns.service"
         else
@@ -460,7 +441,7 @@ EOF
         ;;
 esac
 
-# 直接启动（备用）
+# 直接启动
 if [ "$STARTED" = false ]; then
     log_warn "服务启动失败，直接启动..."
     "$SMARTDNS_BIN" -c /etc/smartdns/smartdns.conf &
@@ -506,6 +487,12 @@ if [ "$ALL_OK" = true ]; then
     echo -e "${GREEN}${BOLD}╚══════════════════════════════════════════╝${NC}"
 else
     echo -e "${YELLOW}${BOLD}⚠ 部分域名解析异常，请检查网络${NC}"
+    echo ""
+    echo "可能原因:"
+    echo "  1. SmartDNS 监听端口 $PORT，但 resolv.conf 指向默认53"
+    echo "     → 测试: nslookup -port=$PORT google.com 127.0.0.1"
+    echo "  2. 上游 DNS 不可达"
+    echo "     → 检查: cat /var/log/smartdns.log"
 fi
 
 echo ""
@@ -520,6 +507,6 @@ echo ""
 echo -e "${BOLD}常用命令:${NC}"
 echo -e "  测试: ${GREEN}nslookup google.com 127.0.0.1${NC}"
 echo -e "  日志: ${GREEN}tail -f /var/log/smartdns.log${NC}"
-echo -e "  重载: ${GREEN}systemctl restart smartdns${NC} (或 rc-service)"
+echo -e "  重载: ${GREEN}systemctl restart smartdns${NC}"
 echo -e "  卸载: ${GREEN}$0 --uninstall${NC}"
 echo ""
