@@ -8,10 +8,16 @@ dns
 wget -qO- https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/dns.sh | sh
 `````
 
-dnsplus
+dnsplus-DOT
 `````
 wget -qO- https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/dnsplus.sh | bash
 `````
+
+DOH
+`````
+wget -qO- https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/DOH.sh | bash
+`````
+
 
 check-dns
 `````
