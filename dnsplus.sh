@@ -1,15 +1,9 @@
 #!/usr/bin/env bash
 
 # =========================================================
-# Secure-DNS Lite Final
-# Unbound + DoT
+# Secure-DNS Lite Final Stable
+# Unbound + DNS over TLS
 # Alpine / Debian / Ubuntu
-# Compatible with:
-# - VPS
-# - LXC
-# - Incus
-# - OpenVZ
-# - KVM
 # =========================================================
 
 set -e
@@ -63,8 +57,10 @@ install_deps() {
     step "安装依赖"
 
     case "$OS" in
+
         alpine)
             apk update
+
             apk add --no-cache \
                 unbound \
                 unbound-openrc \
@@ -72,6 +68,7 @@ install_deps() {
                 bind-tools \
                 curl
             ;;
+
         debian)
             export DEBIAN_FRONTEND=noninteractive
 
@@ -79,7 +76,6 @@ install_deps() {
 
             apt-get install -y \
                 unbound \
-                unbound-anchor \
                 dnsutils \
                 ca-certificates \
                 curl
@@ -117,9 +113,14 @@ disable_system_dns() {
 
     case "$OS" in
         debian)
-            if systemctl is-active systemd-resolved >/dev/null 2>&1; then
-                systemctl disable --now systemd-resolved || true
-                log "已关闭 systemd-resolved"
+
+            if command -v systemctl >/dev/null 2>&1; then
+
+                if systemctl is-active systemd-resolved >/dev/null 2>&1; then
+                    systemctl disable --now systemd-resolved || true
+                    log "已关闭 systemd-resolved"
+                fi
+
             fi
             ;;
     esac
@@ -133,26 +134,20 @@ configure_unbound() {
     cat > "$UNBOUND_CONF" <<EOF
 server:
     username: ""
+
     interface: 127.0.0.1
     port: 53
 
     do-ip4: yes
+    do-ip6: $( $IPV6_OK && echo yes || echo no )
+
     do-udp: yes
     do-tcp: yes
 
-    do-ip6: $( $IPV6_OK && echo yes || echo no )
-
-    verbosity: 0
-
     prefetch: yes
-    prefetch-key: yes
 
     cache-min-ttl: 300
     cache-max-ttl: 14400
-
-    rrset-roundrobin: yes
-
-    edns-buffer-size: 1232
 
     hide-identity: yes
     hide-version: yes
@@ -162,19 +157,22 @@ server:
     harden-glue: yes
     harden-dnssec-stripped: yes
 
-    use-caps-for-id: no
+    edns-buffer-size: 1232
 
-    auto-trust-anchor-file: "/var/lib/unbound/root.key"
+    rrset-roundrobin: yes
+
+    verbosity: 0
 
 forward-zone:
     name: "."
 
+    forward-tls-upstream: yes
+
 EOF
 
     if $IPV4_OK; then
-        cat >> "$UNBOUND_CONF" <<EOF
-    forward-tls-upstream: yes
 
+        cat >> "$UNBOUND_CONF" <<EOF
     forward-addr: 1.1.1.1@853#cloudflare-dns.com
     forward-addr: 1.0.0.1@853#cloudflare-dns.com
 
@@ -182,9 +180,11 @@ EOF
     forward-addr: 8.8.4.4@853#dns.google
 
 EOF
+
     fi
 
     if $IPV6_OK; then
+
         cat >> "$UNBOUND_CONF" <<EOF
     forward-addr: 2606:4700:4700::1111@853#cloudflare-dns.com
     forward-addr: 2606:4700:4700::1001@853#cloudflare-dns.com
@@ -193,18 +193,18 @@ EOF
     forward-addr: 2001:4860:4860::8844@853#dns.google
 
 EOF
+
     fi
 
     log "Unbound 配置完成"
 }
 
 setup_resolvconf() {
-    step "接管 resolv.conf"
+    step "接管系统 DNS"
 
     case "$OS" in
 
         alpine)
-            mkdir -p /etc
 
             cat > /etc/resolv.conf.head <<EOF
 nameserver 127.0.0.1
@@ -247,6 +247,7 @@ start_unbound() {
     unbound-checkconf "$UNBOUND_CONF"
 
     case "$OS" in
+
         alpine)
 
             rc-update add unbound default >/dev/null 2>&1 || true
@@ -296,6 +297,7 @@ test_dns() {
 }
 
 show_info() {
+
     echo ""
     echo "═══════════════════════════════════════"
     echo "      Secure-DNS Lite 部署完成"
@@ -323,12 +325,15 @@ show_info() {
     cat /etc/resolv.conf || true
 
     echo ""
+
     echo "测试命令:"
     echo "  dig cloudflare.com @127.0.0.1"
+
     echo ""
 }
 
 main() {
+
     clear
 
     echo "╔══════════════════════════════════════╗"
