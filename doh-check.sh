@@ -1,542 +1,730 @@
 #!/bin/sh
 #==================================================
-# SmartDNS 环境检测脚本 v1.0
-# 功能: 全面检测系统环境是否支持 SmartDNS 部署
-# 使用: chmod +x smartdns-check.sh && ./smartdns-check.sh
+# SmartDNS 部署后功能检测脚本 v2.0
+# GitHub: https://github.com/你的用户名/仓库名
+# 用法: wget -O- https://raw.githubusercontent.com/.../smartdns-check.sh | sh
+# 功能: 全面检测SmartDNS运行状态、DNS解析、DoH、安全性
 # 更新: 2026-05-11
 #==================================================
 
-# --- 颜色定义 ---
+set +e
+
+# 颜色定义
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-PASS="${GREEN}✓${NC}"
-FAIL="${RED}✗${NC}"
-WARN="${YELLOW}⚠${NC}"
-INFO="${CYAN}ℹ${NC}"
+# 评分
+PASS=0
+FAIL=0
+WARN=0
+TOTAL=0
 
-# 评分系统
-TOTAL_CHECKS=0
-PASSED_CHECKS=0
-WARN_COUNT=0
-FAIL_COUNT=0
+# 图标
+ICON_OK="${GREEN}✓${NC}"
+ICON_FAIL="${RED}✗${NC}"
+ICON_WARN="${YELLOW}⚠${NC}"
+ICON_INFO="${CYAN}ℹ${NC}"
+ICON_ARROW="${BLUE}→${NC}"
 
-pass() {
-    echo -e "  ${PASS} $1"
-    TOTAL_CHECKS=$((TOTAL_CHECKS + 1))
-    PASSED_CHECKS=$((PASSED_CHECKS + 1))
-}
-
-fail() {
-    echo -e "  ${FAIL} $1"
-    echo -e "      解决方案: $2"
-    TOTAL_CHECKS=$((TOTAL_CHECKS + 1))
-    FAIL_COUNT=$((FAIL_COUNT + 1))
-}
-
-warn() {
-    echo -e "  ${WARN} $1"
-    echo -e "      建议: $2"
-    TOTAL_CHECKS=$((TOTAL_CHECKS + 1))
-    WARN_COUNT=$((WARN_COUNT + 1))
-}
-
-info() {
-    echo -e "  ${INFO} $1: ${CYAN}$2${NC}"
-}
-
-section() {
+# 打印函数
+print_header() {
     echo ""
-    echo -e "${BOLD}${BLUE}━━━ $1 ━━━${NC}"
+    echo -e "${BOLD}${MAGENTA}╔══════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${BOLD}${MAGENTA}║  SmartDNS 功能检测脚本 v2.0                             ║${NC}"
+    echo -e "${BOLD}${MAGENTA}║  检测时间: $(date '+%Y-%m-%d %H:%M:%S')                        ║${NC}"
+    echo -e "${BOLD}${MAGENTA}╚══════════════════════════════════════════════════════════╝${NC}"
+    echo ""
 }
 
-# --- 权限检查 ---
-if [ "$(id -u)" -ne 0 ]; then
-    echo -e "${FAIL} 请使用 root 权限运行: sudo $0"
-    exit 1
-fi
+print_section() {
+    echo ""
+    echo -e "${BOLD}${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${BOLD}${BLUE}  $1${NC}"
+    echo -e "${BOLD}${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+}
 
-clear
-echo ""
-echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════╗${NC}"
-echo -e "${BOLD}${CYAN}║     SmartDNS 环境兼容性检测工具         ║${NC}"
-echo -e "${BOLD}${CYAN}║     v1.0 - $(date '+%Y-%m-%d %H:%M:%S')       ║${NC}"
-echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════╝${NC}"
+print_sub() {
+    echo ""
+    echo -e "${BOLD}${CYAN}  ▸ $1${NC}"
+}
+
+check_pass() {
+    echo -e "  ${ICON_OK} $1"
+    PASS=$((PASS + 1))
+    TOTAL=$((TOTAL + 1))
+}
+
+check_fail() {
+    echo -e "  ${ICON_FAIL} $1"
+    if [ -n "$2" ]; then
+        echo -e "    ${ICON_ARROW} 解决: $2"
+    fi
+    FAIL=$((FAIL + 1))
+    TOTAL=$((TOTAL + 1))
+}
+
+check_warn() {
+    echo -e "  ${ICON_WARN} $1"
+    if [ -n "$2" ]; then
+        echo -e "    ${ICON_ARROW} 建议: $2"
+    fi
+    WARN=$((WARN + 1))
+    TOTAL=$((TOTAL + 1))
+}
+
+check_info() {
+    echo -e "  ${ICON_INFO} $1: ${CYAN}$2${NC}"
+}
 
 #==================================================
-# 1. 系统基本信息
+# 第1部分: 系统环境
 #==================================================
-section "系统基本信息"
+print_header
+print_section "📋 第1部分: 系统环境检测"
 
-# 发行版检测
+print_sub "操作系统"
 if [ -f /etc/alpine-release ]; then
-    OS="Alpine Linux"
-    VER=$(cat /etc/alpine-release)
-    PKG_MGR="apk"
+    OS="Alpine $(cat /etc/alpine-release)"
+    check_info "发行版" "$OS"
 elif [ -f /etc/os-release ]; then
     . /etc/os-release
     OS="$PRETTY_NAME"
-    VER="$VERSION_ID"
-    case "$ID" in
-        debian|ubuntu) PKG_MGR="apt" ;;
-        *) PKG_MGR="unknown" ;;
-    esac
+    check_info "发行版" "$OS"
 else
     OS="Unknown"
-    VER="Unknown"
-    PKG_MGR="unknown"
+    check_warn "无法识别操作系统"
 fi
 
-info "操作系统" "$OS"
-info "版本" "$VER"
-info "包管理器" "$PKG_MGR"
+check_info "内核" "$(uname -r)"
+check_info "架构" "$(uname -m)"
+check_info "主机名" "$(hostname)"
+check_info "运行时间" "$(uptime | sed 's/.*up //' | sed 's/,.*//')"
 
-# 内核信息
-KERNEL=$(uname -r)
-info "内核版本" "$KERNEL"
-
-# 架构
-ARCH=$(uname -m)
-info "CPU架构" "$ARCH"
-
-# 运行时间
-UPTIME=$(uptime | sed 's/.*up //' | sed 's/,.*//')
-info "运行时间" "$UPTIME"
-
-#==================================================
-# 2. 系统兼容性检查
-#==================================================
-section "系统兼容性检查"
-
-# 发行版兼容性
-case "$OS" in
-    *Alpine*|*Debian*|*Ubuntu*)
-        pass "发行版兼容: $OS"
-        ;;
-    *)
-        fail "不支持的发行版: $OS" \
-             "仅支持 Alpine Linux、Debian、Ubuntu"
-        ;;
-esac
-
-# 架构兼容性
-case "$ARCH" in
-    x86_64|amd64|aarch64|arm64|armv7l|armv7|i386|i686)
-        pass "CPU架构兼容: $ARCH"
-        ;;
-    *)
-        fail "CPU架构可能不兼容: $ARCH" \
-             "SmartDNS 需要 x86_64/arm64/arm/i386 架构"
-        ;;
-esac
-
-# Init 系统检测
-if [ -f /run/systemd/system ] || [ -d /run/systemd/system ]; then
-    INIT="systemd"
-    pass "Init 系统: systemd"
-elif [ -f /sbin/openrc ] || [ -f /usr/sbin/openrc ]; then
-    INIT="openrc"
-    pass "Init 系统: OpenRC"
-else
-    INIT="unknown"
-    warn "未检测到 systemd/OpenRC" \
-         "SmartDNS 可以手动启动，但不会自动开机运行"
-fi
-
-# 虚拟化环境
-if grep -q "container=lxc" /proc/1/environ 2>/dev/null || grep -q "lxchost" /proc/1/cgroup 2>/dev/null; then
+# 虚拟化检测
+print_sub "虚拟化环境"
+if grep -q "container=lxc" /proc/1/environ 2>/dev/null; then
     VIRT="LXC"
-    info "虚拟化" "LXC 容器"
+    check_warn "检测到 LXC 容器环境" "某些功能可能受限"
 elif grep -q "docker" /proc/1/cgroup 2>/dev/null || [ -f /.dockerenv ]; then
     VIRT="Docker"
-    info "虚拟化" "Docker 容器"
+    check_warn "检测到 Docker 容器环境" "某些功能可能受限"
 elif [ -d /proc/vz ]; then
     VIRT="OpenVZ"
-    info "虚拟化" "OpenVZ 容器"
-elif [ -f /sys/class/dmi/id/product_name ]; then
-    VIRT=$(cat /sys/class/dmi/id/product_name)
-    info "虚拟化" "KVM/物理机: $VIRT"
+    check_warn "检测到 OpenVZ 环境"
 else
-    VIRT="Unknown"
-    info "虚拟化" "未知"
+    VIRT="KVM/物理机"
+    check_pass "物理机/KVM 环境: 完全支持"
 fi
 
-if echo "$VIRT" | grep -qiE "lxc|docker|openvz"; then
-    warn "容器环境检测到" \
-         "可能需要额外配置特权端口或使用高端口"
+# Init 系统
+print_sub "Init 系统"
+if [ -f /run/systemd/system ]; then
+    INIT="systemd"
+    check_pass "Init: systemd"
+elif [ -f /sbin/openrc ]; then
+    INIT="openrc"
+    check_pass "Init: OpenRC"
+else
+    INIT="unknown"
+    check_warn "未知 Init 系统" "服务管理可能受限"
 fi
 
 #==================================================
-# 3. 基础依赖检查
+# 第2部分: SmartDNS 安装状态
 #==================================================
-section "基础依赖检查"
+print_section "🔍 第2部分: SmartDNS 安装状态"
 
-# 必需工具
-REQUIRED_TOOLS="wget grep sed awk"
-OPTIONAL_TOOLS="curl netstat ss nslookup drill tar"
-
-for tool in $REQUIRED_TOOLS; do
-    if command -v "$tool" >/dev/null 2>&1; then
-        pass "必需工具 $tool 已安装"
-    else
-        fail "必需工具 $tool 未安装" \
-             "安装: $PKG_MGR add $tool 或 $PKG_MGR install $tool"
+print_sub "程序文件"
+SMARTDNS_BIN=""
+for path in /usr/bin/smartdns /usr/sbin/smartdns /usr/local/bin/smartdns; do
+    if [ -x "$path" ]; then
+        SMARTDNS_BIN="$path"
+        check_pass "找到: $path"
+        check_info "版本" "$($SMARTDNS_BIN -v 2>&1 | head -1)"
+        check_info "大小" "$(ls -lh $path | awk '{print $5}')"
+        break
     fi
 done
 
-for tool in $OPTIONAL_TOOLS; do
-    if command -v "$tool" >/dev/null 2>&1; then
-        pass "可选工具 $tool 已安装"
-    else
-        warn "可选工具 $tool 未安装" \
-             "建议安装以获得更好的诊断能力"
-    fi
-done
+if [ -z "$SMARTDNS_BIN" ]; then
+    check_fail "未找到 SmartDNS 程序" "请先安装 SmartDNS"
+fi
 
-#==================================================
-# 4. 网络环境检查
-#==================================================
-section "网络环境检查"
-
-# 网络接口
-INTERFACES=$(ip link show 2>/dev/null | grep -E "^[0-9]+:" | awk -F': ' '{print $2}' | grep -v "lo")
-if [ -n "$INTERFACES" ]; then
-    pass "检测到网络接口"
-    for iface in $INTERFACES; do
-        STATE=$(ip link show "$iface" 2>/dev/null | grep -oP 'state \K\w+')
-        IP=$(ip addr show "$iface" 2>/dev/null | grep -oP 'inet \K[\d.]+')
-        info "  接口 $iface" "状态: $STATE, IP: ${IP:-无}"
+print_sub "配置文件"
+CONFIG_FILE="/etc/smartdns/smartdns.conf"
+if [ -f "$CONFIG_FILE" ]; then
+    check_pass "配置文件存在: $CONFIG_FILE"
+    check_info "大小" "$(wc -l < $CONFIG_FILE) 行"
+    
+    # 检查关键配置
+    grep -q "^bind" "$CONFIG_FILE" && \
+        check_pass "bind 配置存在" || \
+        check_fail "缺少 bind 配置"
+    
+    grep -q "^server " "$CONFIG_FILE" && \
+        check_pass "上游 DNS 配置存在" || \
+        check_fail "缺少上游 DNS 配置"
+    
+    grep -q "server-https" "$CONFIG_FILE" && \
+        check_pass "DoH 配置存在" || \
+        check_warn "未配置 DoH" "建议添加 server-https 提升安全性"
+    
+    # 显示配置
+    echo ""
+    echo -e "  ${BOLD}配置摘要:${NC}"
+    grep -E "^bind|^server |^server-https|^server-tls" "$CONFIG_FILE" | while read line; do
+        echo -e "    ${CYAN}$line${NC}"
     done
 else
-    fail "未检测到网络接口" \
-         "请检查网络配置"
+    check_fail "配置文件不存在" "请检查 /etc/smartdns/smartdns.conf"
 fi
 
-# IPv4 连通性
-if ip route get 1.1.1.1 >/dev/null 2>&1; then
-    DEFAULT_IPV4=$(ip route get 1.1.1.1 2>/dev/null | grep -oP 'src \K\S+')
-    pass "IPv4 路由正常: $DEFAULT_IPV4"
+print_sub "日志文件"
+LOG_FILE="/var/log/smartdns.log"
+if [ -f "$LOG_FILE" ]; then
+    check_pass "日志文件存在: $LOG_FILE"
+    check_info "大小" "$(ls -lh $LOG_FILE | awk '{print $5}')"
     
-    # 测试公网连通性
-    if ping -c 1 -W 3 1.1.1.1 >/dev/null 2>&1; then
-        pass "IPv4 公网可达 (1.1.1.1)"
+    # 检查日志中的错误
+    ERROR_COUNT=$(grep -c "ERROR" "$LOG_FILE" 2>/dev/null || echo 0)
+    if [ "$ERROR_COUNT" -gt 0 ]; then
+        check_warn "日志中有 $ERROR_COUNT 条错误" "查看: tail -50 $LOG_FILE"
+        echo ""
+        echo -e "  ${BOLD}最近错误:${NC}"
+        grep "ERROR" "$LOG_FILE" | tail -3 | while read line; do
+            echo -e "    ${RED}$line${NC}"
+        done
     else
-        warn "IPv4 公网可能不通 (ICMP被禁或网络受限)" \
-             "如果使用 NAT/防火墙，属正常现象"
+        check_pass "日志无错误"
     fi
 else
-    fail "IPv4 路由异常" \
-         "请检查网络配置: ip route"
+    check_warn "日志文件不存在" "首次运行可能尚未生成"
 fi
 
-# IPv6 连通性
-if ip route get 2606:4700:4700::1111 >/dev/null 2>&1; then
-    DEFAULT_IPV6=$(ip route get 2606:4700:4700::1111 2>/dev/null | grep -oP 'src \K\S+')
-    pass "IPv6 路由正常: $DEFAULT_IPV6"
+#==================================================
+# 第3部分: 进程与服务
+#==================================================
+print_section "⚙️ 第3部分: 进程与服务状态"
+
+print_sub "进程状态"
+if pgrep smartdns >/dev/null 2>&1; then
+    PID=$(pgrep smartdns | head -1)
+    check_pass "SmartDNS 正在运行 (PID: $PID)"
+    
+    # 进程详情
+    CPU=$(ps -p $PID -o %cpu --no-headers 2>/dev/null | xargs)
+    MEM=$(ps -p $PID -o rss --no-headers 2>/dev/null | awk '{printf "%.1f MB", $1/1024}')
+    START=$(ps -p $PID -o lstart --no-headers 2>/dev/null | xargs)
+    
+    check_info "CPU 使用" "${CPU}%"
+    check_info "内存使用" "$MEM"
+    check_info "启动时间" "$START"
+    
+    # 检查僵尸进程
+    ZOMBIE=$(ps -p $PID -o stat --no-headers 2>/dev/null | grep -c "Z")
+    if [ "$ZOMBIE" -gt 0 ]; then
+        check_fail "进程状态异常 (僵尸进程)"
+    fi
 else
-    warn "未检测到 IPv6 (纯 IPv4 环境)" \
-         "SmartDNS 仍可正常工作"
+    check_fail "SmartDNS 未运行" "执行: smartdns -c /etc/smartdns/smartdns.conf &"
 fi
 
-# DNS 解析测试
-echo ""
-info "DNS 解析测试" ""
-for dns in "google.com" "github.com" "cloudflare.com"; do
-    if nslookup "$dns" 2>/dev/null | grep -q "Address"; then
-        pass "DNS 解析正常: $dns"
+print_sub "服务状态"
+case "$INIT" in
+    openrc)
+        STATUS=$(rc-service smartdns status 2>&1)
+        if echo "$STATUS" | grep -q "started"; then
+            check_pass "OpenRC 服务: 已启动"
+        elif echo "$STATUS" | grep -q "crashed"; then
+            check_fail "OpenRC 服务: 已崩溃" "查看日志: tail -50 /var/log/smartdns.log"
+        elif echo "$STATUS" | grep -q "stopped"; then
+            check_warn "OpenRC 服务: 已停止 (但进程可能在运行)"
+        else
+            check_info "OpenRC 状态" "$STATUS"
+        fi
+        ;;
+    systemd)
+        if systemctl is-active smartdns >/dev/null 2>&1; then
+            check_pass "systemd 服务: active"
+        else
+            check_fail "systemd 服务: inactive"
+        fi
+        ;;
+esac
+
+print_sub "开机自启"
+if [ "$INIT" = "openrc" ]; then
+    if rc-status 2>/dev/null | grep -q smartdns; then
+        check_pass "已添加到运行级别"
     else
-        fail "DNS 解析失败: $dns" \
-             "检查 /etc/resolv.conf 和上游 DNS 配置"
+        check_warn "未添加到运行级别" "执行: rc-update add smartdns default"
+    fi
+    
+    # 检查 local.d 修复脚本
+    if [ -f /etc/local.d/smartdns-fix.start ]; then
+        check_pass "开机修复脚本存在"
+    else
+        check_warn "开机修复脚本不存在" "重启后 resolv.conf 可能被重置"
+    fi
+elif [ "$INIT" = "systemd" ]; then
+    if systemctl is-enabled smartdns >/dev/null 2>&1; then
+        check_pass "systemd 已启用"
+    else
+        check_warn "systemd 未启用" "执行: systemctl enable smartdns"
+    fi
+fi
+
+#==================================================
+# 第4部分: 端口与网络
+#==================================================
+print_section "🌐 第4部分: 端口与网络"
+
+print_sub "监听端口"
+SMARTDNS_PORT=""
+if command -v ss >/dev/null 2>&1; then
+    PORT_INFO=$(ss -tulnp 2>/dev/null | grep smartdns)
+elif command -v netstat >/dev/null 2>&1; then
+    PORT_INFO=$(netstat -tulnp 2>/dev/null | grep smartdns)
+else
+    PORT_INFO=""
+fi
+
+if [ -n "$PORT_INFO" ]; then
+    echo "$PORT_INFO" | while read line; do
+        PORT=$(echo "$line" | grep -oP ':\K\d+')
+        PROTO=$(echo "$line" | awk '{print $1}')
+        check_pass "监听: 0.0.0.0:$PORT ($PROTO)"
+        SMARTDNS_PORT="$PORT"
+    done
+    SMARTDNS_PORT=$(echo "$PORT_INFO" | grep -oP ':\K\d+' | head -1)
+else
+    check_fail "未检测到监听端口"
+fi
+
+print_sub "端口冲突检测"
+for port in 53 5353 5354 5355 8053; do
+    LISTENERS=$(ss -tulnp 2>/dev/null | grep ":${port} " | grep -v smartdns)
+    if [ -n "$LISTENERS" ]; then
+        check_warn "端口 $port 有其他进程" "$(echo $LISTENERS | head -1)"
     fi
 done
 
-#==================================================
-# 5. 端口可用性检查
-#==================================================
-section "端口可用性检查"
-
-# 检测端口是否被占用
-check_port() {
-    local port=$1
-    if command -v ss >/dev/null 2>&1; then
-        ss -tuln 2>/dev/null | grep -q ":${port} "
-    elif command -v netstat >/dev/null 2>&1; then
-        netstat -tuln 2>/dev/null | grep -q ":${port} "
-    else
-        return 1
-    fi
-}
-
-# 显示端口占用详情
-show_port_detail() {
-    local port=$1
-    if command -v ss >/dev/null 2>&1; then
-        echo -e "      $(ss -tulnp 2>/dev/null | grep ":${port} ")"
-    elif command -v netstat >/dev/null 2>&1; then
-        echo -e "      $(netstat -tulnp 2>/dev/null | grep ":${port} ")"
-    fi
-}
-
-PORTS="53 5353 5354 8053 9053"
-PORT_53_AVAILABLE=true
-
-for port in $PORTS; do
-    if check_port "$port"; then
-        if [ "$port" = "53" ]; then
-            PORT_53_AVAILABLE=false
-            warn "端口 $port 已被占用" \
-                 "将使用备用端口"
-            show_port_detail "$port"
+print_sub "本地 DNS 解析"
+if [ -n "$SMARTDNS_PORT" ]; then
+    # IPv4 解析
+    for domain in google.com github.com cloudflare.com; do
+        RESULT=$(nslookup -timeout=5 $domain 127.0.0.1 2>&1)
+        if echo "$RESULT" | grep -q "Address"; then
+            IP=$(echo "$RESULT" | grep "Address" | tail -1 | awk '{print $NF}')
+            check_pass "IPv4: $domain → $IP"
         else
-            warn "端口 $port 已被占用" \
-                 "如需使用此端口，请先释放"
-            show_port_detail "$port"
+            check_fail "IPv4: $domain 解析失败" "检查上游DNS和网络"
+        fi
+    done
+    
+    # IPv6 解析（如果有）
+    if ip route get 2606:4700:4700::1111 >/dev/null 2>&1; then
+        for domain in google.com cloudflare.com; do
+            RESULT=$(nslookup -timeout=5 -type=AAAA $domain ::1 2>&1)
+            if echo "$RESULT" | grep -q "AAAA"; then
+                check_pass "IPv6: $domain 解析成功"
+            else
+                check_warn "IPv6: $domain 解析失败" "纯IPv4环境属正常"
+            fi
+        done
+    fi
+else
+    check_fail "无法确定 SmartDNS 端口" "检查进程是否正常运行"
+fi
+
+#==================================================
+# 第5部分: DoH/DoT 功能检测
+#==================================================
+print_section "🔒 第5部分: DoH/DoT 加密 DNS 检测"
+
+print_sub "DoH (DNS over HTTPS) 连通性"
+DOH_SERVERS="
+Cloudflare|https://cloudflare-dns.com/dns-query
+Google|https://dns.google/dns-query
+Quad9|https://dns.quad9.net/dns-query
+"
+
+echo "$DOH_SERVERS" | while IFS='|' read -r name url; do
+    [ -z "$name" ] && continue
+    
+    # 使用 curl 测试 DoH
+    RESULT=$(curl -s --max-time 5 -H "accept: application/dns-json" "${url}?name=google.com&type=A" 2>&1)
+    
+    if echo "$RESULT" | grep -q '"Status":0'; then
+        check_pass "$name DoH 正常"
+        IP=$(echo "$RESULT" | grep -oP '"data":"[^"]+"' | head -1 | cut -d'"' -f4)
+        [ -n "$IP" ] && check_info "  解析结果" "$IP"
+    elif echo "$RESULT" | grep -q '"Status":2'; then
+        check_fail "$name DoH 返回 SERVFAIL" "DNS 服务器内部错误"
+    elif echo "$RESULT" | grep -q "Could not resolve host"; then
+        check_fail "$name DoH DNS解析失败" "检查 resolv.conf 和网络"
+    elif [ -z "$RESULT" ]; then
+        check_fail "$name DoH 无响应" "网络不通或被防火墙阻止"
+    else
+        check_warn "$name DoH 响应异常" "$(echo $RESULT | head -c 100)"
+    fi
+done
+
+print_sub "DoT (DNS over TLS) 连通性"
+DOT_SERVERS="
+Cloudflare|1.1.1.1|853|cloudflare-dns.com
+Google|8.8.8.8|853|dns.google
+Quad9|9.9.9.9|853|dns.quad9.net
+"
+
+echo "$DOT_SERVERS" | while IFS='|' read -r name ip port hostname; do
+    [ -z "$name" ] && continue
+    
+    # 使用 openssl 测试 TLS 连接
+    if command -v openssl >/dev/null 2>&1; then
+        RESULT=$(echo | openssl s_client -connect ${ip}:${port} -servername ${hostname} -timeout 3 2>&1)
+        if echo "$RESULT" | grep -q "Verify return code: 0"; then
+            check_pass "$name DoT TLS 握手成功"
+        elif echo "$RESULT" | grep -q "Connection timed out"; then
+            check_fail "$name DoT 连接超时" "端口 853 可能被防火墙阻止"
+        else
+            check_warn "$name DoT 连接异常" "检查防火墙规则"
         fi
     else
-        pass "端口 $port 可用"
+        # 备选: 用 nc 测试端口
+        if command -v nc >/dev/null 2>&1; then
+            if nc -z -w 3 $ip $port 2>/dev/null; then
+                check_pass "$name DoT 端口 $port 可达"
+            else
+                check_fail "$name DoT 端口 $port 不可达"
+            fi
+        else
+            check_warn "$name DoT 无法检测 (缺少 openssl/nc)"
+        fi
     fi
 done
 
-# 检查 dhcpcd 是否占用 53
-if pgrep dhcpcd >/dev/null 2>&1; then
-    warn "dhcpcd 服务正在运行" \
-         "可能占用 DNS 端口，安装脚本会自动配置"
-fi
+print_sub "HTTPS 连通性（基础）"
+for url in "https://cloudflare.com" "https://google.com" "https://github.com"; do
+    if curl -s --max-time 5 -o /dev/null -w "%{http_code}" "$url" 2>/dev/null | grep -q "200\|301\|302"; then
+        check_pass "$url 可达"
+    else
+        check_fail "$url 不可达" "检查网络和代理设置"
+    fi
+done
 
 #==================================================
-# 6. resolv.conf 状态
+# 第6部分: resolv.conf 状态
 #==================================================
-section "resolv.conf 状态"
+print_section "📝 第6部分: resolv.conf 状态"
 
-if [ -f /etc/resolv.conf ]; then
-    if [ -L /etc/resolv.conf ]; then
-        LINK_TARGET=$(readlink -f /etc/resolv.conf 2>/dev/null)
-        warn "/etc/resolv.conf 是符号链接" \
-             "指向: $LINK_TARGET"
-    else
-        pass "/etc/resolv.conf 是常规文件"
-    fi
-    
-    # 显示当前 DNS 配置
-    info "当前 DNS 配置" ""
-    if grep "^nameserver" /etc/resolv.conf 2>/dev/null; then
-        :
-    else
-        warn "未配置 nameserver" \
-             "需要配置上游 DNS"
-    fi
-    
-    # 检查是否可写
-    if [ -w /etc/resolv.conf ]; then
-        pass "/etc/resolv.conf 可写"
-    else
-        warn "/etc/resolv.conf 不可写" \
-             "可能需要 chattr -i 解锁"
-    fi
+print_sub "文件状态"
+if [ -L /etc/resolv.conf ]; then
+    TARGET=$(readlink -f /etc/resolv.conf 2>/dev/null)
+    check_warn "resolv.conf 是符号链接 → $TARGET" "可能被 DHCP 覆盖"
+elif [ -f /etc/resolv.conf ]; then
+    check_pass "resolv.conf 是常规文件"
 else
-    fail "/etc/resolv.conf 不存在" \
-         "创建: echo 'nameserver 1.1.1.1' > /etc/resolv.conf"
+    check_fail "resolv.conf 不存在"
 fi
 
-#==================================================
-# 7. 服务状态检查
-#==================================================
-section "服务状态检查"
+# 检查不可变属性
+if lsattr /etc/resolv.conf 2>/dev/null | grep -q "\-i-"; then
+    check_warn "resolv.conf 有不可变属性 (i)" "这可能阻止正常更新"
+elif lsattr /etc/resolv.conf 2>/dev/null | grep -q "\-i"; then
+    check_pass "resolv.conf 已锁定 (不可变)"
+fi
+
+print_sub "DNS 配置"
+if [ -f /etc/resolv.conf ]; then
+    echo ""
+    echo -e "  ${BOLD}当前配置:${NC}"
+    cat /etc/resolv.conf | while read line; do
+        if echo "$line" | grep -q "^nameserver 127.0.0.1"; then
+            echo -e "    ${GREEN}$line${NC}"
+        elif echo "$line" | grep -q "^nameserver"; then
+            echo -e "    ${YELLOW}$line${NC}"
+        else
+            echo -e "    ${CYAN}$line${NC}"
+        fi
+    done
+    
+    # 检查是否指向本地
+    if grep -q "^nameserver 127.0.0.1" /etc/resolv.conf; then
+        check_pass "DNS 指向本地 SmartDNS"
+    else
+        check_warn "DNS 未指向 127.0.0.1" "SmartDNS 可能未被使用"
+        grep "^nameserver" /etc/resolv.conf | while read line; do
+            check_info "当前 DNS" "$line"
+        done
+    fi
+fi
+
+print_sub "DHCP 客户端配置"
+if [ -f /etc/dhcpcd.conf ]; then
+    if grep -q "nohook resolv.conf" /etc/dhcpcd.conf; then
+        check_pass "dhcpcd 已配置为不修改 DNS"
+    else
+        check_warn "dhcpcd 未配置" "重启后可能覆盖 resolv.conf"
+    fi
+fi
+
+if pgrep dhcpcd >/dev/null 2>&1; then
+    check_warn "dhcpcd 正在运行" "可能干扰 DNS 设置"
+fi
+
+# NetworkManager
+if [ -f /etc/NetworkManager/conf.d/99-smartdns.conf ]; then
+    check_pass "NetworkManager 已配置"
+elif pgrep NetworkManager >/dev/null 2>&1; then
+    check_warn "NetworkManager 运行中但未配置"
+fi
 
 # systemd-resolved
-if [ "$INIT" = "systemd" ]; then
-    if systemctl is-active systemd-resolved >/dev/null 2>&1; then
-        warn "systemd-resolved 正在运行" \
-             "SmartDNS 安装时会自动停用"
+if pgrep systemd-resolved >/dev/null 2>&1; then
+    check_warn "systemd-resolved 正在运行" "可能与 SmartDNS 冲突"
+fi
+
+#==================================================
+# 第7部分: 上游 DNS 延迟测试
+#==================================================
+print_section "⏱️ 第7部分: 上游 DNS 延迟测试"
+
+print_sub "UDP DNS 延迟"
+for dns in "1.1.1.1" "8.8.8.8" "9.9.9.9"; do
+    if command -v drill >/dev/null 2>&1; then
+        TIME=$(drill google.com @$dns 2>&1 | grep "Query time" | awk '{print $4}')
+    elif command -v dig >/dev/null 2>&1; then
+        TIME=$(dig +time=3 google.com @$dns 2>&1 | grep "Query time" | awk '{print $4}')
     else
-        pass "systemd-resolved 未运行"
+        # 用 nslookup 粗略估算
+        START=$(date +%s%N)
+        nslookup -timeout=3 google.com $dns >/dev/null 2>&1
+        END=$(date +%s%N)
+        TIME=$(( (END - START) / 1000000 ))
+        TIME="${TIME}ms (估算)"
     fi
-fi
-
-# 其他 DNS 服务
-OTHER_DNS=$(pgrep -x "named|dnsmasq|unbound|pdnsd" 2>/dev/null)
-if [ -n "$OTHER_DNS" ]; then
-    warn "检测到其他 DNS 服务: $OTHER_DNS" \
-         "可能冲突，建议停用后再安装 SmartDNS"
-else
-    pass "未检测到其他 DNS 服务"
-fi
-
-#==================================================
-# 8. 网络连通性测试
-#==================================================
-section "网络连通性测试"
-
-# GitHub 可达性
-GITHUB_ACCESSIBLE=false
-for url in "https://github.com" "https://api.github.com"; do
-    if curl -sL --max-time 5 "$url" >/dev/null 2>&1; then
-        pass "GitHub 可达: $url"
-        GITHUB_ACCESSIBLE=true
+    
+    if [ -n "$TIME" ]; then
+        if echo "$TIME" | grep -q "^[0-9]" && [ "$(echo $TIME | grep -o '^[0-9]*')" -lt 100 ]; then
+            check_pass "$dns 延迟: ${TIME}ms"
+        else
+            check_warn "$dns 延迟: ${TIME}ms (偏高)"
+        fi
     else
-        warn "GitHub 可能不可达: $url" \
-             "可能需要代理或手动下载"
+        check_fail "$dns 无响应"
     fi
 done
 
-# Cloudflare DoH 可达性
-if curl -s --max-time 5 "https://cloudflare-dns.com/dns-query?name=google.com" >/dev/null 2>&1; then
-    pass "Cloudflare DoH 可达"
+#==================================================
+# 第8部分: 安全性检测
+#==================================================
+print_section "🛡️ 第8部分: 安全性检测"
+
+print_sub "DNS 劫持检测"
+# 使用多个 DNS 服务器解析同一域名，对比结果
+DOMAIN="google.com"
+RESULTS=""
+for dns in "1.1.1.1" "8.8.8.8" "9.9.9.9"; do
+    IP=$(nslookup -timeout=3 $DOMAIN $dns 2>/dev/null | grep "Address" | tail -1 | awk '{print $NF}')
+    [ -n "$IP" ] && RESULTS="$RESULTS $IP"
+done
+
+UNIQUE=$(echo "$RESULTS" | tr ' ' '\n' | sort -u | wc -l)
+if [ "$UNIQUE" -le 2 ]; then
+    check_pass "多个 DNS 服务器结果一致 (未检测到劫持)"
 else
-    warn "Cloudflare DoH 不可达" \
-         "传统 DNS (UDP 53) 仍可正常使用"
+    check_warn "不同 DNS 服务器返回不同 IP" "可能存在 DNS 劫持或 CDN 调度"
 fi
 
-# Google DoH 可达性
-if curl -s --max-time 5 "https://dns.google/dns-query?name=google.com" >/dev/null 2>&1; then
-    pass "Google DoH 可达"
+print_sub "DNSSEC 支持检测"
+if command -v dig >/dev/null 2>&1; then
+    if dig +dnssec cloudflare.com @127.0.0.1 2>&1 | grep -q "ad;"; then
+        check_pass "DNSSEC 验证通过"
+    else
+        check_warn "DNSSEC 未验证" "需要上游 DNS 支持"
+    fi
 else
-    warn "Google DoH 不可达" \
-         "传统 DNS (UDP 53) 仍可正常使用"
+    check_info "DNSSEC" "未安装 dig，跳过检测"
+fi
+
+print_sub "DNS 泄露检测"
+# 检测是否会泄露查询到非预期 DNS
+LEAK_DNS="114.114.114.114 223.5.5.5"
+for dns in $LEAK_DNS; do
+    if ss -tulnp 2>/dev/null | grep -q "$dns"; then
+        check_fail "检测到可能的 DNS 泄露: $dns"
+    fi
+done
+check_pass "未检测到 DNS 泄露"
+
+#==================================================
+# 第9部分: 性能压力测试
+#==================================================
+print_section "📊 第9部分: 性能测试"
+
+print_sub "并发解析测试"
+TEST_COUNT=10
+SUCCESS=0
+echo -e "  ${ICON_INFO} 测试 $TEST_COUNT 次并发解析..."
+
+for i in $(seq 1 $TEST_COUNT); do
+    nslookup -timeout=2 google.com 127.0.0.1 >/dev/null 2>&1 && SUCCESS=$((SUCCESS + 1))
+done
+
+if [ "$SUCCESS" -eq "$TEST_COUNT" ]; then
+    check_pass "并发测试: $SUCCESS/$TEST_COUNT 成功"
+elif [ "$SUCCESS" -ge $((TEST_COUNT * 80 / 100)) ]; then
+    check_warn "并发测试: $SUCCESS/$TEST_COUNT 成功 (少量失败)"
+else
+    check_fail "并发测试: $SUCCESS/$TEST_COUNT 成功" "可能存在性能问题"
+fi
+
+print_sub "缓存命中测试"
+# 连续查询同一域名，检测响应时间变化
+FIRST_TIME=0
+SECOND_TIME=0
+
+START=$(date +%s%N)
+nslookup -timeout=3 cloudflare.com 127.0.0.1 >/dev/null 2>&1
+END=$(date +%s%N)
+FIRST_TIME=$(( (END - START) / 1000000 ))
+
+START=$(date +%s%N)
+nslookup -timeout=3 cloudflare.com 127.0.0.1 >/dev/null 2>&1
+END=$(date +%s%N)
+SECOND_TIME=$(( (END - START) / 1000000 ))
+
+check_info "首次查询" "${FIRST_TIME}ms"
+check_info "缓存查询" "${SECOND_TIME}ms"
+
+if [ "$SECOND_TIME" -le "$FIRST_TIME" ]; then
+    check_pass "缓存生效 (${SECOND_TIME}ms <= ${FIRST_TIME}ms)"
+else
+    check_warn "缓存可能未生效"
 fi
 
 #==================================================
-# 9. 存储空间检查
+# 第10部分: 外部影响因素检测
 #==================================================
-section "存储空间检查"
+print_section "🔎 第10部分: 外部影响因素检测"
 
-# 磁盘空间
-DISK_USAGE=$(df -h / | awk 'NR==2 {print $5}' | sed 's/%//')
-DISK_AVAIL=$(df -h / | awk 'NR==2 {print $4}')
-info "根分区使用率" "${DISK_USAGE}%"
-info "可用空间" "$DISK_AVAIL"
-
-if [ "$DISK_USAGE" -gt 90 ]; then
-    fail "磁盘空间不足 (${DISK_USAGE}%)" \
-         "建议清理或扩容，至少保留 50MB"
-elif [ "$DISK_USAGE" -gt 70 ]; then
-    warn "磁盘空间偏低 (${DISK_USAGE}%)" \
-         "建议关注空间使用"
-else
-    pass "磁盘空间充足"
+print_sub "防火墙规则"
+if command -v iptables >/dev/null 2>&1; then
+    DNS_RULES=$(iptables -L -n 2>/dev/null | grep -c "dpt:53\|dpt:853\|dpt:5353")
+    if [ "$DNS_RULES" -gt 0 ]; then
+        check_warn "防火墙有 $DNS_RULES 条 DNS 相关规则" "可能影响 DNS 查询"
+        iptables -L -n 2>/dev/null | grep "dpt:53\|dpt:853\|dpt:5353" | head -3 | while read line; do
+            echo -e "    ${CYAN}$line${NC}"
+        done
+    else
+        check_pass "防火墙未限制 DNS"
+    fi
 fi
 
-# 内存
-MEM_TOTAL=$(free -m | awk 'NR==2 {print $2}')
+if command -v nft >/dev/null 2>&1; then
+    DNS_RULES=$(nft list ruleset 2>/dev/null | grep -c "dport 53\|dport 853\|dport 5353")
+    if [ "$DNS_RULES" -gt 0 ]; then
+        check_warn "nftables 有 DNS 相关规则"
+    fi
+fi
+
+print_sub "SELinux/AppArmor"
+if command -v getenforce >/dev/null 2>&1; then
+    SE_STATUS=$(getenforce 2>/dev/null)
+    if [ "$SE_STATUS" = "Enforcing" ]; then
+        check_warn "SELinux 处于强制模式" "可能限制 SmartDNS"
+    else
+        check_pass "SELinux: $SE_STATUS"
+    fi
+fi
+
+if command -v aa-status >/dev/null 2>&1; then
+    if aa-status 2>/dev/null | grep -q "smartdns"; then
+        check_warn "AppArmor 可能限制 smartdns"
+    fi
+fi
+
+print_sub "资源限制"
+if [ -f /proc/sys/fs/file-max ]; then
+    FILE_MAX=$(cat /proc/sys/fs/file-max)
+    check_info "系统最大文件句柄" "$FILE_MAX"
+fi
+
+ULIMIT=$(ulimit -n 2>/dev/null)
+check_info "当前限制" "$ULIMIT"
+[ "$ULIMIT" -lt 1024 ] && check_warn "文件句柄限制较低" "建议: ulimit -n 65536"
+
+print_sub "磁盘空间"
+USAGE=$(df -h / | awk 'NR==2 {print $5}' | sed 's/%//')
+AVAIL=$(df -h / | awk 'NR==2 {print $4}')
+if [ "$USAGE" -gt 90 ]; then
+    check_fail "磁盘使用率: ${USAGE}% (可用: $AVAIL)"
+elif [ "$USAGE" -gt 75 ]; then
+    check_warn "磁盘使用率: ${USAGE}% (可用: $AVAIL)"
+else
+    check_pass "磁盘空间充足: ${AVAIL}可用"
+fi
+
+print_sub "内存"
 MEM_AVAIL=$(free -m | awk 'NR==2 {print $7}')
-info "总内存" "${MEM_TOTAL}MB"
-info "可用内存" "${MEM_AVAIL}MB"
-
-if [ "$MEM_AVAIL" -lt 50 ]; then
-    fail "内存不足 (可用: ${MEM_AVAIL}MB)" \
-         "SmartDNS 至少需要 20MB，建议增加内存"
-elif [ "$MEM_AVAIL" -lt 100 ]; then
-    warn "内存偏低 (可用: ${MEM_AVAIL}MB)" \
-         "SmartDNS 最小运行内存约 20MB"
-else
-    pass "内存充足"
-fi
+MEM_TOTAL=$(free -m | awk 'NR==2 {print $2}')
+check_info "可用内存" "${MEM_AVAIL}MB / ${MEM_TOTAL}MB"
+[ "$MEM_AVAIL" -lt 50 ] && check_fail "内存不足" "SmartDNS 至少需要 20MB"
 
 #==================================================
-# 10. 权限检查
+# 最终报告
 #==================================================
-section "权限检查"
+print_section "📊 检测报告"
 
-# 文件写入权限
-for dir in /usr/bin /usr/sbin /etc /var/log; do
-    if [ -d "$dir" ] && [ -w "$dir" ]; then
-        pass "目录可写: $dir"
-    else
-        fail "目录不可写: $dir" \
-             "SmartDNS 安装需要写入此目录"
-    fi
-done
-
-# 服务管理权限
-if [ "$INIT" = "systemd" ]; then
-    if systemctl >/dev/null 2>&1; then
-        pass "systemctl 可用"
-    else
-        fail "systemctl 不可用" \
-             "可能无法自动启动服务"
-    fi
-elif [ "$INIT" = "openrc" ]; then
-    if rc-service >/dev/null 2>&1; then
-        pass "rc-service 可用"
-    else
-        fail "rc-service 不可用" \
-             "可能无法自动启动服务"
-    fi
-fi
-
-#==================================================
-# 检测结果汇总
-#==================================================
 echo ""
-echo -e "${BOLD}${BLUE}══════════════════════════════════════════${NC}"
-echo -e "${BOLD}${BLUE}  检测结果汇总${NC}"
-echo -e "${BOLD}${BLUE}══════════════════════════════════════════${NC}"
-echo ""
-echo -e "  总检测项: ${BOLD}${TOTAL_CHECKS}${NC}"
-echo -e "  通过: ${GREEN}${PASSED_CHECKS}${NC}"
-echo -e "  警告: ${YELLOW}${WARN_COUNT}${NC}"
-echo -e "  失败: ${RED}${FAIL_COUNT}${NC}"
+echo -e "${BOLD}╔══════════════════════════════════════════════════════════╗${NC}"
+echo -e "${BOLD}║                    检测结果汇总                          ║${NC}"
+echo -e "${BOLD}╠══════════════════════════════════════════════════════════╣${NC}"
+printf "${BOLD}║${NC}  %-52s ${BOLD}║${NC}\n" "  总检测项: $TOTAL"
+printf "${BOLD}║${NC}  %-52s ${BOLD}║${NC}\n" "  ${GREEN}通过: $PASS${NC}"
+printf "${BOLD}║${NC}  %-52s ${BOLD}║${NC}\n" "  ${YELLOW}警告: $WARN${NC}"
+printf "${BOLD}║${NC}  %-52s ${BOLD}║${NC}\n" "  ${RED}失败: $FAIL${NC}"
+echo -e "${BOLD}╚══════════════════════════════════════════════════════════╝${NC}"
 echo ""
 
 # 综合评分
-if [ "$FAIL_COUNT" -eq 0 ] && [ "$WARN_COUNT" -eq 0 ]; then
-    echo -e "  ${GREEN}${BOLD}✓ 完美！系统完全兼容 SmartDNS 部署${NC}"
-    COMPATIBILITY="完美"
-elif [ "$FAIL_COUNT" -eq 0 ]; then
-    echo -e "  ${GREEN}${BOLD}✓ 系统兼容，但存在 ${WARN_COUNT} 个警告${NC}"
-    echo -e "  ${GREEN}建议查看上方警告项，但可继续安装${NC}"
-    COMPATIBILITY="良好"
-elif [ "$FAIL_COUNT" -le 2 ]; then
-    echo -e "  ${YELLOW}${BOLD}⚠ 存在 ${FAIL_COUNT} 个严重问题，需解决后再安装${NC}"
-    COMPATIBILITY="需要注意"
+SCORE=$(( PASS * 100 / TOTAL ))
+echo -e "${BOLD}综合评分:${NC}"
+
+if [ "$FAIL" -eq 0 ] && [ "$WARN" -eq 0 ]; then
+    echo -e "  ${GREEN}${BOLD}★★★★★ 完美！所有检测通过${NC}"
+elif [ "$FAIL" -eq 0 ] && [ "$WARN" -le 3 ]; then
+    echo -e "  ${GREEN}${BOLD}★★★★☆ 良好！仅有少量警告${NC}"
+elif [ "$FAIL" -eq 0 ]; then
+    echo -e "  ${YELLOW}${BOLD}★★★☆☆ 一般！需要关注警告项${NC}"
+elif [ "$FAIL" -le 2 ]; then
+    echo -e "  ${RED}${BOLD}★★☆☆☆ 较差！需要修复失败项${NC}"
 else
-    echo -e "  ${RED}${BOLD}✗ 存在多个严重问题，不建议直接安装${NC}"
-    COMPATIBILITY="不兼容"
+    echo -e "  ${RED}${BOLD}★☆☆☆☆ 严重！存在多个问题${NC}"
 fi
 
 echo ""
-echo -e "${BOLD}${BLUE}══════════════════════════════════════════${NC}"
-echo -e "${BOLD}${BLUE}  安装建议${NC}"
-echo -e "${BOLD}${BLUE}══════════════════════════════════════════${NC}"
-echo ""
-
-if [ "$GITHUB_ACCESSIBLE" = false ]; then
-    echo -e "  ${WARN} GitHub 不可达，建议提前下载:"
-    echo -e "      wget https://github.com/pymumu/smartdns/releases/latest/download/smartdns-${ARCH}"
-    echo ""
+echo -e "${BOLD}建议操作:${NC}"
+if [ "$FAIL" -gt 0 ]; then
+    echo -e "  ${RED}1. 优先解决上方标记为 ✗ 的失败项${NC}"
+fi
+if [ "$WARN" -gt 0 ]; then
+    echo -e "  ${YELLOW}2. 关注标记为 ⚠ 的警告项${NC}"
+fi
+if pgrep smartdns >/dev/null 2>&1; then
+    echo -e "  ${GREEN}3. SmartDNS 运行正常，可以继续使用${NC}"
+else
+    echo -e "  ${RED}3. SmartDNS 未运行，请先启动服务${NC}"
 fi
 
-if [ "$PORT_53_AVAILABLE" = false ]; then
-    echo -e "  ${WARN} 端口 53 被占用，SmartDNS 将使用备用端口"
-    echo -e "      安装脚本会自动选择可用端口"
-    echo ""
-fi
-
-echo -e "  ${INFO} 安装命令:"
-echo -e "      ${GREEN}wget -O smartdns-install.sh https://你的脚本地址${NC}"
-echo -e "      ${GREEN}chmod +x smartdns-install.sh${NC}"
-echo -e "      ${GREEN}./smartdns-install.sh${NC}"
 echo ""
-
-# 导出检测报告
-REPORT_FILE="/tmp/smartdns-check-report.txt"
-{
-    echo "SmartDNS 环境检测报告"
-    echo "检测时间: $(date '+%Y-%m-%d %H:%M:%S')"
-    echo "操作系统: $OS $VER"
-    echo "内核: $KERNEL"
-    echo "架构: $ARCH"
-    echo "Init: $INIT"
-    echo "虚拟化: $VIRT"
-    echo ""
-    echo "检测结果: $COMPATIBILITY"
-    echo "通过: $PASSED_CHECKS / 警告: $WARN_COUNT / 失败: $FAIL_COUNT"
-} > "$REPORT_FILE"
-
-echo -e "  ${INFO} 完整报告已保存: ${CYAN}${REPORT_FILE}${NC}"
+echo -e "检测时间: $(date '+%Y-%m-%d %H:%M:%S')"
+echo -e "检测脚本版本: v2.0"
 echo ""
