@@ -1,26 +1,24 @@
 #!/usr/bin/env bash
 
 # =========================================================
-# Secure-DNS Unbound Stable Edition v5.0
+# Secure-DNS Unbound Stable Edition v5.1
 #
-# 稳定特性:
+# 修复版:
 # - Debian / Ubuntu / Alpine
-# - systemd / OpenRC 自动兼容
-# - 自动安装/升级 Unbound
-# - 自动 IPv4 / IPv6 检测
-# - 自动适配 IPv4-only / IPv6-only / 双栈
-# - 自动关闭 systemd-resolved
-# - 自动防止 dhcpcd 覆盖 resolv.conf
+# - systemd / OpenRC
+# - 自动安装或升级 Unbound
+# - 自动检测 IPv4 / IPv6
+# - 自动适配 IPv4-only / IPv6-only / DualStack
+# - 正确兼容 dhcpcd / resolvconf / 容器
+# - 使用 resolv.conf.head 持久化 DNS
 # - Cloudflare + Google DNS over TLS
-# - 稳定优先
 #
-# 不使用:
-# - tcp-fastopen
-# - prefetch-key
-# - daemon 死循环
-# - chattr
-# - capability hack
-# - Root fallback
+# 特点:
+# - 不强改 resolv.conf
+# - 不使用 chattr
+# - 不使用 daemon 死循环
+# - 不使用 root fallback hack
+# - Alpine / Incus / LXC 稳定
 #
 # =========================================================
 
@@ -38,7 +36,7 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 # =========================================================
-# 变量
+# 全局变量
 # =========================================================
 
 OS=""
@@ -50,7 +48,6 @@ ENABLE_IPV6=false
 PREFER_IPV6="no"
 
 UNBOUND_CONF="/etc/unbound/unbound.conf"
-RESOLV_CONF="/etc/resolv.conf"
 
 # =========================================================
 # 日志
@@ -225,7 +222,6 @@ detect_ipv6() {
         >/dev/null 2>&1; then
 
         ENABLE_IPV6=true
-
         PREFER_IPV6="yes"
 
         log_info "IPv6 可用"
@@ -256,25 +252,6 @@ disable_systemd_resolved() {
 
             log_info "已关闭 systemd-resolved"
         fi
-    fi
-}
-
-# =========================================================
-# dhcpcd
-# =========================================================
-
-protect_resolvconf() {
-
-    log_step "保护 resolv.conf"
-
-    if [ -f /etc/dhcpcd.conf ]; then
-
-        grep -q '^nohook resolv.conf' \
-            /etc/dhcpcd.conf \
-            || echo 'nohook resolv.conf' \
-            >> /etc/dhcpcd.conf
-
-        log_info "已禁用 dhcpcd 覆盖 DNS"
     fi
 }
 
@@ -412,36 +389,69 @@ check_config() {
 }
 
 # =========================================================
-# 配置系统 DNS
+# DNS 持久化配置
 # =========================================================
 
 configure_dns() {
 
     log_step "配置系统 DNS"
 
-    [ -L "$RESOLV_CONF" ] && rm -f "$RESOLV_CONF"
+    mkdir -p /etc
 
-    {
-        [ "$ENABLE_IPV4" = true ] && \
-            echo "nameserver 127.0.0.1"
+    cat > /etc/resolv.conf.head << EOF
+nameserver 127.0.0.1
+EOF
 
-        [ "$ENABLE_IPV6" = true ] && \
-            echo "nameserver ::1"
+    if [ "$ENABLE_IPV6" = true ]; then
+        echo "nameserver ::1" >> /etc/resolv.conf.head
+    fi
 
-        echo ""
-        echo "options timeout:2"
-        echo "options attempts:2"
-        echo "options edns0"
+    # Alpine dhcpcd
+    if [ -f /etc/dhcpcd.conf ]; then
 
-    } > "$RESOLV_CONF"
+        grep -q '^nohook resolv.conf' \
+            /etc/dhcpcd.conf || true
 
-    chmod 644 "$RESOLV_CONF"
+        if command -v rc-service >/dev/null 2>&1; then
+            rc-service dhcpcd restart \
+                >/dev/null 2>&1 || true
+        fi
+    fi
 
-    log_info "系统 DNS 已配置"
+    # Debian resolvconf
+    if [ -d /etc/resolvconf/resolv.conf.d ]; then
+
+        cp /etc/resolv.conf.head \
+           /etc/resolvconf/resolv.conf.d/head
+
+        if command -v resolvconf >/dev/null 2>&1; then
+            resolvconf -u || true
+        fi
+    fi
+
+    # fallback
+    if [ ! -f /etc/resolv.conf ] || \
+       ! grep -q '127.0.0.1' /etc/resolv.conf 2>/dev/null; then
+
+        cat > /etc/resolv.conf << EOF
+nameserver 127.0.0.1
+EOF
+
+        if [ "$ENABLE_IPV6" = true ]; then
+            echo "nameserver ::1" >> /etc/resolv.conf
+        fi
+
+        echo "" >> /etc/resolv.conf
+        echo "options timeout:2" >> /etc/resolv.conf
+        echo "options attempts:2" >> /etc/resolv.conf
+        echo "options edns0" >> /etc/resolv.conf
+    fi
+
+    log_info "DNS 优先级已设置为本地 Unbound"
 }
 
 # =========================================================
-# 启动
+# 启动 Unbound
 # =========================================================
 
 start_unbound() {
@@ -582,6 +592,11 @@ show_info() {
 
     echo ""
 
+    echo "当前 resolv.conf:"
+    cat /etc/resolv.conf || true
+
+    echo ""
+
     echo "测试命令:"
     echo "  dig cloudflare.com @127.0.0.1"
 
@@ -600,7 +615,7 @@ main() {
 "${BLUE}╔══════════════════════════════════════╗${NC}"
 
     echo -e \
-"${BLUE}║    Secure-DNS Unbound Stable v5.0   ║${NC}"
+"${BLUE}║    Secure-DNS Unbound Stable v5.1   ║${NC}"
 
     echo -e \
 "${BLUE}╚══════════════════════════════════════╝${NC}"
@@ -620,8 +635,6 @@ main() {
     detect_ipv6
 
     disable_systemd_resolved
-
-    protect_resolvconf
 
     configure_unbound
 
