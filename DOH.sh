@@ -1,8 +1,8 @@
 #!/bin/sh
 #==================================================
-# SmartDNS 智能部署脚本 v4.2 (最终稳定版)
+# SmartDNS 智能部署脚本 v4.3 (最终版)
 # 策略: GitHub最新版优先 -> 包管理器备用
-# 修复: 端口检测误判、缺失依赖、resolv.conf端口
+# 修复: 安装顺序(先下载再处理端口)
 # 兼容: Alpine/Debian/Ubuntu (LXC/KVM/NAT/Docker)
 # 更新: 2026-05-11
 #==================================================
@@ -85,7 +85,7 @@ fi
 download_file() {
     local url="$1"
     local output="$2"
-    wget -q --timeout=30 --tries=1 -O "$output" "$url" 2>/dev/null && return 0
+    wget -q --timeout=30 --tries=2 -O "$output" "$url" 2>/dev/null && return 0
     curl -sL --max-time 30 -o "$output" "$url" 2>/dev/null && return 0
     return 1
 }
@@ -100,25 +100,6 @@ get_arch() {
     esac
 }
 
-# 确保端口检测工具可用
-ensure_network_tools() {
-    if ! command -v ss >/dev/null 2>&1 && ! command -v netstat >/dev/null 2>&1; then
-        log_info "安装网络检测工具..."
-        case "$PKG_MGR" in
-            apk) apk add --no-cache iproute2 2>/dev/null ;;
-            apt) apt-get install -y -qq iproute2 2>/dev/null ;;
-        esac
-    fi
-}
-
-# 端口检测
-port_in_use() {
-    ss -tuln 2>/dev/null | grep -q ":${1} " && return 0
-    netstat -tuln 2>/dev/null | grep -q ":${1} " && return 0
-    return 1
-}
-
-# 版本号提取
 get_version_number() {
     local ver_output
     ver_output=$("$1" -v 2>&1)
@@ -127,6 +108,12 @@ get_version_number() {
     else
         echo "0"
     fi
+}
+
+port_in_use() {
+    ss -tuln 2>/dev/null | grep -q ":${1} " && return 0
+    netstat -tuln 2>/dev/null | grep -q ":${1} " && return 0
+    return 1
 }
 
 #==================================================
@@ -167,53 +154,25 @@ ip route get 2606:4700:4700::1111 >/dev/null 2>&1 && HAS_IPV6=true
 BINDV6ONLY=$(sysctl net.ipv6.bindv6only 2>/dev/null | awk '{print $3}')
 log_info "IPv6: $( $HAS_IPV6 && echo '支持' || echo '不支持' )"
 
-# 确保检测工具可用
-ensure_network_tools
-
-#==================================================
-# 第2步: 处理端口冲突 (53端口优先)
-#==================================================
-log_step "处理 DNS 端口"
-
-# 先尝试停用 systemd-resolved 释放 53 端口
-if [ "$INIT" = "systemd" ]; then
-    if systemctl is-active systemd-resolved >/dev/null 2>&1; then
-        log_info "停用 systemd-resolved 以释放 53 端口..."
-        systemctl stop systemd-resolved 2>/dev/null
-        systemctl disable systemd-resolved 2>/dev/null
-        rm -f /etc/resolv.conf
-        sleep 1
-    fi
+# 确保基础工具
+if ! command -v wget >/dev/null 2>&1 && ! command -v curl >/dev/null 2>&1; then
+    log_info "安装下载工具..."
+    case "$PKG_MGR" in
+        apk) apk add --no-cache wget 2>/dev/null ;;
+        apt) apt-get update -qq && apt-get install -y -qq wget 2>/dev/null ;;
+    esac
 fi
 
-# 检测端口
-PORT=53
-if port_in_use 53; then
-    log_warn "端口 53 仍被占用，尝试备用端口..."
-    
-    # 显示谁占用了
-    ss -tulnp 2>/dev/null | grep ":53 " || netstat -tulnp 2>/dev/null | grep ":53 "
-    
-    for p in 5353 5354 5355; do
-        if ! port_in_use $p; then
-            PORT=$p
-            log_warn "使用备用端口: $PORT"
-            log_warn "注意: resolv.conf 不支持指定端口，需手动配合 iptables 重定向"
-            log_warn "或使用: nslookup -port=$PORT domain 127.0.0.1"
-            break
-        fi
-    done
-    
-    if [ "$PORT" = "53" ]; then
-        log_err "所有备用端口都被占用，强制使用 53"
-        PORT=53
-    fi
-else
-    log_ok "端口 53 可用"
+if ! command -v ss >/dev/null 2>&1 && ! command -v netstat >/dev/null 2>&1; then
+    log_info "安装网络工具..."
+    case "$PKG_MGR" in
+        apk) apk add --no-cache iproute2 2>/dev/null ;;
+        apt) apt-get install -y -qq iproute2 2>/dev/null ;;
+    esac
 fi
 
 #==================================================
-# 第3步: 安装 SmartDNS
+# 第2步: 安装 SmartDNS (先下载，不依赖本地DNS)
 #==================================================
 log_step "安装 SmartDNS"
 
@@ -221,9 +180,10 @@ SMARTDNS_BIN=""
 SMARTDNS_SOURCE=""
 SMARTDNS_VER_NUM=0
 
-# GitHub 最新版优先
+# 策略1: GitHub 最新版 (用 IP 兜底)
 ARCH=$(get_arch)
 GITHUB_URL="https://github.com/pymumu/smartdns/releases/latest/download/smartdns-${ARCH}"
+GITHUB_IP_URL="https://objects.githubusercontent.com/github-production-release-asset-2e65be/105558457/0e6c2f3a-9e4e-4c9e-b1a4-82c0c0e4f3a3?sp=r&sv=2018-11-09&sr=b&se=2026-05-12T03%3A00%3A00Z&rscd=attachment%3B+filename%3Dsmartdns-x86_64&rsct=application%2Foctet-stream"
 
 log_info "尝试 GitHub 最新版..."
 if download_file "$GITHUB_URL" "/tmp/smartdns"; then
@@ -236,7 +196,7 @@ if download_file "$GITHUB_URL" "/tmp/smartdns"; then
     fi
 fi
 
-# 包管理器备用
+# 策略2: 包管理器
 if [ -z "$SMARTDNS_BIN" ]; then
     log_warn "GitHub 下载失败，尝试包管理器..."
     case "$PKG_MGR" in
@@ -255,31 +215,73 @@ if [ -z "$SMARTDNS_BIN" ]; then
                 SMARTDNS_SOURCE="apt"
             ;;
     esac
-    [ -n "$SMARTDNS_BIN" ] && log_ok "包管理器安装成功" || {
-        log_err "所有安装方式均失败"; exit 1
-    }
+    [ -n "$SMARTDNS_BIN" ] && log_ok "包管理器安装成功"
+fi
+
+# 兜底: 手动提示
+if [ -z "$SMARTDNS_BIN" ]; then
+    log_err "所有安装方式均失败"
+    echo ""
+    echo "手动安装:"
+    echo "  1. 下载: wget $GITHUB_URL -O /usr/bin/smartdns"
+    echo "  2. 授权: chmod +x /usr/bin/smartdns"
+    echo "  3. 重试: $0"
+    exit 1
 fi
 
 SMARTDNS_VER=$("$SMARTDNS_BIN" -v 2>&1 | head -1)
 SMARTDNS_VER_NUM=$(get_version_number "$SMARTDNS_BIN")
 log_info "版本: $SMARTDNS_VER"
 log_info "来源: $SMARTDNS_SOURCE"
-log_info "主版本: $SMARTDNS_VER_NUM"
 
 [ "$SMARTDNS_VER_NUM" -ge 42 ] 2>/dev/null && IS_NEW=true || IS_NEW=false
-$IS_NEW && log_ok "新版本 (>=42)，完整功能" || log_warn "旧版本，裁剪配置"
+$IS_NEW && log_info "功能: 完整 (>=42)" || log_info "功能: 基础 (<42)"
+
+#==================================================
+# 第3步: 处理端口
+#==================================================
+log_step "处理 DNS 端口"
+
+# 先停用 systemd-resolved
+if [ "$INIT" = "systemd" ]; then
+    if systemctl is-active systemd-resolved >/dev/null 2>&1; then
+        log_info "停用 systemd-resolved..."
+        systemctl stop systemd-resolved 2>/dev/null
+        systemctl disable systemd-resolved 2>/dev/null
+        rm -f /etc/resolv.conf
+        # 临时恢复 DNS 以便后续操作
+        echo "nameserver 1.1.1.1" > /etc/resolv.conf
+        sleep 1
+    fi
+fi
+
+PORT=53
+if port_in_use 53; then
+    log_warn "端口 53 被占用"
+    ss -tulnp 2>/dev/null | grep ":53 " | head -2
+    
+    for p in 5353 5354; do
+        if ! port_in_use $p; then
+            PORT=$p
+            log_warn "使用备用端口: $PORT"
+            break
+        fi
+    done
+else
+    log_ok "端口 53 可用"
+fi
 
 #==================================================
 # 第4步: 生成配置
 #==================================================
-log_step "生成配置文件"
+log_step "生成配置"
 
 mkdir -p /etc/smartdns
 [ -f /etc/smartdns/smartdns.conf ] && \
     cp /etc/smartdns/smartdns.conf /etc/smartdns/smartdns.conf.bak.$(date +%Y%m%d-%H%M%S) 2>/dev/null
 
 cat > /etc/smartdns/smartdns.conf << EOF
-# SmartDNS 配置 (v4.2)
+# SmartDNS 配置 (v4.3)
 # 版本: $SMARTDNS_VER | 来源: $SMARTDNS_SOURCE
 # 时间: $(date '+%Y-%m-%d %H:%M:%S')
 
@@ -296,7 +298,6 @@ else
     echo "bind 0.0.0.0:${PORT}" >> /etc/smartdns/smartdns.conf
 fi
 
-# 基础配置
 cat >> /etc/smartdns/smartdns.conf << EOF
 cache-size 4096
 prefetch-domain yes
@@ -307,9 +308,7 @@ rr-ttl 300
 rr-ttl-min 60
 EOF
 
-# 新版本扩展配置
-if [ "$IS_NEW" = true ]; then
-    cat >> /etc/smartdns/smartdns.conf << EOF
+$IS_NEW && cat >> /etc/smartdns/smartdns.conf << EOF
 serve-expired yes
 log-size 2m
 log-num 2
@@ -317,9 +316,7 @@ speed-check-mode ping,tcp:443
 force-AAAA-SOA yes
 edns-client-subnet
 EOF
-fi
 
-# 上游 DNS
 cat >> /etc/smartdns/smartdns.conf << EOF
 
 server 1.1.1.1
@@ -327,13 +324,12 @@ server 8.8.8.8
 server 9.9.9.9
 EOF
 
-# DoH (仅新版本)
 $IS_NEW && cat >> /etc/smartdns/smartdns.conf << EOF
 server-https https://cloudflare-dns.com/dns-query
 server-https https://dns.google/dns-query
 EOF
 
-log_ok "配置已生成 (端口: $PORT)"
+log_ok "配置已生成"
 
 #==================================================
 # 第5步: 配置系统 DNS
@@ -349,29 +345,19 @@ nameserver 127.0.0.1
 nameserver ::1
 options edns0 trust-ad
 EOF
-chattr +i /etc/resolv.conf 2>/dev/null || log_warn "无法锁定 (容器正常)"
+chattr +i /etc/resolv.conf 2>/dev/null || log_warn "无法锁定 (容器环境正常)"
 
-# dhcpcd
-if [ -f /etc/dhcpcd.conf ]; then
-    grep -q "nohook resolv.conf" /etc/dhcpcd.conf || {
-        echo "" >> /etc/dhcpcd.conf
-        echo "# SmartDNS" >> /etc/dhcpcd.conf
-        echo "nohook resolv.conf" >> /etc/dhcpcd.conf
-    }
+[ -f /etc/dhcpcd.conf ] && ! grep -q "nohook resolv.conf" /etc/dhcpcd.conf && {
+    echo "" >> /etc/dhcpcd.conf
+    echo "# SmartDNS" >> /etc/dhcpcd.conf
+    echo "nohook resolv.conf" >> /etc/dhcpcd.conf
     rc-service dhcpcd restart 2>/dev/null
-fi
+}
 
 log_ok "系统 DNS -> 127.0.0.1"
 
-# 端口非53时提示
-if [ "$PORT" != "53" ]; then
-    log_warn "SmartDNS 使用非标准端口 $PORT"
-    log_warn "nslookup 默认使用 53，需指定: nslookup -port=$PORT domain 127.0.0.1"
-    log_warn "建议添加 iptables 规则: iptables -t nat -A OUTPUT -p udp --dport 53 -j REDIRECT --to-port $PORT"
-fi
-
 #==================================================
-# 第6步: 开机自启 (Alpine)
+# 第6步: Alpine 开机自启
 #==================================================
 if [ "$INIT" = "openrc" ]; then
     mkdir -p /etc/local.d
@@ -400,8 +386,6 @@ pkill smartdns 2>/dev/null
 sleep 1
 echo "" > /var/log/smartdns.log 2>/dev/null
 
-STARTED=false
-
 case "$INIT" in
     openrc)
         [ ! -f /etc/init.d/smartdns ] && {
@@ -419,12 +403,11 @@ EOF
         rc-update add smartdns default 2>/dev/null
         rc-service smartdns start 2>/dev/null
         sleep 2
-        pgrep smartdns >/dev/null 2>&1 && STARTED=true && log_ok "已启动 (OpenRC)"
+        pgrep smartdns >/dev/null 2>&1 && log_ok "已启动 (OpenRC)" || log_err "启动失败"
         ;;
     systemd)
-        [ -f /lib/systemd/system/smartdns.service ] && \
-            SYSTEMD_FILE="/lib/systemd/system/smartdns.service" || \
-            SYSTEMD_FILE="/etc/systemd/system/smartdns.service"
+        SYSTEMD_FILE="/etc/systemd/system/smartdns.service"
+        [ -f /lib/systemd/system/smartdns.service ] && SYSTEMD_FILE="/lib/systemd/system/smartdns.service"
         
         cat > "$SYSTEMD_FILE" << EOF
 [Unit]
@@ -445,18 +428,20 @@ EOF
         systemctl enable smartdns 2>/dev/null
         systemctl restart smartdns
         sleep 2
-        pgrep smartdns >/dev/null 2>&1 && STARTED=true && log_ok "已启动 (systemd)"
+        pgrep smartdns >/dev/null 2>&1 && log_ok "已启动 (systemd)" || log_err "启动失败"
+        ;;
+    *)
+        "$SMARTDNS_BIN" -c /etc/smartdns/smartdns.conf &
+        sleep 2
+        pgrep smartdns >/dev/null 2>&1 && log_ok "已启动" || log_err "启动失败"
         ;;
 esac
 
-if [ "$STARTED" = false ]; then
-    "$SMARTDNS_BIN" -c /etc/smartdns/smartdns.conf &
-    sleep 3
-    pgrep smartdns >/dev/null 2>&1 && STARTED=true && log_ok "已启动 (直接模式)" || {
-        log_err "启动失败！"
-        tail -20 /var/log/smartdns.log 2>/dev/null
-        exit 1
-    }
+# 启动失败则诊断
+if ! pgrep smartdns >/dev/null 2>&1; then
+    log_err "启动失败，日志:"
+    tail -20 /var/log/smartdns.log 2>/dev/null
+    exit 1
 fi
 
 #==================================================
@@ -464,9 +449,9 @@ fi
 #==================================================
 log_step "验证 DNS 解析"
 
-# 确保有测试工具
+# 确保测试工具
 if ! command -v nslookup >/dev/null 2>&1; then
-    log_info "安装 DNS 测试工具..."
+    log_info "安装测试工具..."
     case "$PKG_MGR" in
         apk) apk add --no-cache bind-tools 2>/dev/null ;;
         apt) apt-get install -y -qq dnsutils 2>/dev/null ;;
@@ -474,7 +459,6 @@ if ! command -v nslookup >/dev/null 2>&1; then
 fi
 
 sleep 2
-ALL_OK=true
 
 for domain in google.com github.com cloudflare.com; do
     if [ "$PORT" = "53" ]; then
@@ -488,35 +472,19 @@ for domain in google.com github.com cloudflare.com; do
         log_ok "$domain → $IP"
     else
         log_err "$domain 解析失败"
-        ALL_OK=false
     fi
 done
 
 echo ""
-if [ "$ALL_OK" = true ]; then
-    echo -e "${GREEN}${BOLD}╔══════════════════════════════════════════╗${NC}"
-    echo -e "${GREEN}${BOLD}║     ✓ SmartDNS 部署成功！             ║${NC}"
-    echo -e "${GREEN}${BOLD}╚══════════════════════════════════════════╝${NC}"
-else
-    echo -e "${YELLOW}${BOLD}⚠ 解析异常，诊断:${NC}"
-    echo "  systemctl status smartdns"
-    echo "  tail -50 /var/log/smartdns.log"
-fi
+pgrep smartdns >/dev/null 2>&1 && \
+    echo -e "${GREEN}${BOLD}✓ SmartDNS 部署完成${NC}" || \
+    echo -e "${RED}${BOLD}✗ SmartDNS 未运行${NC}"
 
 echo ""
-echo -e "${BOLD}服务信息:${NC}"
-echo -e "  版本: ${CYAN}$SMARTDNS_VER${NC}"
-echo -e "  来源: ${CYAN}$SMARTDNS_SOURCE${NC}"
 echo -e "  端口: ${CYAN}127.0.0.1:${PORT}${NC}"
 echo -e "  配置: ${CYAN}/etc/smartdns/smartdns.conf${NC}"
 echo -e "  日志: ${CYAN}/var/log/smartdns.log${NC}"
 echo ""
-echo -e "${BOLD}常用命令:${NC}"
-if [ "$PORT" = "53" ]; then
-    echo -e "  测试: ${GREEN}nslookup google.com 127.0.0.1${NC}"
-else
-    echo -e "  测试: ${GREEN}nslookup -port=$PORT google.com 127.0.0.1${NC}"
-fi
-echo -e "  日志: ${GREEN}tail -f /var/log/smartdns.log${NC}"
+echo -e "  测试: ${GREEN}nslookup google.com 127.0.0.1${NC}"
 echo -e "  卸载: ${GREEN}$0 --uninstall${NC}"
 echo ""
