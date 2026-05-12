@@ -1,16 +1,13 @@
 #!/usr/bin/env bash
 #===============================================================================
-# Komari + Cloudflare Tunnel Manager v4.5.1 (fixed)
+# Komari + Cloudflare Tunnel Manager v4.5.2
 # 生产级稳定版 | Alpine/Debian/OpenRC/systemd/BusyBox 兼容
 #
-# 主要修复：
-# 1) Token 保存使用 %s，避免破坏内容
-# 2) 去掉危险/脆弱的 trap 拼接，改为清理函数
-# 3) _cmd_ok 改为 BusyBox 友好的存在性检查
-# 4) checksum 候选限制为 3 个 URL
-# 5) 保存/恢复 umask 使用子作用域
-# 6) tail -n +N 已改为 awk
-# 7) restore/backup 前补齐目录，避免恢复时目录缺失
+# v4.5.2 修复:
+#   - cloudflared wrapper 使用环境变量传递 Token（不再暴露在 ps 中）
+#   - 安装完成后交互界面显示初始账号密码
+#   - 交互菜单新增"查看密码"选项
+# shellcheck disable=SC1090,SC2034,SC2155
 #===============================================================================
 
 set -euo pipefail
@@ -19,7 +16,7 @@ IFS=$'\n\t'
 #===============================================================================
 # 常量
 #===============================================================================
-readonly VERSION="4.5.1"
+readonly VERSION="4.5.2"
 readonly APP_NAME="komari"
 readonly CF_NAME="cloudflared"
 
@@ -74,6 +71,7 @@ cleanup_lock() {
         rm -f "${LOCK_DIR}.flock" 2>/dev/null || true
     fi
 }
+
 acquire_lock() {
     if command -v flock >/dev/null 2>&1; then
         exec 9>"${LOCK_DIR}.flock"
@@ -120,7 +118,7 @@ detect_ip() {
 }
 
 #===============================================================================
-# 依赖安装（增强 BusyBox 兼容）
+# 依赖安装
 #===============================================================================
 _cmd_ok() {
     command -v "$1" >/dev/null 2>&1
@@ -362,26 +360,32 @@ svc_ok() {
 }
 
 #===============================================================================
-# Cloudflare Tunnel Token 管理
+# Cloudflare Tunnel Token 管理（v4.5.2：wrapper 使用环境变量，不在 ps 暴露）
 #===============================================================================
 install_cf_wrapper() {
     mkdir -p "$CF_DIR"
     cat > "$CF_WRAPPER" <<'WRAPPER_EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-CF_BIN="/usr/local/bin/cloudflared"
+
 CF_ENV="/opt/komari/cloudflared/.env"
+CF_BIN="/usr/local/bin/cloudflared"
 
-[[ -f "$CF_ENV" ]] && . "$CF_ENV"
+# 从 env 文件加载 Token 到环境变量（不暴露在 ps 命令行中）
+if [[ -f "$CF_ENV" ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    . "$CF_ENV"
+    set +a
+fi
 
-: "${TUNNEL_TOKEN:=}"
-
-if [[ -z "$TUNNEL_TOKEN" ]]; then
+if [[ -z "${TUNNEL_TOKEN:-}" ]]; then
     echo "TUNNEL_TOKEN not set" >&2
     exit 1
 fi
 
-exec "$CF_BIN" tunnel --no-autoupdate run --token "$TUNNEL_TOKEN"
+# cloudflared 会自动读取 TUNNEL_TOKEN 环境变量
+exec "$CF_BIN" tunnel --no-autoupdate run
 WRAPPER_EOF
     chmod 700 "$CF_WRAPPER"
 }
@@ -396,7 +400,7 @@ save_tunnel_token() {
         printf 'TUNNEL_TOKEN=%s\n' "$token" > "$CF_ENV"
     )
     chmod 600 "$CF_ENV"
-    ok "Token 已安全保存"
+    ok "Token 已安全保存（不暴露在进程列表中）"
 }
 
 load_tunnel_token() {
@@ -404,6 +408,39 @@ load_tunnel_token() {
     # shellcheck disable=SC1090
     . "$CF_ENV"
     [[ -n "${TUNNEL_TOKEN:-}" ]]
+}
+
+#===============================================================================
+# 获取初始账号密码
+#===============================================================================
+get_credentials() {
+    local log_file="$LOG_DIR/komari.log"
+    if [[ -f "$log_file" ]]; then
+        grep "admin account created" "$log_file" 2>/dev/null | tail -1 | \
+            sed -n 's/.*Username:\s*\([^,]*\).*Password:\s*\([^ ]*\).*/\1 \2/p' || true
+    fi
+}
+
+show_credentials() {
+    local creds
+    creds=$(get_credentials)
+    if [[ -n "$creds" ]]; then
+        local user pass
+        user=$(echo "$creds" | awk '{print $1}')
+        pass=$(echo "$creds" | awk '{print $2}')
+        echo ""
+        printf '%b\n' "${YELLOW}${BOLD}╔══════════════════════════════════════════╗${NC}"
+        printf '%b\n' "${YELLOW}${BOLD}║        初始账号信息（仅显示一次）        ║${NC}"
+        printf '%b\n' "${YELLOW}${BOLD}╠══════════════════════════════════════════╣${NC}"
+        printf '%b\n' "${YELLOW}${BOLD}║  用户名: ${GREEN}${user}${YELLOW}                          ║${NC}"
+        printf '%b\n' "${YELLOW}${BOLD}║  密  码: ${GREEN}${pass}${YELLOW}                    ║${NC}"
+        printf '%b\n' "${YELLOW}${BOLD}║                                          ║${NC}"
+        printf '%b\n' "${YELLOW}${BOLD}║  ${RED}请立即登录修改密码！${YELLOW}                  ║${NC}"
+        printf '%b\n' "${YELLOW}${BOLD}╚══════════════════════════════════════════╝${NC}"
+        echo ""
+    else
+        warn "未找到初始账号信息（可能已被轮转或日志已清理）"
+    fi
 }
 
 #===============================================================================
@@ -489,6 +526,7 @@ After=network-online.target ${APP_NAME}.service
 
 [Service]
 Type=simple
+EnvironmentFile=${CF_ENV}
 ExecStart=${CF_WRAPPER}
 Restart=on-failure
 RestartSec=5
@@ -724,7 +762,7 @@ doctor() {
     local issues=0
 
     if [[ -x "$BIN" ]]; then
-        printf '  %b komari: %s\n' "${GREEN}✓${NC}" "$("$BIN" version 2>/dev/null || echo '?')"
+        printf '  %b komari\n' "${GREEN}✓${NC}"
     else
         printf '  %b komari: 未安装\n' "${RED}✗${NC}"
         issues=$((issues + 1))
@@ -814,7 +852,7 @@ install() {
 
     step "启动服务..."
     svc "$APP_NAME" start
-    sleep 2
+    sleep 3
     svc "$CF_NAME" start
     sleep 2
 
@@ -829,9 +867,14 @@ install() {
     save_config
     install_shortcut
 
+    echo ""
     ok "安装完成！本地: http://${LISTEN_ADDR}:${LISTEN_PORT}"
     [[ -n "${DOMAIN:-}" ]] && info "公网: https://${DOMAIN}"
-    info "管理: komari [status|backup|restore|logs|doctor|update|uninstall]"
+
+    # 显示初始账号密码
+    show_credentials
+
+    info "管理: komari [status|backup|restore|logs|doctor|update|uninstall|password]"
 }
 
 #===============================================================================
@@ -988,6 +1031,7 @@ menu() {
         printf " 2) 更新      6) 重启    10) 恢复\n"
         printf " 3) 卸载      7) 日志    11) 自检\n"
         printf " 4) 启动      8) 状态    12) 配置\n"
+        printf "                             13) 查看密码\n"
         printf " 0) 退出\n"
 
         read -rp "> " ch
@@ -1017,6 +1061,7 @@ menu() {
                 read -rp "域名: " d
                 [[ -n "$d" ]] && { DOMAIN="$d"; save_config; }
                 ;;
+            13) show_credentials ;;
             0) exit 0 ;;
         esac
         read -rp "回车继续..."
@@ -1042,12 +1087,14 @@ Komari Manager v${VERSION}
   restore      从备份恢复
   logs         查看实时日志
   doctor       系统自检
+  password     查看初始账号密码
   menu         交互菜单 (默认)
 
 示例:
   komari install
   komari update
   komari status
+  komari password
 EOF
 }
 
@@ -1070,6 +1117,7 @@ main() {
         backup)     backup ;;
         restore)    restore_menu ;;
         logs)       tail -f "$LOG_DIR/komari.log" 2>/dev/null || err "日志不可用" ;;
+        password)   show_credentials ;;
         menu)       menu ;;
         help|--help|-h) show_help ;;
         version|--version|-v) echo "v$VERSION" ;;
