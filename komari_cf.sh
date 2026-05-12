@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #===============================================================================
-# Komari + Cloudflare Tunnel Manager v4.5.3.1
+# Komari + Cloudflare Tunnel Manager v4.5.3.2
 # 生产级稳定版 | Alpine/Debian/OpenRC/systemd/BusyBox 兼容
 #
 # v4.5.3 更新:
@@ -17,7 +17,7 @@ IFS=$'\n\t'
 #===============================================================================
 # 常量
 #===============================================================================
-readonly VERSION="4.5.3.1"
+readonly VERSION="4.5.3.2"
 readonly APP_NAME="komari"
 readonly CF_NAME="cloudflared"
 
@@ -66,7 +66,7 @@ die()   { err "$@"; exit 1; }
 is_wide_screen() {
     local cols
     cols=$(tput cols 2>/dev/null || echo 80)
-    [[ $cols -ge 60 ]]
+    [[ "${cols:-80}" -ge 60 ]]
 }
 
 #===============================================================================
@@ -340,14 +340,14 @@ has_other_cf_tunnel() {
     if [[ "$(detect_init)" == "systemd" ]]; then
         for s in /etc/systemd/system/cloudflared*.service /lib/systemd/system/cloudflared*.service; do
             [[ -f "$s" ]] || continue
-            grep -q "komari" "$s" 2>/dev/null && continue
+            grep -qE "/(komari|opt/komari)" "$s" 2>/dev/null && continue
             other=1; break
         done
     fi
     if [[ "$(detect_init)" == "openrc" ]]; then
         for s in /etc/init.d/cloudflared*; do
             [[ -f "$s" ]] || continue
-            grep -q "komari" "$s" 2>/dev/null && continue
+            grep -qE "/(komari|opt/komari)" "$s" 2>/dev/null && continue
             other=1; break
         done
     fi
@@ -684,6 +684,7 @@ install() {
     [[ "$(id -u)" -eq 0 ]] || die "需要 root 权限"
     step "Komari v${VERSION} 安装向导"
     ensure_deps
+    rm -f "$DATA_DIR/komari.db" 2>/dev/null || true
     mkdir -p "$INSTALL_DIR" "$DATA_DIR" "$LOG_DIR" "$CONFIG_DIR" "$BACKUP_DIR" "$CF_DIR" "$CACHE_DIR"
     local arch port addr; arch=$(detect_arch)
     info "系统: $(detect_os)/$(detect_init)/$arch"
@@ -705,6 +706,7 @@ install() {
     save_config; install_shortcut
     echo ""; ok "安装完成！http://${LISTEN_ADDR}:${LISTEN_PORT}"
     [[ -n "${DOMAIN:-}" ]] && info "公网: https://${DOMAIN}"
+    for _ in 1 2 3 4 5; do get_credentials | grep -q . && break; sleep 1; done
     show_credentials
     info "管理: komari [status|doctor|backup|restore|logs|update|password]"
 }
