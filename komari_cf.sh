@@ -4,7 +4,6 @@
 # 生产级稳定版 | Alpine/Debian/OpenRC/systemd/BusyBox 兼容
 #
 # v4.5.3 更新:
-#   - 性能优化：hash 缓存命令路径 / SHA256 本地缓存 / 按需清理日志
 #   - 智能卸载：检测其他 CF Tunnel，避免误删共享的 cloudflared 二进制
 #   - 交互菜单精简：合并"状态/自检"，新增 quick_status 函数
 #   - 响应式布局：自动适配手机小屏和 PC 大屏
@@ -27,7 +26,6 @@ readonly LOG_DIR="${INSTALL_DIR}/logs"
 readonly CONFIG_DIR="${INSTALL_DIR}/config"
 readonly BACKUP_DIR="${INSTALL_DIR}/backups"
 readonly CF_DIR="${INSTALL_DIR}/cloudflared"
-readonly CACHE_DIR="${INSTALL_DIR}/cache"
 
 readonly BIN="${INSTALL_DIR}/komari"
 readonly CF_BIN="/usr/local/bin/cloudflared"
@@ -129,22 +127,11 @@ detect_ip() {
 }
 
 #===============================================================================
-# 依赖安装（优化：hash 缓存命令路径）
+# 依赖安装
 #===============================================================================
-# 一次性缓存所有关键命令路径，后续检测 O(1)
-_cache_commands() {
-    local cmd
-    for cmd in curl grep sed awk tar gzip sha256sum flock tput od head wc du df stat; do
-        hash "$cmd" 2>/dev/null || true
-    done
-}
-
-_cmd_ok() {
-    hash "$1" 2>/dev/null
-}
+_cmd_ok() { command -v "$1" >/dev/null 2>&1; }
 
 ensure_deps() {
-    _cache_commands
     local miss=""
     for d in curl grep sed awk tar gzip sha256sum; do
         _cmd_ok "$d" || miss="$miss $d"
@@ -214,68 +201,46 @@ sha256_of() { sha256sum "$1" 2>/dev/null | awk '{print tolower($1)}'; }
 short_fingerprint() { sha256_of "$1" | cut -c1-12; }
 
 #===============================================================================
-# SHA256 校验（优化：本地缓存校验结果）
+# SHA256 校验
 #===============================================================================
-_checksum_cache_key() {
+_checksum_candidates() {
     local url="$1"
-    printf '%s' "$url" | sha256sum 2>/dev/null | awk '{print $1}' || echo "${url##*/}"
+    printf '%s\n' "${url}.sha256" "$(dirname "$url")/SHA256SUMS" "$(dirname "$url")/checksums.txt"
 }
 
-_cached_checksum() {
-    local key="$1" cache_file="${CACHE_DIR}/checksum-${key}"
-    [[ -f "$cache_file" ]] && [[ $(find "$cache_file" -mmin -1440 2>/dev/null) ]] || return 1
-    cat "$cache_file"
+_download_text() {
+    local url="$1" out="$2"
+    curl -fsSL --connect-timeout 10 --max-time 30 -o "$out" "$url" 2>/dev/null
 }
 
-_save_checksum_cache() {
-    local key="$1" value="$2"
-    mkdir -p "$CACHE_DIR"
-    printf '%s\n' "$value" > "${CACHE_DIR}/checksum-${key}"
+_extract_expected_sha256() {
+    local checksum_file="$1" target_name="$2" target_base
+    target_base="$(basename "$target_name")"
+    awk -v target="$target_base" '
+        BEGIN { IGNORECASE=1 }
+        function ishash(s) { return s ~ /^[0-9a-fA-F]{64}$/ }
+        $0 ~ target { for(i=1;i<=NF;i++) if(ishash($i)) { print tolower($i); exit } }
+        { for(i=1;i<=NF;i++) if(ishash($i)) { print tolower($i); exit } }
+    ' "$checksum_file" 2>/dev/null || true
 }
 
 _verify_checksum_if_possible() {
-    local file="$1" asset_url="$2" cache_key expected actual checksum_url
-    cache_key=$(_checksum_cache_key "$asset_url")
-
-    # 优先使用本地缓存
-    expected=$(_cached_checksum "$cache_key" 2>/dev/null || true)
-    if [[ -n "$expected" ]]; then
-        actual="$(sha256_of "$file")"
-        [[ "$actual" == "$expected" ]] && { info "校验通过(缓存): $(basename "$file")"; return 0; }
-    fi
-
-    # 缓存未命中，远程获取
-    local checksum_file="${file}.checksum.$$" base
+    local file="$1" asset_url="$2" checksum_file expected actual checksum_url base
     base="$(basename "$asset_url")"
+    checksum_file="${file}.checksum.$$"
     expected=""
     while IFS= read -r checksum_url; do
         [[ -n "$checksum_url" ]] || continue
-        if curl -fsSL --connect-timeout 10 --max-time 30 -o "$checksum_file" "$checksum_url" 2>/dev/null; then
-            expected=$(awk -v target="$base" '
-                BEGIN { IGNORECASE=1 }
-                function ishash(s) { return s ~ /^[0-9a-fA-F]{64}$/ }
-                $0 ~ target { for(i=1;i<=NF;i++) if(ishash($i)) { print tolower($i); exit } }
-                { for(i=1;i<=NF;i++) if(ishash($i)) { print tolower($i); exit } }
-            ' "$checksum_file" 2>/dev/null || true)
+        if _download_text "$checksum_url" "$checksum_file"; then
+            expected="$(_extract_expected_sha256 "$checksum_file" "$base" | tr '[:upper:]' '[:lower:]')"
             [[ -n "$expected" ]] && break
         fi
-    done < <(printf '%s\n' "${asset_url}.sha256" "$(dirname "$asset_url")/SHA256SUMS" "$(dirname "$asset_url")/checksums.txt")
+    done < <(_checksum_candidates "$asset_url")
     rm -f "$checksum_file" 2>/dev/null || true
-
-    if [[ -z "$expected" ]]; then
-        info "跳过校验: $base"
-        return 0
-    fi
-
+    [[ -z "$expected" ]] && { info "跳过校验: $base"; return 0; }
     actual="$(sha256_of "$file")"
     [[ -n "$actual" ]] || die "无法计算 SHA256: $file"
-
-    if [[ "$actual" != "$expected" ]]; then
-        err "SHA256 校验失败: $base"; return 1
-    fi
-
-    # 缓存结果
-    _save_checksum_cache "$cache_key" "$expected"
+    [[ "$actual" == "$expected" ]] || { err "SHA256 校验失败: $(basename "$file")"; return 1; }
     ok "SHA256 校验通过: $base"
 }
 
@@ -331,14 +296,18 @@ svc_ok() {
 # 检测是否有其他 CF Tunnel
 #===============================================================================
 has_other_cf_tunnel() {
+    # 检查是否有其他 cloudflared 服务（非本脚本创建）
     local other=0
+    # systemd: 检查其他 service 文件
     if [[ "$(detect_init)" == "systemd" ]]; then
         for s in /etc/systemd/system/cloudflared*.service /lib/systemd/system/cloudflared*.service; do
             [[ -f "$s" ]] || continue
+            # 跳过我们自己创建的
             grep -q "komari" "$s" 2>/dev/null && continue
             other=1; break
         done
     fi
+    # openrc: 检查其他 init.d 脚本
     if [[ "$(detect_init)" == "openrc" ]]; then
         for s in /etc/init.d/cloudflared*; do
             [[ -f "$s" ]] || continue
@@ -346,6 +315,7 @@ has_other_cf_tunnel() {
             other=1; break
         done
     fi
+    # 检查是否有其他 cloudflared 进程（不同配置）
     if pgrep -f "cloudflared tunnel" | grep -qv -f <(pgrep -f "komari" 2>/dev/null || true) 2>/dev/null; then
         other=1
     fi
@@ -520,7 +490,7 @@ health_tcp() {
 }
 
 #===============================================================================
-# 日志轮转（优化：按需清理）
+# 日志轮转
 #===============================================================================
 rotate_logs() {
     mkdir -p "$LOG_DIR"
@@ -530,10 +500,7 @@ rotate_logs() {
         [[ $sz -le $LOG_SIZE_MAX ]] && continue
         ts=$(date +%Y%m%d_%H%M%S); cp "$f" "${f}.${ts}"; _truncate "$f"
         (gzip "${f}.${ts}" 2>/dev/null || mv "${f}.${ts}" "${f}.${ts}.gz" 2>/dev/null) &
-
-        # 按需清理：先统计文件数，超过阈值才执行清理
-        local count; count=$(find "$LOG_DIR" -name "$(basename "$f").*.gz" -type f 2>/dev/null | wc -l)
-        [[ $count -gt 5 ]] && find "$LOG_DIR" -name "$(basename "$f").*.gz" -type f 2>/dev/null | sort -r | awk 'NR>5' | xargs rm -f 2>/dev/null || true
+        find "$LOG_DIR" -name "$(basename "$f").*.gz" -type f 2>/dev/null | sort -r | awk 'NR>5' | xargs rm -f 2>/dev/null || true
     done
 }
 
@@ -575,17 +542,17 @@ EOF
 #===============================================================================
 backup() {
     step "创建备份..."
-    mkdir -p "$BACKUP_DIR"
+    mkdir -p "$BACKUP_DIR" "$CONFIG_DIR" "$CF_DIR" "$DATA_DIR" "$LOG_DIR"
     local ts out tmp; ts=$(date +%Y%m%d_%H%M%S)
     out="$BACKUP_DIR/backup-${ts}.tar.gz"; tmp="/tmp/komari_bak_$$"
-    mkdir -p "$tmp"/{config,init,cf,data,wrapper}
+    mkdir -p "$tmp"/{config,init,systemd,cf,data,wrapper}
     [[ -f "$CONFIG_DIR/komari.conf" ]] && cp "$CONFIG_DIR/komari.conf" "$tmp/config/"
     [[ -f "$CF_ENV" ]] && cp "$CF_ENV" "$tmp/cf/"
     [[ -f "$CF_WRAPPER" ]] && cp "$CF_WRAPPER" "$tmp/wrapper/"
     [[ -f "/etc/init.d/$APP_NAME" ]] && cp "/etc/init.d/$APP_NAME" "$tmp/init/"
     [[ -f "/etc/init.d/$CF_NAME" ]] && cp "/etc/init.d/$CF_NAME" "$tmp/init/"
-    [[ -f "/etc/systemd/system/${APP_NAME}.service" ]] && cp "/etc/systemd/system/${APP_NAME}.service" "$tmp/init/"
-    [[ -f "/etc/systemd/system/${CF_NAME}.service" ]] && cp "/etc/systemd/system/${CF_NAME}.service" "$tmp/init/"
+    [[ -f "/etc/systemd/system/${APP_NAME}.service" ]] && cp "/etc/systemd/system/${APP_NAME}.service" "$tmp/systemd/"
+    [[ -f "/etc/systemd/system/${CF_NAME}.service" ]] && cp "/etc/systemd/system/${CF_NAME}.service" "$tmp/systemd/"
     [[ -d "$DATA_DIR" ]] && cp -a "$DATA_DIR"/* "$tmp/data/" 2>/dev/null || true
     tar -czf "$out" -C "$tmp" . 2>/dev/null; rm -rf "$tmp"
     find "$BACKUP_DIR" -name 'backup-*.tar.gz' 2>/dev/null | sort -r | awk 'NR>7' | xargs rm -f 2>/dev/null || true
@@ -600,16 +567,14 @@ restore() {
     local tmp="/tmp/komari_rst_$$"; mkdir -p "$tmp"
     tar -tzf "$f" 2>/dev/null | grep -qE '^/|\.\./' && { err "危险路径"; rm -rf "$tmp"; return 1; }
     tar -xzf "$f" -C "$tmp" 2>/dev/null || { err "解压失败"; rm -rf "$tmp"; return 1; }
-    mkdir -p "$CONFIG_DIR" "$DATA_DIR" "$CF_DIR"
-    [[ "$(detect_init)" == systemd ]] && mkdir -p /etc/systemd/system
-    [[ "$(detect_init)" == openrc ]] && mkdir -p /etc/init.d
+    mkdir -p "$CONFIG_DIR" "$DATA_DIR" "$CF_DIR" /etc/systemd/system /etc/init.d
     [[ -f "$tmp/config/komari.conf" ]] && cp "$tmp/config/komari.conf" "$CONFIG_DIR/"
     [[ -f "$tmp/cf/.env" ]] && { cp "$tmp/cf/.env" "$CF_ENV"; chmod 600 "$CF_ENV"; }
     [[ -f "$tmp/wrapper/run-cloudflared.sh" ]] && { cp "$tmp/wrapper/run-cloudflared.sh" "$CF_WRAPPER"; chmod 700 "$CF_WRAPPER"; }
     [[ -f "$tmp/init/komari" ]] && { cp "$tmp/init/komari" /etc/init.d/; chmod +x /etc/init.d/komari; }
     [[ -f "$tmp/init/cloudflared" ]] && { cp "$tmp/init/cloudflared" /etc/init.d/; chmod +x /etc/init.d/cloudflared; }
-    [[ -f "$tmp/init/${APP_NAME}.service" ]] && cp "$tmp/init/${APP_NAME}.service" /etc/systemd/system/
-    [[ -f "$tmp/init/${CF_NAME}.service" ]] && cp "$tmp/init/${CF_NAME}.service" /etc/systemd/system/
+    [[ -f "$tmp/systemd/${APP_NAME}.service" ]] && cp "$tmp/systemd/${APP_NAME}.service" /etc/systemd/system/
+    [[ -f "$tmp/systemd/${CF_NAME}.service" ]] && cp "$tmp/systemd/${CF_NAME}.service" /etc/systemd/system/
     [[ -d "$tmp/data" ]] && cp -a "$tmp/data"/* "$DATA_DIR/" 2>/dev/null || true
     rm -rf "$tmp"
     [[ "$(detect_init)" == systemd ]] && systemctl daemon-reload
@@ -679,7 +644,7 @@ install() {
     [[ "$(id -u)" -eq 0 ]] || die "需要 root 权限"
     step "Komari v${VERSION} 安装向导"
     ensure_deps
-    mkdir -p "$INSTALL_DIR" "$DATA_DIR" "$LOG_DIR" "$CONFIG_DIR" "$BACKUP_DIR" "$CF_DIR" "$CACHE_DIR"
+    mkdir -p "$INSTALL_DIR" "$DATA_DIR" "$LOG_DIR" "$CONFIG_DIR" "$BACKUP_DIR" "$CF_DIR"
     local arch port addr; arch=$(detect_arch)
     info "系统: $(detect_os)/$(detect_init)/$arch"
     while true; do read -rp "端口 [$PORT_DEFAULT]: " port; port="${port:-$PORT_DEFAULT}"; port_free "$port" && break; warn "端口占用"; done
@@ -750,6 +715,7 @@ uninstall() {
     read -rp "输入 DELETE 确认: " c
     [[ "$c" != "DELETE" ]] && { info "已取消"; return 0; }
 
+    # 检测是否有其他 CF Tunnel
     local other_cf=0
     if has_other_cf_tunnel; then
         other_cf=1
@@ -774,11 +740,7 @@ uninstall() {
     esac
 
     rm -f "$BIN"
-    if [[ $other_cf -eq 0 ]]; then
-        rm -f "$CF_BIN" "$CF_WRAPPER"
-    else
-        info "保留 cloudflared 二进制（被其他服务使用）"
-    fi
+    [[ $other_cf -eq 0 ]] && rm -f "$CF_BIN" "$CF_WRAPPER" || info "保留 cloudflared 二进制（被其他服务使用）"
     rm -f /usr/local/bin/komari
 
     read -rp "删除数据目录? [y/N]: " d
@@ -800,6 +762,7 @@ menu() {
         local wide; wide=$(is_wide_screen && echo 1 || echo 0)
 
         if [[ $wide -eq 1 ]]; then
+            # PC 宽屏布局
             printf '%b\n' "${CYAN}╔══════════════════════════════════════════════╗${NC}"
             printf '%b\n' "${CYAN}║     Komari + CF Tunnel Manager v${VERSION}        ║${NC}"
             printf '%b\n' "${CYAN}╚══════════════════════════════════════════════╝${NC}"
@@ -814,6 +777,7 @@ menu() {
             printf '  %-20s %-20s %-20s\n' '4) 启动' '8) 状态' '12) 配置'
             printf '  %-20s %-20s\n' '13) 密码' '0) 退出'
         else
+            # 手机窄屏布局
             printf '%b\n' "${CYAN}╔══════════════════╗${NC}"
             printf '%b\n' "${CYAN}║ Komari Mgr v${VERSION} ║${NC}"
             printf '%b\n' "${CYAN}╚══════════════════╝${NC}"
