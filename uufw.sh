@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 #===============================================================================
-# Komari + Cloudflare Tunnel 防火墙加固脚本 v2.2.2
+# UUFW 防火墙加固脚本 v2.2.3
 # 自动适配 Alpine (nftables/iptables) 与 Debian/Ubuntu (iptables/ufw)
 #
-# v2.2.2 修复:
+# v2.2.3 修复:
 #   - parse_extra_ports: read -ra 改为 while read 循环（完整兼容性）
 #   - remove_port: 空数组保护
+#   - 脚本重命名uufw
 #===============================================================================
 
 set -euo pipefail
@@ -14,13 +15,13 @@ IFS=$'\n\t'
 #===============================================================================
 # 常量
 #===============================================================================
-readonly VERSION="2.2.2"
-readonly SCRIPT_NAME="komari-fw"
+readonly VERSION="2.2.3"
+readonly SCRIPT_NAME="uufw"
 readonly SSH_PORT_DEFAULT="22"
 readonly CF_IPV4_URL="https://www.cloudflare.com/ips-v4/"
 readonly CF_IPV6_URL="https://www.cloudflare.com/ips-v6/"
-readonly CF_IPS_DIR="/opt/komari-fw"
-readonly BACKUP_DIR="/opt/komari-fw/backups"
+readonly CF_IPS_DIR="/opt/uufw"
+readonly BACKUP_DIR="/opt/uufw/backups"
 readonly CONFIG_FILE="$CF_IPS_DIR/firewall.conf"
 
 #===============================================================================
@@ -187,7 +188,7 @@ apply_nftables() {
     backup_rules
 
     local sp="${SSH_PORT:-$SSH_PORT_DEFAULT}"
-    local nft_conf="$CF_IPS_DIR/komari.nft"
+    local nft_conf="$CF_IPS_DIR/uufw.nft"
     local extra_rules=""
 
     while IFS= read -r item; do
@@ -198,12 +199,12 @@ apply_nftables() {
 
     cat > "$nft_conf" << NFTEOF
 #!/usr/sbin/nft -f
-# Komari Firewall Rules v${VERSION}
+# UUFW Firewall Rules v${VERSION}
 # Generated: $(date)
 
 flush ruleset
 
-table inet komari {
+table inet UUFW {
 
     chain input {
         type filter hook input priority 0; policy drop;
@@ -214,7 +215,7 @@ table inet komari {
         ip protocol icmp accept
         ip6 nexthdr icmpv6 accept
 ${extra_rules}
-        log prefix "komari-fw-blocked: " drop
+        log prefix "uufw-blocked: " drop
     }
 
     chain forward {
@@ -237,9 +238,9 @@ NFTEOF
 
     # 持久化
     if [[ -d /etc/nftables ]]; then
-        cp "$nft_conf" /etc/nftables/komari.nft
+        cp "$nft_conf" /etc/nftables/uufw.nft
     elif [[ -d /etc/nftables.d ]]; then
-        cp "$nft_conf" /etc/nftables.d/komari.nft
+        cp "$nft_conf" /etc/nftables.d/uufw.nft
     fi
     if [[ "$(detect_os)" == "alpine" ]]; then
         rc-update add nftables 2>/dev/null || true
@@ -376,9 +377,9 @@ show_status() {
     case "$fw_type" in
         nftables)
             local blocked
-            blocked=$(dmesg 2>/dev/null | grep -c "komari-fw-blocked" || echo 0)
+            blocked=$(dmesg 2>/dev/null | grep -c "uufw-blocked" || echo 0)
             echo "  拦截: ${blocked} 次"
-            dmesg 2>/dev/null | grep "komari-fw-blocked" | tail -3 | sed 's/^/  /'
+            dmesg 2>/dev/null | grep "uufw-blocked" | tail -3 | sed 's/^/  /'
             ;;
         iptables)
             iptables -L INPUT -v -n 2>/dev/null | head -5 | sed 's/^/  /'
@@ -471,7 +472,7 @@ temp_open_port() {
 
     case "$(detect_firewall_type)" in
         nftables)
-            nft add rule inet komari input ${proto} dport "$port" accept 2>/dev/null || true
+            nft add rule inet UUFW input ${proto} dport "$port" accept 2>/dev/null || true
             ok "已开放"
             (sleep "$duration"; apply_nftables) &
             ;;
@@ -501,7 +502,7 @@ uninstall_fw() {
     case "$fw_type" in
         nftables)
             nft flush ruleset 2>/dev/null || true
-            rm -f /etc/nftables/komari.nft /etc/nftables.d/komari.nft "$CF_IPS_DIR/komari.nft"
+            rm -f /etc/nftables/uufw.nft /etc/nftables.d/uufw.nft "$CF_IPS_DIR/uufw.nft"
             nft add table inet filter 2>/dev/null || true
             nft add chain inet filter input { type filter hook input priority 0\; policy accept\; } 2>/dev/null || true
             ok "nftables 规则已清除"
@@ -522,7 +523,7 @@ uninstall_fw() {
 
     echo ""
     warn "防火墙已清除，系统处于开放状态！"
-    warn "重新安装: komari-fw install"
+    warn "重新安装: uufw install"
 }
 
 #===============================================================================
@@ -543,7 +544,7 @@ menu() {
     while true; do
         clear 2>/dev/null || true
         printf '%b\n' "${CYAN}╔══════════════════════════════════════╗${NC}"
-        printf '%b\n' "${CYAN}║    Komari 防火墙管理 v${VERSION}        ║${NC}"
+        printf '%b\n' "${CYAN}║    UUFW 防火墙管理 v${VERSION}        ║${NC}"
         printf '%b\n' "${CYAN}╚══════════════════════════════════════╝${NC}"
 
         local fw_type; fw_type=$(detect_firewall_type)
@@ -628,8 +629,8 @@ install_shortcut() {
 #===============================================================================
 show_help() {
     cat <<EOF
-Komari 防火墙管理器 v${VERSION}
-用法: komari-fw [命令]
+UUFW 防火墙管理器 v${VERSION}
+用法: uufw [命令]
 
 命令:
   install     安装/应用防火墙规则
@@ -639,8 +640,8 @@ Komari 防火墙管理器 v${VERSION}
   menu        交互管理面板（默认）
 
 示例:
-  komari-fw install
-  komari-fw status
+  uufw install
+  uufw status
 EOF
 }
 
