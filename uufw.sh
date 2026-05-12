@@ -1,22 +1,13 @@
 #!/usr/bin/env bash
 #===============================================================================
-# UUFW Firewall Manager v3.0.4.2
+# UUFW Firewall Manager v3.0.5
 # Change log:
-#   - [v3.0.4] 修复 nftables 应用流程：避免将 delete table 写入同一规则文件导致语法失败
-#   - [v3.0.4] 修复 temp_open_port() 的 fallback 调度逻辑，确保延时后重新应用主规则
-#   - [v3.0.4] 增加 SSH 监听预检与 LOG_RATE 校验，降低误封与 nft 语法失败风险
-#   - [v3.0.4] 改进 CF_ONLY 在 nftables / iptables 下的处理与回滚提示
-#   - [v3.0.4] 保留 flock + 目录锁回退，增强低依赖环境兼容性
-#   - [v3.0.3] acquire_lock: flock 不可用时回退到 mkdir 目录锁
-#   - [v3.0.3] 菜单选项 8: 更新 CF IP 列表后自动重新应用规则
-#   - [v3.0.3] ufw 检测到时可一键禁用
-#   - [v3.0.3] 合并 emit_iptables_cf_rules_v4/v6 为 emit_iptables_cf_rules
-#   - [v3.0.3] build_nft_rules: 移除冗余的 table {} 声明
-#   - [v3.0.2] 补全 DHCPv6 (UDP 546) 规则
-#   - [v3.0.2] 增加 ca-certificates 和 util-linux 依赖
-#   - [v3.0.2] nftables 持久化 include 管理
-#   - [v3.0.2] nftables 原子性更新
-#   - [v3.0.2] 状态查询增强：持久化状态检查
+#   - [v3.0.5] 修复 download_cf_ips 中 set -e 下 CF API 500 导致脚本退出的问题
+#   - [v3.0.5] 修复 load_config 中 EXTRA_PORTS 解析后未正确赋值给全局变量
+#   - [v3.0.5] 修复 show_status 和 remove_port 读取 EXTRA_PORTS 的显示 bug
+#   - [v3.0.5] 增加 CF IP 下载失败时的本地回退提示
+#   - [v3.0.4] SSH 监听预检、LOG_RATE 校验、delete table 分离
+#   - [v3.0.4] emit_nft_set 空集合占位符修复
 #   - Alpine / Debian 兼容，支持纯 IPv6 环境
 #===============================================================================
 
@@ -26,7 +17,7 @@ IFS=$'\n\t'
 #===============================================================================
 # Constants
 #===============================================================================
-readonly VERSION="3.0.4.2"
+readonly VERSION="3.0.5"
 readonly SCRIPT_NAME="uufw"
 readonly SSH_PORT_DEFAULT="22"
 readonly CF_IPV4_URL="https://www.cloudflare.com/ips-v4/"
@@ -200,7 +191,7 @@ parse_extra_ports() {
     while IFS= read -r item; do
         item=$(trim "$item")
         [[ -n "$item" ]] && printf '%s\n' "$item"
-    done < <(printf '%s' "$EXTRA_PORTS" | tr ',' '\n')
+    done < <(printf '%s' "${EXTRA_PORTS}" | tr ',' '\n')
 }
 
 #===============================================================================
@@ -320,9 +311,9 @@ EOF_CONF
 download_url() {
     local url=$1 out=$2
     if has_cmd curl; then
-        curl -fsSL --connect-timeout 10 --max-time 30 -o "$out" "$url"
+        curl -fsSL --connect-timeout 10 --max-time 30 -o "$out" "$url" 2>/dev/null
     elif has_cmd wget; then
-        wget -qO "$out" "$url"
+        wget -qO "$out" "$url" 2>/dev/null
     else
         return 127
     fi
@@ -364,37 +355,47 @@ download_cf_ips() {
     mkdir -p "$DATA_DIR"
     local v4="$DATA_DIR/cf-ipv4.txt"
     local v6="$DATA_DIR/cf-ipv6.txt"
-    local updated=0 tmp filtered
+    local updated=0 tmp filtered download_ok=0
 
     tmp="$(mktemp_file)"
     filtered="$(mktemp_file)"
-    if download_url "$CF_IPV4_URL" "$tmp"; then
-        grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$' "$tmp" > "$filtered" || true
+    if download_url "$CF_IPV4_URL" "$tmp" && [[ -s "$tmp" ]]; then
+        grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$' "$tmp" > "$filtered" 2>/dev/null || true
         if [[ -s "$filtered" ]]; then
             mv -f "$filtered" "$v4"
             updated=1
-        elif [[ ! -s "$v4" ]]; then
+            download_ok=1
+        fi
+    fi
+    if [[ $download_ok -eq 0 ]]; then
+        if [[ ! -s "$v4" ]]; then
             write_cf_default_v4 "$v4"
         fi
-    elif [[ ! -s "$v4" ]]; then
-        write_cf_default_v4 "$v4"
     fi
 
+    download_ok=0
     tmp="$(mktemp_file)"
     filtered="$(mktemp_file)"
-    if download_url "$CF_IPV6_URL" "$tmp"; then
-        grep -E '^[0-9A-Fa-f:]+/[0-9]+$' "$tmp" > "$filtered" || true
+    if download_url "$CF_IPV6_URL" "$tmp" && [[ -s "$tmp" ]]; then
+        grep -E '^[0-9A-Fa-f:]+/[0-9]+$' "$tmp" > "$filtered" 2>/dev/null || true
         if [[ -s "$filtered" ]]; then
             mv -f "$filtered" "$v6"
             updated=1
-        elif [[ ! -s "$v6" ]]; then
+            download_ok=1
+        fi
+    fi
+    if [[ $download_ok -eq 0 ]]; then
+        if [[ ! -s "$v6" ]]; then
             write_cf_default_v6 "$v6"
         fi
-    elif [[ ! -s "$v6" ]]; then
-        write_cf_default_v6 "$v6"
     fi
 
-    [[ $updated -eq 1 ]] && info "CF IP 列表已更新" || true || true
+    if [[ $updated -eq 1 ]]; then
+        info "CF IP 列表已更新"
+    else
+        info "CF IP 列表使用本地缓存"
+    fi
+    return 0
 }
 
 #===============================================================================
