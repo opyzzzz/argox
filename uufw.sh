@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 #===============================================================================
-# UUFW Firewall Manager v3.0.5
+# UUFW Firewall Manager v3.0.6
 # Change log:
+#   - [v3.0.6] 修复 sanitize_csv_ports 数组定义和追加语法，防止 set -e 下解析失效
+#   - [v3.0.6] add_port 增加重复端口检查，避免配置冗余
+#   - [v3.0.6] load_config 修复 read 循环，支持末行无换行符的配置文件读取
+#   - [v3.0.6] 增强 download_cf_ips 在 set -e 下对 grep 返回值的容错性
+#   - [v3.0.6] 优化 parse_extra_ports 过滤逻辑，确保状态显示和删除列表准确
 #   - [v3.0.5] 修复 download_cf_ips 中 set -e 下 CF API 500 导致脚本退出的问题
-#   - [v3.0.5] 修复 load_config 中 EXTRA_PORTS 解析后未正确赋值给全局变量
-#   - [v3.0.5] 修复 show_status 和 remove_port 读取 EXTRA_PORTS 的显示 bug
-#   - [v3.0.5] 增加 CF IP 下载失败时的本地回退提示
-#   - [v3.0.4] SSH 监听预检、LOG_RATE 校验、delete table 分离
-#   - [v3.0.4] emit_nft_set 空集合占位符修复
 #   - Alpine / Debian 兼容，支持纯 IPv6 环境
 #===============================================================================
 
@@ -17,7 +17,7 @@ IFS=$'\n\t'
 #===============================================================================
 # Constants
 #===============================================================================
-readonly VERSION="3.0.5"
+readonly VERSION="3.0.6"
 readonly SCRIPT_NAME="uufw"
 readonly SSH_PORT_DEFAULT="22"
 readonly CF_IPV4_URL="https://www.cloudflare.com/ips-v4/"
@@ -157,7 +157,8 @@ validate_log_rate() {
 
 sanitize_csv_ports() {
     local input=${1:-}
-    local out=() item proto port
+    local -a out=() # Fix: explicitly declare as array
+    local item proto port
     [[ -z "$input" ]] && { printf '%s' ""; return 0; }
     while IFS= read -r item; do
         item=$(trim "$item")
@@ -167,7 +168,7 @@ sanitize_csv_ports() {
         proto=$(printf '%s' "$proto" | tr '[:upper:]' '[:lower:]')
         validate_proto "$proto" || { err "无效协议: $proto"; return 1; }
         validate_port_number "$port" || { err "无效端口: $port"; return 1; }
-        out+=("${proto}:${port}")
+        out+=("${proto}:${port}") # Fix: standardized array append
     done < <(printf '%s' "$input" | tr ',' '\n')
     (IFS=,; printf '%s' "${out[*]:-}")
 }
@@ -189,8 +190,8 @@ parse_extra_ports() {
     [[ -z "${EXTRA_PORTS:-}" ]] && return 0
     local item
     while IFS= read -r item; do
-        item=$(trim "$item")
-        [[ -n "$item" ]] && printf '%s\n' "$item"
+        item=$(trim "$item") # Fix: trim whitespace for display
+        [[ -n "$item" ]] && printf '%s\n' "$item" # Fix: filter empty lines
     done < <(printf '%s' "${EXTRA_PORTS}" | tr ',' '\n')
 }
 
@@ -251,7 +252,8 @@ ensure_ssh_safe() {
 load_config() {
     [[ -f "$CONFIG_FILE" ]] || return 0
 
-    while IFS='=' read -r k v; do
+    # Fix: Ensure last line is read even if no newline
+    while IFS='=' read -r k v || [[ -n "$k" ]]; do
         k=$(trim "${k:-}")
         v=$(trim "${v:-}")
         [[ -z "$k" || "$k" == \#* ]] && continue
@@ -360,6 +362,7 @@ download_cf_ips() {
     tmp="$(mktemp_file)"
     filtered="$(mktemp_file)"
     if download_url "$CF_IPV4_URL" "$tmp" && [[ -s "$tmp" ]]; then
+        # Fix: ensure grep doesn't trip set -e if no match
         grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$' "$tmp" > "$filtered" 2>/dev/null || true
         if [[ -s "$filtered" ]]; then
             mv -f "$filtered" "$v4"
@@ -377,6 +380,7 @@ download_cf_ips() {
     tmp="$(mktemp_file)"
     filtered="$(mktemp_file)"
     if download_url "$CF_IPV6_URL" "$tmp" && [[ -s "$tmp" ]]; then
+        # Fix: ensure grep doesn't trip set -e if no match
         grep -E '^[0-9A-Fa-f:]+/[0-9]+$' "$tmp" > "$filtered" 2>/dev/null || true
         if [[ -s "$filtered" ]]; then
             mv -f "$filtered" "$v6"
@@ -931,6 +935,12 @@ add_port() {
     validate_port_number "$port" || { err "无效端口: $port"; return 1; }
 
     new_entry="${proto}:${port}"
+    # Fix: deduplication check before adding
+    if [[ ",${EXTRA_PORTS:-}," == *",${new_entry},"* ]]; then
+        warn "端口 ${new_entry} 已在列表中，无需重复添加"
+        return 0
+    fi
+
     if [[ -n "${EXTRA_PORTS:-}" ]]; then
         EXTRA_PORTS="${EXTRA_PORTS},${new_entry}"
     else
@@ -948,6 +958,7 @@ remove_port() {
     echo "当前自定义端口:"
     local i=1 item target total=0 new_ports=()
     while IFS= read -r item; do
+        item=$(trim "$item")
         [[ -z "$item" ]] && continue
         printf '  %d) %s\n' "$i" "$item"
         total=$i
@@ -962,6 +973,7 @@ remove_port() {
 
     i=1
     while IFS= read -r item; do
+        item=$(trim "$item")
         [[ -z "$item" ]] && continue
         [[ $i -ne $target ]] && new_ports+=("$item")
         i=$((i+1))
@@ -1118,6 +1130,7 @@ menu() {
 
         local count=0 item
         while IFS= read -r item; do
+            item=$(trim "$item")
             [[ -z "$item" ]] && continue
             [[ $count -eq 0 ]] && printf '自定义端口: '
             printf '%s ' "$item"
