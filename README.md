@@ -2,6 +2,10 @@
 wget -O /root/argo.sh https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/argo_supervised.sh && chmod +x /root/argo.sh && sh /root/argo.sh install
 `````
 
+komari-cf
+`````
+wget -qO- https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/komari_cf.sh | sh
+`````
 
 dns
 `````
