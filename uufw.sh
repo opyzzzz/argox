@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #===============================================================================
-# UUFW Firewall Manager v3.0.4.1
+# UUFW Firewall Manager v3.0.4.2
 # Change log:
 #   - [v3.0.4] 修复 nftables 应用流程：避免将 delete table 写入同一规则文件导致语法失败
 #   - [v3.0.4] 修复 temp_open_port() 的 fallback 调度逻辑，确保延时后重新应用主规则
@@ -26,7 +26,7 @@ IFS=$'\n\t'
 #===============================================================================
 # Constants
 #===============================================================================
-readonly VERSION="3.0.4.1"
+readonly VERSION="3.0.4.2"
 readonly SCRIPT_NAME="uufw"
 readonly SSH_PORT_DEFAULT="22"
 readonly CF_IPV4_URL="https://www.cloudflare.com/ips-v4/"
@@ -394,7 +394,7 @@ download_cf_ips() {
         write_cf_default_v6 "$v6"
     fi
 
-    [[ $updated -eq 1 ]] && info "CF IP 列表已更新" || true
+    [[ $updated -eq 1 ]] && info "CF IP 列表已更新" || true || true
 }
 
 #===============================================================================
