@@ -4,7 +4,7 @@ wget -O /root/argo.sh https://raw.githubusercontent.com/opyzzzz/argox/refs/heads
 
 komari-cf
 `````
-apk add curl bash -q && curl -fsSL https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/komari_cf.sh -o /usr/local/bin/komari && chmod +x /usr/local/bin/komari && komari
+curl -fsSL https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/komari_cf.sh -o /usr/local/bin/komari && chmod +x /usr/local/bin/komari && komari
 `````
 
 dns
