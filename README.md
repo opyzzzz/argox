@@ -4,7 +4,7 @@ wget -O /root/argo.sh https://raw.githubusercontent.com/opyzzzz/argox/refs/heads
 
 komari-cf
 `````
-wget -qO- https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/komari_cf.sh | sh
+wget -qO- https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/komari_cf.sh | bash
 `````
 
 dns
