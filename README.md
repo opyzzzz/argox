@@ -6,6 +6,10 @@ komari-cf
 `````
 curl -fsSL https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/komari_cf.sh -o /usr/local/bin/komari && chmod +x /usr/local/bin/komari && komari
 `````
+uufw防火墙
+`````
+curl -fsSL https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/uufw.sh -o /usr/local/bin/uufw && chmod +x /usr/local/bin/uufw && uufw
+`````
 
 dns
 `````
