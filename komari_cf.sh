@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #===============================================================================
-# Komari + Cloudflare Tunnel Manager v4.5.3
+# Komari + Cloudflare Tunnel Manager v4.5.3.1
 # 生产级稳定版 | Alpine/Debian/OpenRC/systemd/BusyBox 兼容
 #
 # v4.5.3 更新:
@@ -17,7 +17,7 @@ IFS=$'\n\t'
 #===============================================================================
 # 常量
 #===============================================================================
-readonly VERSION="4.5.3"
+readonly VERSION="4.5.3.1"
 readonly APP_NAME="komari"
 readonly CF_NAME="cloudflared"
 
@@ -351,7 +351,7 @@ has_other_cf_tunnel() {
             other=1; break
         done
     fi
-    if pgrep -f "cloudflared tunnel" | grep -qv -f <(pgrep -f "komari" 2>/dev/null || true) 2>/dev/null; then
+    if pgrep -f "cloudflared tunnel" 2>/dev/null | head -1 | grep -q . && ! pgrep -f "komari" 2>/dev/null | head -1 | grep -q .; then
         other=1
     fi
     return $other
