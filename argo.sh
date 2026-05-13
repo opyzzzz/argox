@@ -1,12 +1,15 @@
+```bash
 #!/usr/bin/env bash
 
 # =========================================================
-# sing-box + Cloudflared(QUIC)
-# Alpine / Debian / Podman / Docker / VPS
-# 小内存优化版
-# 支持:
-#   - VLESS-WS-Argo
-#   - VLESS-Reality
+# Ultra Lite Argo + sing-box
+# For:
+#   - 64MB VPS
+#   - Alpine
+#   - Debian
+#   - Podman
+#   - Docker
+#   - LXC
 # =========================================================
 
 set -u
@@ -15,115 +18,46 @@ set -u
 # 基础变量
 # =========================================================
 
-WORKDIR="/root/sbox"
+WORKDIR="/root/.argo-lite"
+
+mkdir -p "$WORKDIR"
 
 SB="$WORKDIR/sing-box"
 CF="$WORKDIR/cloudflared"
 
-SB_CONF="$WORKDIR/config.json"
+CONFIG="$WORKDIR/config.json"
 
-SB_LOG="$WORKDIR/singbox.log"
-ARGO_LOG="$WORKDIR/argo.log"
+SB_PID="$WORKDIR/singbox.pid"
+CF_PID="$WORKDIR/cloudflared.pid"
 
-UUIDF="$WORKDIR/uuid"
+UUID_FILE="$WORKDIR/uuid"
+TOKEN_FILE="$WORKDIR/token"
+DOMAIN_FILE="$WORKDIR/domain"
 
-WS_PORTF="$WORKDIR/ws_port"
-REALITY_PORTF="$WORKDIR/reality_port"
+PRIVATE_FILE="$WORKDIR/private.key"
+PUBLIC_FILE="$WORKDIR/public.key"
+SHORTID_FILE="$WORKDIR/shortid"
 
-DOMAINF="$WORKDIR/domain"
-TOKENF="$WORKDIR/token"
+WS_PATH_FILE="$WORKDIR/ws_path"
 
-WSPATHF="$WORKDIR/ws_path"
+REALITY_PORT_FILE="$WORKDIR/reality_port"
 
-PRIVATEF="$WORKDIR/private.key"
-PUBLICF="$WORKDIR/public.key"
-SHORTIDF="$WORKDIR/shortid"
-
-IPMODEF="$WORKDIR/ipmode"
-
-mkdir -p "$WORKDIR"
+LOG="$WORKDIR/runtime.log"
 
 # =========================================================
-# 颜色
-# =========================================================
-
-red='\033[1;31m'
-green='\033[1;32m'
-yellow='\033[1;33m'
-plain='\033[0m'
-
-# =========================================================
-# 输出函数
+# 输出
 # =========================================================
 
 info() {
-    echo -e "${green}[+] $*${plain}"
+    echo "[+] $*"
 }
 
 warn() {
-    echo -e "${yellow}[!] $*${plain}"
+    echo "[!] $*"
 }
 
 error() {
-    echo -e "${red}[-] $*${plain}"
-}
-
-# =========================================================
-# 系统检测
-# =========================================================
-
-detect_pkgmgr() {
-
-    if command -v apk >/dev/null 2>&1; then
-        PKG="apk"
-
-    elif command -v apt >/dev/null 2>&1; then
-        PKG="apt"
-
-    else
-        error "不支持的系统"
-        exit 1
-    fi
-}
-
-# =========================================================
-# 安装依赖
-# =========================================================
-
-install_deps() {
-
-    detect_pkgmgr
-
-    info "安装依赖..."
-
-    if [ "$PKG" = "apk" ]; then
-
-        apk add --no-cache \
-            bash \
-            curl \
-            wget \
-            tar \
-            openssl \
-            ca-certificates \
-            >/dev/null 2>&1
-
-    else
-
-        export DEBIAN_FRONTEND=noninteractive
-
-        apt update -y >/dev/null 2>&1
-
-        apt install -y \
-            bash \
-            curl \
-            wget \
-            tar \
-            openssl \
-            ca-certificates \
-            >/dev/null 2>&1
-    fi
-
-    update-ca-certificates >/dev/null 2>&1 || true
+    echo "[-] $*"
 }
 
 # =========================================================
@@ -135,20 +69,44 @@ get_arch() {
     case "$(uname -m)" in
 
         x86_64|amd64)
-            ARCH_SB="amd64"
-            ARCH_CF="amd64"
+            ARCH="amd64"
             ;;
 
         aarch64|arm64)
-            ARCH_SB="arm64"
-            ARCH_CF="arm64"
+            ARCH="arm64"
             ;;
 
         *)
-            error "不支持架构: $(uname -m)"
+            error "unsupported arch"
             exit 1
             ;;
     esac
+}
+
+# =========================================================
+# 下载文件
+# =========================================================
+
+download_file() {
+
+    local url="$1"
+    local out="$2"
+
+    if command -v wget >/dev/null 2>&1; then
+
+        wget \
+            --no-check-certificate \
+            -qO "$out" "$url"
+
+    elif command -v curl >/dev/null 2>&1; then
+
+        curl -Lks -o "$out" "$url"
+
+    else
+
+        error "need wget or curl"
+        exit 1
+    fi
 }
 
 # =========================================================
@@ -157,44 +115,47 @@ get_arch() {
 
 download_singbox() {
 
+    if [ -x "$SB" ]; then
+        return
+    fi
+
     get_arch
 
-    info "下载 sing-box..."
-
-    rm -rf "$WORKDIR"/sing-box*
-    rm -f "$WORKDIR/sb.tar.gz"
+    info "download sing-box"
 
     local url
+    local tmp
 
-    url="https://github.com/SagerNet/sing-box/releases/latest/download/sing-box-linux-$ARCH_SB.tar.gz"
+    tmp="$WORKDIR/sb.tar.gz"
 
-    wget -q -O "$WORKDIR/sb.tar.gz" "$url"
+    url="https://github.com/SagerNet/sing-box/releases/latest/download/sing-box-linux-$ARCH.tar.gz"
 
-    if [ ! -s "$WORKDIR/sb.tar.gz" ]; then
-        error "sing-box 下载失败"
+    download_file "$url" "$tmp"
+
+    if [ ! -s "$tmp" ]; then
+        error "download sing-box failed"
         exit 1
     fi
 
-    mkdir -p "$WORKDIR/sbtmp"
+    mkdir -p "$WORKDIR/tmp"
 
-    tar -xzf "$WORKDIR/sb.tar.gz" \
-        -C "$WORKDIR/sbtmp" >/dev/null 2>&1
+    tar -xzf "$tmp" -C "$WORKDIR/tmp" >/dev/null 2>&1
 
-    local sb_bin
+    local bin
 
-    sb_bin=$(find "$WORKDIR/sbtmp" -type f -name sing-box | head -n1)
+    bin=$(find "$WORKDIR/tmp" -type f -name sing-box | head -n1)
 
-    if [ -z "$sb_bin" ]; then
-        error "sing-box 解压失败"
+    if [ -z "$bin" ]; then
+        error "extract sing-box failed"
         exit 1
     fi
 
-    mv "$sb_bin" "$SB"
+    mv "$bin" "$SB"
 
     chmod +x "$SB"
 
-    rm -rf "$WORKDIR/sbtmp"
-    rm -f "$WORKDIR/sb.tar.gz"
+    rm -rf "$WORKDIR/tmp"
+    rm -f "$tmp"
 }
 
 # =========================================================
@@ -203,63 +164,61 @@ download_singbox() {
 
 download_cf() {
 
+    if [ -x "$CF" ]; then
+        return
+    fi
+
     get_arch
 
-    info "下载 cloudflared..."
+    info "download cloudflared"
 
-    rm -f "$CF"
+    local url
 
-    wget -q -O "$CF" \
-        "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$ARCH_CF"
+    url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$ARCH"
 
-    if [ ! -s "$CF" ]; then
-        error "cloudflared 下载失败"
-        exit 1
-    fi
+    download_file "$url" "$CF"
 
     chmod +x "$CF"
 }
 
 # =========================================================
-# 生成 Reality 密钥
+# Reality 密钥
 # =========================================================
 
-generate_reality_key() {
+generate_reality() {
 
-    info "生成 Reality 密钥..."
-
-    local key_output
-
-    key_output=$("$SB" generate reality-keypair 2>/dev/null)
-
-    if [ -z "$key_output" ]; then
-        error "Reality 密钥生成失败"
-        exit 1
+    if [ -f "$PRIVATE_FILE" ]; then
+        return
     fi
 
-    echo "$key_output" | awk '/PrivateKey/ {print $2}' > "$PRIVATEF"
-    echo "$key_output" | awk '/PublicKey/ {print $2}' > "$PUBLICF"
+    info "generate reality key"
 
-    if [ ! -s "$PRIVATEF" ] || [ ! -s "$PUBLICF" ]; then
-        error "Reality 密钥解析失败"
-        exit 1
+    local out
+
+    out=$("$SB" generate reality-keypair)
+
+    echo "$out" | awk '/PrivateKey/ {print $2}' > "$PRIVATE_FILE"
+    echo "$out" | awk '/PublicKey/ {print $2}' > "$PUBLIC_FILE"
+
+    if command -v openssl >/dev/null 2>&1; then
+        openssl rand -hex 4 > "$SHORTID_FILE"
+    else
+        date +%s | md5sum | cut -c1-8 > "$SHORTID_FILE"
     fi
-
-    openssl rand -hex 4 > "$SHORTIDF"
 }
 
 # =========================================================
-# 获取公网IP
+# 获取IP
 # =========================================================
 
-get_public_ip() {
+get_ip() {
 
     local ip
 
-    ip=$(curl -s4 --max-time 10 ip.sb 2>/dev/null)
+    ip=$(curl -s6 --max-time 5 ip.sb 2>/dev/null)
 
     if [ -z "$ip" ]; then
-        ip=$(curl -s4 --max-time 10 api.ipify.org 2>/dev/null)
+        ip=$(curl -s4 --max-time 5 ip.sb 2>/dev/null)
     fi
 
     if [ -z "$ip" ]; then
@@ -270,45 +229,40 @@ get_public_ip() {
 }
 
 # =========================================================
-# 生成配置
+# 配置
 # =========================================================
 
 generate_config() {
 
     local uuid
-    local ws_port
+    local private
+    local shortid
+    local path
     local reality_port
 
-    local ws_path
+    uuid=$(cat "$UUID_FILE")
 
-    local private_key
-    local shortid
+    private=$(cat "$PRIVATE_FILE")
+    shortid=$(cat "$SHORTID_FILE")
 
-    uuid=$(cat "$UUIDF")
+    path=$(cat "$WS_PATH_FILE")
 
-    ws_port=$(cat "$WS_PORTF")
-    reality_port=$(cat "$REALITY_PORTF")
+    reality_port=$(cat "$REALITY_PORT_FILE")
 
-    ws_path=$(cat "$WSPATHF")
-
-    private_key=$(cat "$PRIVATEF")
-    shortid=$(cat "$SHORTIDF")
-
-    cat > "$SB_CONF" <<EOF
+    cat > "$CONFIG" <<EOF
 {
   "log": {
-    "level": "warn",
-    "timestamp": true
+    "disabled": true
   },
 
   "inbounds": [
 
     {
       "type": "vless",
-      "tag": "vless-ws",
 
       "listen": "::",
-      "listen_port": $ws_port,
+
+      "listen_port": 10000,
 
       "users": [
         {
@@ -318,15 +272,15 @@ generate_config() {
 
       "transport": {
         "type": "ws",
-        "path": "$ws_path"
+        "path": "$path"
       }
     },
 
     {
       "type": "vless",
-      "tag": "vless-reality",
 
       "listen": "::",
+
       "listen_port": $reality_port,
 
       "users": [
@@ -349,7 +303,7 @@ generate_config() {
             "server_port": 443
           },
 
-          "private_key": "$private_key",
+          "private_key": "$private",
 
           "short_id": [
             "$shortid"
@@ -370,94 +324,85 @@ EOF
 }
 
 # =========================================================
-# 配置检测
-# =========================================================
-
-check_config() {
-
-    "$SB" check -c "$SB_CONF" >/dev/null 2>&1
-}
-
-# =========================================================
 # 启动 sing-box
 # =========================================================
 
-run_singbox() {
+start_sb() {
 
-    if pgrep -x sing-box >/dev/null 2>&1; then
-        return
+    if [ -f "$SB_PID" ]; then
+
+        local pid
+
+        pid=$(cat "$SB_PID")
+
+        if kill -0 "$pid" 2>/dev/null; then
+            return
+        fi
     fi
 
-    generate_config
+    info "start sing-box"
 
-    if ! check_config; then
-        error "sing-box 配置错误"
-        "$SB" check -c "$SB_CONF"
-        exit 1
-    fi
+    nohup "$SB" run -c "$CONFIG" \
+        >/dev/null 2>&1 &
 
-    info "启动 sing-box..."
+    echo $! > "$SB_PID"
 
-    nohup "$SB" run -c "$SB_CONF" \
-        > "$SB_LOG" 2>&1 &
-
-    sleep 3
-
-    if pgrep -x sing-box >/dev/null 2>&1; then
-        info "sing-box 启动成功"
-    else
-        error "sing-box 启动失败"
-        tail -20 "$SB_LOG"
-        exit 1
-    fi
+    sleep 2
 }
 
 # =========================================================
 # 启动 cloudflared
 # =========================================================
 
-run_argo() {
+start_cf() {
 
-    if pgrep -x cloudflared >/dev/null 2>&1; then
-        return
+    if [ -f "$CF_PID" ]; then
+
+        local pid
+
+        pid=$(cat "$CF_PID")
+
+        if kill -0 "$pid" 2>/dev/null; then
+            return
+        fi
     fi
 
+    info "start cloudflared"
+
     local token
-    local ipmode
 
-    token=$(cat "$TOKENF")
-    ipmode=$(cat "$IPMODEF")
-
-    info "启动 Argo Tunnel..."
+    token=$(cat "$TOKEN_FILE")
 
     nohup "$CF" tunnel run \
         --token "$token" \
-        --protocol quic \
-        --edge-ip-version "$ipmode" \
+        --protocol auto \
         --no-autoupdate \
-        > "$ARGO_LOG" 2>&1 &
+        >/dev/null 2>&1 &
 
-    sleep 8
+    echo $! > "$CF_PID"
 
-    if pgrep -x cloudflared >/dev/null 2>&1; then
-        info "Argo Tunnel 启动成功"
-    else
-        error "Argo Tunnel 启动失败"
-        tail -20 "$ARGO_LOG"
-        exit 1
-    fi
+    sleep 3
 }
 
 # =========================================================
-# 停止服务
+# 停止
 # =========================================================
 
 stop_all() {
 
-    pkill -x sing-box >/dev/null 2>&1 || true
-    pkill -x cloudflared >/dev/null 2>&1 || true
+    if [ -f "$SB_PID" ]; then
 
-    info "服务已停止"
+        kill "$(cat "$SB_PID")" 2>/dev/null || true
+
+        rm -f "$SB_PID"
+    fi
+
+    if [ -f "$CF_PID" ]; then
+
+        kill "$(cat "$CF_PID")" 2>/dev/null || true
+
+        rm -f "$CF_PID"
+    fi
 }
 
 # =========================================================
@@ -468,54 +413,68 @@ show_links() {
 
     local uuid
     local domain
+    local path
 
-    local ws_path
+    local pbk
+    local sid
 
-    local reality_port
+    local ip
+    local port
 
-    local public_key
-    local shortid
+    uuid=$(cat "$UUID_FILE")
 
-    local server_ip
+    domain=$(cat "$DOMAIN_FILE")
 
-    uuid=$(cat "$UUIDF")
-    domain=$(cat "$DOMAINF")
+    path=$(cat "$WS_PATH_FILE")
 
-    ws_path=$(cat "$WSPATHF")
+    pbk=$(cat "$PUBLIC_FILE")
 
-    reality_port=$(cat "$REALITY_PORTF")
+    sid=$(cat "$SHORTID_FILE")
 
-    public_key=$(cat "$PUBLICF")
-    shortid=$(cat "$SHORTIDF")
+    port=$(cat "$REALITY_PORT_FILE")
 
-    server_ip=$(get_public_ip)
+    ip=$(get_ip)
 
-    local enc_path
+    local enc
 
-    enc_path=$(echo "$ws_path" | sed 's/\//%2F/g')
-
-    echo
-    echo "================================================"
-    echo -e "${green}部署完成${plain}"
-    echo "================================================"
+    enc=$(echo "$path" | sed 's/\//%2F/g')
 
     echo
-    echo "【VLESS-WS-Argo】"
+    echo "=================================="
+    echo "VLESS WS ARGO"
+    echo "=================================="
     echo
 
-    echo "vless://$uuid@$domain:443?encryption=none&security=tls&type=ws&host=$domain&path=$enc_path#$domain-Argo"
+    echo "vless://$uuid@$domain:443?encryption=none&security=tls&type=ws&host=$domain&path=$enc#$domain"
 
     echo
-    echo "------------------------------------------------"
+    echo "=================================="
+    echo "VLESS REALITY"
+    echo "=================================="
+    echo
+
+    echo "vless://$uuid@$ip:$port?security=reality&sni=www.cloudflare.com&fp=chrome&pbk=$pbk&sid=$sid&type=tcp&flow=xtls-rprx-vision#Reality"
 
     echo
-    echo "【VLESS-Reality】"
-    echo
+}
 
-    echo "vless://$uuid@$server_ip:$reality_port?security=reality&sni=www.cloudflare.com&fp=chrome&pbk=$public_key&sid=$shortid&type=tcp&flow=xtls-rprx-vision#Reality"
+# =========================================================
+# 初始化
+# =========================================================
 
-    echo
-    echo "================================================"
+init_env() {
+
+    if [ ! -f "$UUID_FILE" ]; then
+        cat /proc/sys/kernel/random/uuid > "$UUID_FILE"
+    fi
+
+    if [ ! -f "$WS_PATH_FILE" ]; then
+        echo "/$(date +%s | md5sum | cut -c1-8)" > "$WS_PATH_FILE"
+    fi
+
+    if [ ! -f "$REALITY_PORT_FILE" ]; then
+        echo "2053" > "$REALITY_PORT_FILE"
+    fi
 }
 
 # =========================================================
@@ -524,221 +483,117 @@ show_links() {
 
 install_all() {
 
-    install_deps
+    init_env
 
     echo
-    read -rp "请输入 Argo 域名: " domain
+    echo "Input argo domain:"
+    read -r domain
 
-    if [ -z "$domain" ]; then
-        error "域名不能为空"
-        exit 1
-    fi
-
-    echo "$domain" > "$DOMAINF"
+    echo "$domain" > "$DOMAIN_FILE"
 
     echo
-    echo "Cloudflare 出口IP模式:"
-    echo "1. IPv4 (默认)"
-    echo "2. IPv6"
-    echo
-
-    read -rp "请选择 [1-2 默认1]: " ipchoose
-
-    case "$ipchoose" in
-        2)
-            echo "6" > "$IPMODEF"
-            ;;
-        *)
-            echo "4" > "$IPMODEF"
-            ;;
-    esac
-
-    echo
-    read -rp "请输入 Reality 端口 [默认443]: " reality_port
-
-    case "$reality_port" in
-        "")
-            reality_port="443"
-            ;;
-
-        *[!0-9]*)
-            error "端口必须是数字"
-            exit 1
-            ;;
-    esac
-
-    echo "$reality_port" > "$REALITY_PORTF"
-
-    echo "10000" > "$WS_PORTF"
-
-    echo
-    echo "请输入 Cloudflare Tunnel Token:"
+    echo "Input cloudflare token:"
     read -r token
 
-    token=$(echo "$token" | tr -d '\r\n')
+    echo "$token" > "$TOKEN_FILE"
 
-    if [ ${#token} -lt 100 ]; then
-        error "Token 无效"
-        exit 1
+    echo
+    echo "Reality port (default 2053):"
+    read -r rport
+
+    if [ -n "$rport" ]; then
+        echo "$rport" > "$REALITY_PORT_FILE"
     fi
 
-    echo "$token" > "$TOKENF"
-
-    cat /proc/sys/kernel/random/uuid > "$UUIDF"
-
-    echo "/$(tr -dc 'a-z0-9' </dev/urandom | head -c 8)" > "$WSPATHF"
-
     download_singbox
+
     download_cf
 
-    generate_reality_key
+    generate_reality
 
-    run_singbox
-    run_argo
+    generate_config
+
+    start_sb
+
+    start_cf
 
     show_links
 }
 
 # =========================================================
-# 守护模式
+# 守护
 # =========================================================
 
 daemon_loop() {
 
-    info "进入守护模式"
+    local fail=0
 
     while true; do
 
-        if ! pgrep -x sing-box >/dev/null 2>&1; then
-            warn "sing-box 已停止，重新启动"
-            run_singbox
+        if [ -f "$SB_PID" ]; then
+
+            if ! kill -0 "$(cat "$SB_PID")" 2>/dev/null; then
+
+                warn "restart sing-box"
+
+                start_sb
+
+                fail=$((fail + 1))
+            fi
         fi
 
-        if ! pgrep -x cloudflared >/dev/null 2>&1; then
-            warn "cloudflared 已停止，重新启动"
-            run_argo
+        if [ -f "$CF_PID" ]; then
+
+            if ! kill -0 "$(cat "$CF_PID")" 2>/dev/null; then
+
+                warn "restart cloudflared"
+
+                start_cf
+
+                fail=$((fail + 1))
+            fi
         fi
 
-        sleep 30
+        if [ "$fail" -gt 10 ]; then
+
+            warn "too many crashes"
+
+            sleep 60
+
+            fail=0
+        fi
+
+        sleep 15
     done
 }
 
 # =========================================================
-# 菜单
+# 主逻辑
 # =========================================================
 
-menu() {
-
-    while true; do
-
-        echo
-        echo "=============================="
-        echo "1. 安装"
-        echo "2. 启动"
-        echo "3. 停止"
-        echo "4. 重启"
-        echo "5. 查看 sing-box 日志"
-        echo "6. 查看 Argo 日志"
-        echo "7. 查看节点"
-        echo "8. 守护模式"
-        echo "9. 卸载"
-        echo "0. 退出"
-        echo "=============================="
-
-        read -rp "请选择: " num
-
-        case "$num" in
-
-            1)
-                install_all
-                ;;
-
-            2)
-                run_singbox
-                run_argo
-                ;;
-
-            3)
-                stop_all
-                ;;
-
-            4)
-                stop_all
-                sleep 2
-                run_singbox
-                run_argo
-                ;;
-
-            5)
-                tail -f "$SB_LOG"
-                ;;
-
-            6)
-                tail -f "$ARGO_LOG"
-                ;;
-
-            7)
-                show_links
-                ;;
-
-            8)
-                daemon_loop
-                ;;
-
-            9)
-
-                stop_all
-
-                rm -rf "$WORKDIR"
-
-                info "卸载完成"
-
-                exit 0
-                ;;
-
-            0)
-                exit 0
-                ;;
-
-        esac
-    done
-}
-
-# =========================================================
-# 入口
-# =========================================================
-
-case "${1:-menu}" in
+case "${1:-install}" in
 
     install)
+
         install_all
-        ;;
 
-    start)
-        run_singbox
-        run_argo
-        ;;
-
-    stop)
-        stop_all
-        ;;
-
-    restart)
-        stop_all
-        sleep 2
-        run_singbox
-        run_argo
-        ;;
-
-    daemon)
         daemon_loop
         ;;
 
-    menu)
-        menu
+    stop)
+
+        stop_all
         ;;
 
-    *)
-        menu
+    links)
+
+        show_links
         ;;
+
+    daemon)
+
+        daemon_loop
+        ;;
+
 esac
+```
