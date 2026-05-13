@@ -1,5 +1,5 @@
 `````
-wget -O /root/argo.sh https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/argo_supervised.sh && chmod +x /root/argo.sh && sh /root/argo.sh install
+curl -fsSL https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/argo_supervised.sh -o /usr/local/bin/argo.sh && chmod +x /usr/local/bin/argo.sh && argo
 `````
 
 komari-cf
