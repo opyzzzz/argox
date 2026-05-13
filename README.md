@@ -1,5 +1,5 @@
 `````
-wget -O argo.sh https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/argo.sh && chmod +x argo.sh && ./argo.sh install
+wget -O /usr/local/bin/argo https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/argo.sh && chmod +x /usr/local/bin/argo && argo install
 `````
 
 komari-cf
