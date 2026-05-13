@@ -1,4 +1,3 @@
-cat > /root/argo.sh << 'EOF'
 #!/bin/bash
 
 # ==========================
@@ -193,7 +192,3 @@ case "$1" in
         esac
         ;;
 esac
-EOF
-
-chmod +x /root/argo.sh
-/root/argo.sh install
