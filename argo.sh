@@ -1,599 +1,194 @@
-```bash
-#!/usr/bin/env bash
+#!/bin/bash
 
-# =========================================================
-# Ultra Lite Argo + sing-box
-# For:
-#   - 64MB VPS
-#   - Alpine
-#   - Debian
-#   - Podman
-#   - Docker
-#   - LXC
-# =========================================================
-
-set -u
-
-# =========================================================
-# 基础变量
-# =========================================================
-
-WORKDIR="/root/.argo-lite"
-
-mkdir -p "$WORKDIR"
-
-SB="$WORKDIR/sing-box"
+# ==========================
+# 变量定义
+# ==========================
+WORKDIR="/root/argo"
 CF="$WORKDIR/cloudflared"
+XRAY="$WORKDIR/xray"
+CONF="$WORKDIR/config.json"
 
-CONFIG="$WORKDIR/config.json"
+UUIDF="$WORKDIR/uuid"
+PORTF="$WORKDIR/port"
+DOMAINF="$WORKDIR/domain"
+TOKENF="$WORKDIR/token"
+PATHF="$WORKDIR/path"
 
-SB_PID="$WORKDIR/singbox.pid"
-CF_PID="$WORKDIR/cloudflared.pid"
+mkdir -p $WORKDIR
 
-UUID_FILE="$WORKDIR/uuid"
-TOKEN_FILE="$WORKDIR/token"
-DOMAIN_FILE="$WORKDIR/domain"
+# ==========================
+# 纯 IPv6 环境深度修复
+# ==========================
+fix_env() {
+    echo "[+] 正在进行纯 IPv6 环境加固..."
+    
+    # 1. 强制安装根证书和必要工具 (没有证书 CF 必离线)
+    apk add --no-cache curl wget unzip bash procps chrony ca-certificates >/dev/null 2>&1
+    update-ca-certificates >/dev/null 2>&1
 
-PRIVATE_FILE="$WORKDIR/private.key"
-PUBLIC_FILE="$WORKDIR/public.key"
-SHORTID_FILE="$WORKDIR/shortid"
+    # 2. 注入 NAT64 + IPv6 DNS (解决纯v6访问v4资源失败)
+    cat > /etc/resolv.conf << EN_DNS
+nameserver 2001:4860:4860::8888
+nameserver 2606:4700:4700::1111
+nameserver 2a00:1098:2c::1
+nameserver 2a01:4f8:c2c:123f::1
+EN_DNS
 
-WS_PATH_FILE="$WORKDIR/ws_path"
+    # 3. 连通性检测
+    local retry=0
+    while ! ping -6 -c 1 -W 2 2001:4860:4860::8888 >/dev/null 2>&1; do
+        retry=$((retry + 1))
+        [ $retry -gt 5 ] && break
+        sleep 2
+    done
 
-REALITY_PORT_FILE="$WORKDIR/reality_port"
-
-LOG="$WORKDIR/runtime.log"
-
-# =========================================================
-# 输出
-# =========================================================
-
-info() {
-    echo "[+] $*"
+    # 4. 强制同步时间 (TLS 握手核心)
+    chronyd -q 'server pool.ntp.org iburst' >/dev/null 2>&1
 }
-
-warn() {
-    echo "[!] $*"
-}
-
-error() {
-    echo "[-] $*"
-}
-
-# =========================================================
-# 架构检测
-# =========================================================
 
 get_arch() {
-
     case "$(uname -m)" in
-
-        x86_64|amd64)
-            ARCH="amd64"
-            ;;
-
-        aarch64|arm64)
-            ARCH="arm64"
-            ;;
-
-        *)
-            error "unsupported arch"
-            exit 1
-            ;;
+        x86_64)  ARCH="amd64" ;;
+        aarch64) ARCH="arm64" ;;
+        *)       ARCH="amd64" ;;
     esac
 }
 
-# =========================================================
-# 下载文件
-# =========================================================
-
-download_file() {
-
-    local url="$1"
-    local out="$2"
-
-    if command -v wget >/dev/null 2>&1; then
-
-        wget \
-            --no-check-certificate \
-            -qO "$out" "$url"
-
-    elif command -v curl >/dev/null 2>&1; then
-
-        curl -Lks -o "$out" "$url"
-
-    else
-
-        error "need wget or curl"
-        exit 1
-    fi
-}
-
-# =========================================================
-# 下载 sing-box
-# =========================================================
-
-download_singbox() {
-
-    if [ -x "$SB" ]; then
-        return
-    fi
-
+# ==========================
+# 下载与配置
+# ==========================
+download_bin(){
     get_arch
+    echo "[+] 检测到架构: $ARCH，正在下载组件..."
+    
+    # 下载 Cloudflared
+    [ -f "$CF" ] && rm -f "$CF"
+    wget -O $CF "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$ARCH"
+    chmod +x $CF
 
-    info "download sing-box"
-
-    local url
-    local tmp
-
-    tmp="$WORKDIR/sb.tar.gz"
-
-    url="https://github.com/SagerNet/sing-box/releases/latest/download/sing-box-linux-$ARCH.tar.gz"
-
-    download_file "$url" "$tmp"
-
-    if [ ! -s "$tmp" ]; then
-        error "download sing-box failed"
-        exit 1
-    fi
-
-    mkdir -p "$WORKDIR/tmp"
-
-    tar -xzf "$tmp" -C "$WORKDIR/tmp" >/dev/null 2>&1
-
-    local bin
-
-    bin=$(find "$WORKDIR/tmp" -type f -name sing-box | head -n1)
-
-    if [ -z "$bin" ]; then
-        error "extract sing-box failed"
-        exit 1
-    fi
-
-    mv "$bin" "$SB"
-
-    chmod +x "$SB"
-
-    rm -rf "$WORKDIR/tmp"
-    rm -f "$tmp"
-}
-
-# =========================================================
-# 下载 cloudflared
-# =========================================================
-
-download_cf() {
-
-    if [ -x "$CF" ]; then
-        return
-    fi
-
-    get_arch
-
-    info "download cloudflared"
-
-    local url
-
-    url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$ARCH"
-
-    download_file "$url" "$CF"
-
-    chmod +x "$CF"
-}
-
-# =========================================================
-# Reality 密钥
-# =========================================================
-
-generate_reality() {
-
-    if [ -f "$PRIVATE_FILE" ]; then
-        return
-    fi
-
-    info "generate reality key"
-
-    local out
-
-    out=$("$SB" generate reality-keypair)
-
-    echo "$out" | awk '/PrivateKey/ {print $2}' > "$PRIVATE_FILE"
-    echo "$out" | awk '/PublicKey/ {print $2}' > "$PUBLIC_FILE"
-
-    if command -v openssl >/dev/null 2>&1; then
-        openssl rand -hex 4 > "$SHORTID_FILE"
-    else
-        date +%s | md5sum | cut -c1-8 > "$SHORTID_FILE"
+    # 下载 Xray
+    if [ ! -f "$XRAY" ]; then
+        local X_ARCH="64"
+        [[ "$ARCH" == "arm64" ]] && X_ARCH="arm64-v8a"
+        wget -O $WORKDIR/x.zip "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-$X_ARCH.zip"
+        unzip -o $WORKDIR/x.zip -d $WORKDIR >/dev/null 2>&1
+        chmod +x $XRAY
+        rm -f $WORKDIR/x.zip
     fi
 }
 
-# =========================================================
-# 获取IP
-# =========================================================
-
-get_ip() {
-
-    local ip
-
-    ip=$(curl -s6 --max-time 5 ip.sb 2>/dev/null)
-
-    if [ -z "$ip" ]; then
-        ip=$(curl -s4 --max-time 5 ip.sb 2>/dev/null)
-    fi
-
-    if [ -z "$ip" ]; then
-        ip="YOUR_IP"
-    fi
-
-    echo "$ip"
-}
-
-# =========================================================
-# 配置
-# =========================================================
-
-generate_config() {
-
-    local uuid
-    local private
-    local shortid
-    local path
-    local reality_port
-
-    uuid=$(cat "$UUID_FILE")
-
-    private=$(cat "$PRIVATE_FILE")
-    shortid=$(cat "$SHORTID_FILE")
-
-    path=$(cat "$WS_PATH_FILE")
-
-    reality_port=$(cat "$REALITY_PORT_FILE")
-
-    cat > "$CONFIG" <<EOF
+# ==========================
+# 运行逻辑
+# ==========================
+run_xray(){
+    if ! pgrep -x "xray" > /dev/null; then
+        local port=$(cat $PORTF)
+        local uuid=$(cat $UUIDF)
+        local path=$(cat $PATHF)
+        
+        cat > $CONF <<EOC
 {
-  "log": {
-    "disabled": true
-  },
-
-  "inbounds": [
-
-    {
-      "type": "vless",
-
-      "listen": "::",
-
-      "listen_port": 10000,
-
-      "users": [
-        {
-          "uuid": "$uuid"
-        }
-      ],
-
-      "transport": {
-        "type": "ws",
-        "path": "$path"
-      }
-    },
-
-    {
-      "type": "vless",
-
-      "listen": "::",
-
-      "listen_port": $reality_port,
-
-      "users": [
-        {
-          "uuid": "$uuid",
-          "flow": "xtls-rprx-vision"
-        }
-      ],
-
-      "tls": {
-        "enabled": true,
-
-        "server_name": "www.cloudflare.com",
-
-        "reality": {
-          "enabled": true,
-
-          "handshake": {
-            "server": "www.cloudflare.com",
-            "server_port": 443
-          },
-
-          "private_key": "$private",
-
-          "short_id": [
-            "$shortid"
-          ]
-        }
-      }
-    }
-
-  ],
-
-  "outbounds": [
-    {
-      "type": "direct"
-    }
-  ]
+    "inbounds": [{
+        "port": $port, "protocol": "vless",
+        "settings": {"clients": [{"id": "$uuid"}], "decryption": "none"},
+        "streamSettings": {"network": "ws", "wsSettings": {"path": "$path"}}
+    }],
+    "outbounds": [{"protocol": "freedom"}]
 }
-EOF
+EOC
+        nohup $XRAY -config $CONF >/dev/null 2>&1 &
+        echo "[!] Xray 进程启动成功"
+    fi
 }
 
-# =========================================================
-# 启动 sing-box
-# =========================================================
-
-start_sb() {
-
-    if [ -f "$SB_PID" ]; then
-
-        local pid
-
-        pid=$(cat "$SB_PID")
-
-        if kill -0 "$pid" 2>/dev/null; then
-            return
+run_argo(){
+    if ! pgrep -x "cloudflared" > /dev/null; then
+        local token=$(cat $TOKENF)
+        # 强制 IPv6 和 http2 协议，增加稳定心跳
+        nohup $CF tunnel --no-autoupdate \
+            --edge-ip-version 6 \
+            --protocol http2 \
+            --heartbeat-interval 10s \
+            run --token "$token" > "$WORKDIR/argo.log" 2>&1 &
+        
+        sleep 5
+        if pgrep -x "cloudflared" > /dev/null; then
+            echo "[!] Argo 隧道连接成功 (IPv6)"
+        else
+            echo "[-] Argo 启动失败，请检查日志: cat $WORKDIR/argo.log"
         fi
     fi
-
-    info "start sing-box"
-
-    nohup "$SB" run -c "$CONFIG" \
-        >/dev/null 2>&1 &
-
-    echo $! > "$SB_PID"
-
-    sleep 2
 }
 
-# =========================================================
-# 启动 cloudflared
-# =========================================================
+# ==========================
+# 启动与保活
+# ==========================
+create_service(){
+    cat > /etc/init.d/argo <<EOS
+#!/sbin/openrc-run
+depend() { after net dns; }
+start() { /root/argo.sh start; }
+stop() { pkill -9 xray; pkill -9 cloudflared; }
+EOS
+    chmod +x /etc/init.d/argo
+    rc-update add argo default >/dev/null 2>&1
 
-start_cf() {
-
-    if [ -f "$CF_PID" ]; then
-
-        local pid
-
-        pid=$(cat "$CF_PID")
-
-        if kill -0 "$pid" 2>/dev/null; then
-            return
-        fi
-    fi
-
-    info "start cloudflared"
-
-    local token
-
-    token=$(cat "$TOKEN_FILE")
-
-    nohup "$CF" tunnel run \
-        --token "$token" \
-        --protocol auto \
-        --no-autoupdate \
-        >/dev/null 2>&1 &
-
-    echo $! > "$CF_PID"
-
-    sleep 3
-}
-
-# =========================================================
-# 停止
-# =========================================================
-
-stop_all() {
-
-    if [ -f "$SB_PID" ]; then
-
-        kill "$(cat "$SB_PID")" 2>/dev/null || true
-
-        rm -f "$SB_PID"
-    fi
-
-    if [ -f "$CF_PID" ]; then
-
-        kill "$(cat "$CF_PID")" 2>/dev/null || true
-
-        rm -f "$CF_PID"
+    if ! crontab -l 2>/dev/null | grep -q "argo.sh cron"; then
+        (crontab -l 2>/dev/null; echo "* * * * * /root/argo.sh cron") | crontab -
     fi
 }
 
-# =========================================================
-# 输出节点
-# =========================================================
-
-show_links() {
-
-    local uuid
-    local domain
-    local path
-
-    local pbk
-    local sid
-
-    local ip
-    local port
-
-    uuid=$(cat "$UUID_FILE")
-
-    domain=$(cat "$DOMAIN_FILE")
-
-    path=$(cat "$WS_PATH_FILE")
-
-    pbk=$(cat "$PUBLIC_FILE")
-
-    sid=$(cat "$SHORTID_FILE")
-
-    port=$(cat "$REALITY_PORT_FILE")
-
-    ip=$(get_ip)
-
-    local enc
-
-    enc=$(echo "$path" | sed 's/\//%2F/g')
-
-    echo
-    echo "=================================="
-    echo "VLESS WS ARGO"
-    echo "=================================="
-    echo
-
-    echo "vless://$uuid@$domain:443?encryption=none&security=tls&type=ws&host=$domain&path=$enc#$domain"
-
-    echo
-    echo "=================================="
-    echo "VLESS REALITY"
-    echo "=================================="
-    echo
-
-    echo "vless://$uuid@$ip:$port?security=reality&sni=www.cloudflare.com&fp=chrome&pbk=$pbk&sid=$sid&type=tcp&flow=xtls-rprx-vision#Reality"
-
-    echo
-}
-
-# =========================================================
-# 初始化
-# =========================================================
-
-init_env() {
-
-    if [ ! -f "$UUID_FILE" ]; then
-        cat /proc/sys/kernel/random/uuid > "$UUID_FILE"
-    fi
-
-    if [ ! -f "$WS_PATH_FILE" ]; then
-        echo "/$(date +%s | md5sum | cut -c1-8)" > "$WS_PATH_FILE"
-    fi
-
-    if [ ! -f "$REALITY_PORT_FILE" ]; then
-        echo "2053" > "$REALITY_PORT_FILE"
-    fi
-}
-
-# =========================================================
-# 安装
-# =========================================================
-
-install_all() {
-
-    init_env
-
-    echo
-    echo "Input argo domain:"
-    read -r domain
-
-    echo "$domain" > "$DOMAIN_FILE"
-
-    echo
-    echo "Input cloudflare token:"
-    read -r token
-
-    echo "$token" > "$TOKEN_FILE"
-
-    echo
-    echo "Reality port (default 2053):"
-    read -r rport
-
-    if [ -n "$rport" ]; then
-        echo "$rport" > "$REALITY_PORT_FILE"
-    fi
-
-    download_singbox
-
-    download_cf
-
-    generate_reality
-
-    generate_config
-
-    start_sb
-
-    start_cf
-
-    show_links
-}
-
-# =========================================================
-# 守护
-# =========================================================
-
-daemon_loop() {
-
-    local fail=0
-
-    while true; do
-
-        if [ -f "$SB_PID" ]; then
-
-            if ! kill -0 "$(cat "$SB_PID")" 2>/dev/null; then
-
-                warn "restart sing-box"
-
-                start_sb
-
-                fail=$((fail + 1))
-            fi
-        fi
-
-        if [ -f "$CF_PID" ]; then
-
-            if ! kill -0 "$(cat "$CF_PID")" 2>/dev/null; then
-
-                warn "restart cloudflared"
-
-                start_cf
-
-                fail=$((fail + 1))
-            fi
-        fi
-
-        if [ "$fail" -gt 10 ]; then
-
-            warn "too many crashes"
-
-            sleep 60
-
-            fail=0
-        fi
-
-        sleep 15
-    done
-}
-
-# =========================================================
-# 主逻辑
-# =========================================================
-
-case "${1:-install}" in
-
+# ==========================
+# 主指令执行
+# ==========================
+case "$1" in
     install)
-
-        install_all
-
-        daemon_loop
+        fix_env
+        read -p "请输入本地监听端口 (默认8080): " p
+        echo "${p:-8080}" > $PORTF
+        read -p "请输入解析域名: " d
+        echo "$d" > $DOMAINF
+        echo "请输入 Tunnel Token:"
+        read -r t
+        token=$(echo "$t" | grep -oE '[A-Za-z0-9_-]{120,}' | head -n1)
+        [ -z "$token" ] && { echo "Token识别错误"; exit 1; }
+        echo "$token" > $TOKENF
+        
+        # 随机参数只生成一次并保存
+        cat /proc/sys/kernel/random/uuid > $UUIDF
+        echo "/$(head /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c 8)" > $PATHF
+        
+        download_bin
+        create_service
+        run_xray
+        run_argo
+        
+        uuid=$(cat $UUIDF); path=$(cat $PATHF); domain=$(cat $DOMAINF)
+        echo -e "\n========== 节点部署成功 =========="
+        echo "架构: $ARCH | 环境: IPv6-Only"
+        echo "域名: $domain"
+        echo "UUID: $uuid"
+        echo "路径: $path"
+        echo "----------------------------------"
+        echo "链接: vless://$uuid@$domain:443?encryption=none&security=tls&type=ws&host=$domain&path=$(echo $path | sed 's/\//%2F/g')#$domain"
+        echo "=================================="
         ;;
-
-    stop)
-
-        stop_all
+    start)
+        fix_env
+        run_xray
+        run_argo
         ;;
-
-    links)
-
-        show_links
+    cron)
+        pgrep -x "xray" > /dev/null || run_xray
+        pgrep -x "cloudflared" > /dev/null || { fix_env; run_argo; }
         ;;
-
-    daemon)
-
-        daemon_loop
+    menu)
+        echo "1. 重启服务  2. 查看日志  3. 卸载"
+        read -p "选择: " n
+        case "$n" in
+            1) pkill -9 xray; pkill -9 cloudflared; /root/argo.sh start ;;
+            2) tail -f "$WORKDIR/argo.log" ;;
+            3) rc-update del argo; pkill -9 xray; pkill -9 cloudflared; rm -rf $WORKDIR; echo "卸载完成" ;;
+        esac
         ;;
-
 esac
-```
