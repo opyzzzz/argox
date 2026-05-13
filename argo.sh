@@ -1,9 +1,10 @@
 #!/bin/bash
 
-# ==========================
-# 变量定义
-# ==========================
-WORKDIR="/root/argo"
+# ===============================================================
+# 变量与路径统一定义
+# ===============================================================
+SCRIPT_PATH="/usr/local/bin/argo"
+WORKDIR="/var/lib/argo"
 CF="$WORKDIR/cloudflared"
 XRAY="$WORKDIR/xray"
 CONF="$WORKDIR/config.json"
@@ -15,35 +16,36 @@ DOMAINF="$WORKDIR/domain"
 TOKENF="$WORKDIR/token"
 PATHF="$WORKDIR/path"
 IP_PREFF="$WORKDIR/ip_pref"
-TYPEF="$WORKDIR/type" # 记录节点类型: argo 或 reality
+TYPEF="$WORKDIR/type"
+PRIVF="$WORKDIR/priv"
+PUBF="$WORKDIR/pub"
+SIDF="$WORKDIR/sid"
 
 mkdir -p $WORKDIR
 
-# ==========================
-# 环境检测与修复
-# ==========================
+# ===============================================================
+# 环境检查与安装工具
+# ===============================================================
 fix_env() {
-    echo "[+] 检查运行环境..."
-    # 基础工具安装
-    apk add --no-cache curl wget unzip bash procps chrony ca-certificates openssl >/dev/null 2>&1
-    update-ca-certificates >/dev/null 2>&1
+    echo "[+] 正在检查并优化系统环境..."
     
-    # 强制同步时间 (Reality 对时间要求极高)
+    # 针对 Alpine 系统安装必要依赖
+    if [ -f /etc/alpine-release ]; then
+        apk add --no-cache curl wget unzip bash procps chrony ca-certificates openssl >/dev/null 2>&1
+        update-ca-certificates >/dev/null 2>&1
+        rc-update add chronyd default >/dev/null 2>&1
+        service chronyd start >/dev/null 2>&1
+    fi
+
+    # 同步时间 (Reality 对时间偏差非常敏感)
     chronyd -q 'server pool.ntp.org iburst' >/dev/null 2>&1
 
-    # 检测 IP 优先级
-    V4=$(curl -s4m 5 https://api.ipify.org || echo "")
-    V6=$(curl -s6m 5 https://api64.ipify.org || echo "")
-
-    echo "[!] 检测到本地 IP: IPv4=[$V4] IPv6=[$V6]"
+    # IP 优先级检测
+    local v4=$(curl -s4m 5 https://api.ipify.org || echo "")
+    local v6=$(curl -s6m 5 https://api64.ipify.org || echo "")
     
-    # 如果没指定过，默认优先 IPv4
     if [ ! -f "$IP_PREFF" ]; then
-        if [ -n "$V4" ]; then
-            echo "4" > $IP_PREFF
-        else
-            echo "6" > $IP_PREFF
-        fi
+        [ -n "$v4" ] && echo "4" > "$IP_PREFF" || echo "6" > "$IP_PREFF"
     fi
 }
 
@@ -57,37 +59,39 @@ get_arch() {
 
 download_bin(){
     get_arch
-    echo "[+] 系统架构: $ARCH, 正在下载核心组件..."
+    local node_type=$(cat "$TYPEF" 2>/dev/null)
     
-    # 下载 Cloudflared
-    if [[ "$(cat $TYPEF)" == "argo" ]]; then
-        [ ! -f "$CF" ] && wget -O $CF "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$ARCH"
-        chmod +x $CF
+    # 下载 Cloudflared (仅在 Argo 模式需要)
+    if [[ "$node_type" == "argo" && ! -f "$CF" ]]; then
+        echo "[+] 下载 Cloudflared ($ARCH)..."
+        wget -O "$CF" "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$ARCH"
+        chmod +x "$CF"
     fi
 
     # 下载 Xray
     if [ ! -f "$XRAY" ]; then
-        local X_ARCH="64"
-        [[ "$ARCH" == "arm64" ]] && X_ARCH="arm64-v8a"
-        wget -O $WORKDIR/x.zip "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-$X_ARCH.zip"
-        unzip -o $WORKDIR/x.zip -d $WORKDIR >/dev/null 2>&1
-        chmod +x $XRAY
-        rm -f $WORKDIR/x.zip
+        echo "[+] 下载 Xray-core ($ARCH)..."
+        local x_arch="64"
+        [[ "$ARCH" == "arm64" ]] && x_arch="arm64-v8a"
+        wget -O "$WORKDIR/x.zip" "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-$x_arch.zip"
+        unzip -o "$WORKDIR/x.zip" -d "$WORKDIR" >/dev/null 2>&1
+        chmod +x "$XRAY"
+        rm -f "$WORKDIR/x.zip"
     fi
 }
 
-# ==========================
-# 核心运行逻辑
-# ==========================
-
+# ===============================================================
+# 核心启动逻辑
+# ===============================================================
 run_xray(){
-    local type=$(cat $TYPEF)
-    local port=$(cat $PORTF)
-    local uuid=$(cat $UUIDF)
+    [ ! -f "$TYPEF" ] && return
+    local type=$(cat "$TYPEF")
+    local port=$(cat "$PORTF")
+    local uuid=$(cat "$UUIDF")
 
     if [[ "$type" == "argo" ]]; then
-        local path=$(cat $PATHF)
-        cat > $CONF <<EOC
+        local path=$(cat "$PATHF")
+        cat > "$CONF" <<EOC
 {
     "inbounds": [{
         "port": $port, "listen": "127.0.0.1", "protocol": "vless",
@@ -99,25 +103,18 @@ run_xray(){
 EOC
     else
         # Reality 配置
-        local priv_key=$(cat $WORKDIR/priv)
-        local pub_key=$(cat $WORKDIR/pub)
-        local sid=$(cat $WORKDIR/sid)
-        local sni="www.microsoft.com"
-        cat > $CONF <<EOC
+        local priv=$(cat "$PRIVF")
+        local sid=$(cat "$SIDF")
+        cat > "$CONF" <<EOC
 {
     "inbounds": [{
         "port": $port, "protocol": "vless",
-        "settings": {
-            "clients": [{"id": "$uuid", "flow": "xtls-rprx-vision"}],
-            "decryption": "none"
-        },
+        "settings": {"clients": [{"id": "$uuid", "flow": "xtls-rprx-vision"}], "decryption": "none"},
         "streamSettings": {
             "network": "tcp", "security": "reality",
             "realitySettings": {
-                "show": false, "dest": "$sni:443", "xver": 0,
-                "serverNames": ["$sni"],
-                "privateKey": "$priv_key",
-                "shortIds": ["$sid"]
+                "show": false, "dest": "www.microsoft.com:443", "xver": 0,
+                "serverNames": ["www.microsoft.com"], "privateKey": "$priv", "shortIds": ["$sid"]
             }
         }
     }],
@@ -126,170 +123,153 @@ EOC
 EOC
     fi
 
-    pkill -x xray
-    nohup $XRAY -config $CONF >/dev/null 2>&1 &
-    echo "[!] Xray ($type) 启动成功"
+    pkill -9 xray >/dev/null 2>&1
+    nohup "$XRAY" -config "$CONF" >/dev/null 2>&1 &
+    echo "[!] Xray 进程已启动 ($type)"
 }
 
 run_argo(){
-    [[ "$(cat $TYPEF)" != "argo" ]] && return
+    [[ "$(cat "$TYPEF" 2>/dev/null)" != "argo" ]] && return
     
-    local token=$(cat $TOKENF)
-    local ip_pref=$(cat $IP_PREFF)
-    
-    pkill -x cloudflared
-    # 移除 --edge-ip-version 强制，改用参数控制
+    local token=$(cat "$TOKENF")
+    local ip_pref=$(cat "$IP_PREFF")
     local edge_arg=""
-    [[ "$ip_pref" == "6" ]] && edge_arg="--edge-ip-version 6"
-    [[ "$ip_pref" == "4" ]] && edge_arg="--edge-ip-version 4"
+    [[ "$ip_pref" == "6" ]] && edge_arg="--edge-ip-version 6" || edge_arg="--edge-ip-version 4"
 
-    nohup $CF tunnel --no-autoupdate \
-        $edge_arg \
-        --protocol http2 \
-        --heartbeat-interval 10s \
-        run --token "$token" > "$WORKDIR/argo.log" 2>&1 &
+    pkill -9 cloudflared >/dev/null 2>&1
+    nohup "$CF" tunnel --no-autoupdate $edge_arg --protocol http2 --heartbeat-interval 10s run --token "$token" > "$WORKDIR/argo.log" 2>&1 &
     
-    sleep 5
-    if pgrep -x "cloudflared" > /dev/null; then
-        echo "[!] Argo 隧道已建立 (IPv$ip_pref 优先)"
-    else
-        echo "[-] Argo 启动失败，请检查日志。尝试切换 IPv4/IPv6 或检查 Token。"
+    sleep 3
+    pgrep -x "cloudflared" > /dev/null && echo "[!] Argo 隧道已连接 (IPv$ip_pref)" || echo "[-] Argo 启动失败，请检查日志: $WORKDIR/argo.log"
+}
+
+# ===============================================================
+# 系统集成 (快捷命令与服务)
+# ===============================================================
+install_to_system() {
+    # 将脚本自身移动到系统路径
+    if [ "$0" != "$SCRIPT_PATH" ]; then
+        cp "$0" "$SCRIPT_PATH"
+        chmod +x "$SCRIPT_PATH"
     fi
-}
 
-# ==========================
-# 安装函数
-# ==========================
-
-install_argo() {
-    echo "argo" > $TYPEF
-    read -p "请输入本地监听端口 (默认8080): " p
-    echo "${p:-8080}" > $PORTF
-    read -p "请输入 Cloudflare 解析域名: " d
-    echo "$d" > $DOMAINF
-    read -p "请输入 Tunnel Token: " t
-    token=$(echo "$t" | grep -oE '[A-Za-z0-9_-]{120,}' | head -n1)
-    [ -z "$token" ] && { echo "Token识别错误"; exit 1; }
-    echo "$token" > $TOKENF
-    
-    echo "请选择连接 Cloudflare 的优先级:"
-    echo "1. 默认 (IPv4)"
-    echo "2. 强制 (IPv6)"
-    read -p "选择 [1/2]: " ip_choice
-    [[ "$ip_choice" == "2" ]] && echo "6" > $IP_PREFF || echo "4" > $IP_PREFF
-
-    cat /proc/sys/kernel/random/uuid > $UUIDF
-    echo "/$(head /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c 8)" > $PATHF
-    
-    download_bin
-    run_xray
-    run_argo
-    
-    # 打印 Argo 节点信息
-    echo -e "\n========== Argo 节点配置 =========="
-    echo "域名: $(cat $DOMAINF)"
-    echo "UUID: $(cat $UUIDF)"
-    echo "路径: $(cat $PATHF)"
-    echo "链接: vless://$(cat $UUIDF)@$(cat $DOMAINF):443?encryption=none&security=tls&type=ws&host=$(cat $DOMAINF)&path=$(sed 's/\//%2F/g' $PATHF)#Argo-VLESS"
-}
-
-install_reality() {
-    echo "reality" > $TYPEF
-    read -p "请输入 Reality 监听端口 (默认443): " p
-    echo "${p:-443}" > $PORTF
-    
-    # 生成 Reality 密钥
-    download_bin # 需要 xray 来生成密钥
-    keys=$($XRAY x25519)
-    echo "$keys" | grep "Private key:" | awk '{print $3}' > $WORKDIR/priv
-    echo "$keys" | grep "Public key:" | awk '{print $3}' > $WORKDIR/pub
-    openssl rand -hex 8 > $WORKDIR/sid
-    cat /proc/sys/kernel/random/uuid > $UUIDF
-    
-    run_xray
-    
-    # 获取当前公网 IP
-    local myip=$(curl -s4m 5 https://api.ipify.org || curl -s6m 5 https://api64.ipify.org)
-    
-    echo -e "\n========== Reality 节点配置 =========="
-    echo "地址: $myip"
-    echo "端口: $(cat $PORTF)"
-    echo "UUID: $(cat $UUIDF)"
-    echo "PublicKey: $(cat $WORKDIR/pub)"
-    echo "ShortID: $(cat $WORKDIR/sid)"
-    echo "SNI: www.microsoft.com"
-    echo "--------------------------------------"
-    echo "链接: vless://$(cat $UUIDF)@$myip:$(cat $PORTF)?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.microsoft.com&fp=chrome&pbk=$(cat $WORKDIR/pub)&sid=$(cat $WORKDIR/sid)#Reality-VLESS"
-}
-
-# ==========================
-# 菜单与保活
-# ==========================
-
-create_service(){
-    cat > /etc/init.d/argo <<EOS
+    # 创建 OpenRC 服务 (针对 Alpine)
+    if [ -d /etc/init.d ]; then
+        cat > /etc/init.d/argo <<EOS
 #!/sbin/openrc-run
 depend() { after net dns; }
-start() { /root/argo.sh start; }
+start() { $SCRIPT_PATH start; }
 stop() { pkill -9 xray; pkill -9 cloudflared; }
 EOS
-    chmod +x /etc/init.d/argo
-    rc-update add argo default >/dev/null 2>&1
-    if ! crontab -l 2>/dev/null | grep -q "argo.sh cron"; then
-        (crontab -l 2>/dev/null; echo "*/5 * * * * /root/argo.sh cron") | crontab -
+        chmod +x /etc/init.d/argo
+        rc-update add argo default >/dev/null 2>&1
+    fi
+
+    # 计划任务保活 (纠正了路径)
+    if ! crontab -l 2>/dev/null | grep -q "$SCRIPT_PATH cron"; then
+        (crontab -l 2>/dev/null; echo "*/5 * * * * $SCRIPT_PATH cron") | crontab -
     fi
 }
 
+# ===============================================================
+# 交互菜单功能
+# ===============================================================
+show_config() {
+    local type=$(cat "$TYPEF" 2>/dev/null)
+    [ -z "$type" ] && echo "未发现已安装的配置" && return
+    
+    echo -e "\n--- 当前配置信息 ---"
+    if [[ "$type" == "argo" ]]; then
+        local uuid=$(cat "$UUIDF")
+        local domain=$(cat "$DOMAINF")
+        local path=$(cat "$PATHF")
+        echo "模式: Cloudflare Argo"
+        echo "链接: vless://$uuid@$domain:443?encryption=none&security=tls&type=ws&host=$domain&path=$(echo $path | sed 's/\//%2F/g')#Argo-VLESS"
+    else
+        local uuid=$(cat "$UUIDF")
+        local port=$(cat "$PORTF")
+        local pub=$(cat "$PUBF")
+        local sid=$(cat "$SIDF")
+        local myip=$(curl -s4m 5 https://api.ipify.org || curl -s6m 5 https://api64.ipify.org)
+        echo "模式: VLESS-REALITY"
+        echo "链接: vless://$uuid@$myip:$port?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.microsoft.com&fp=chrome&pbk=$pub&sid=$sid#Reality-VLESS"
+    fi
+}
+
+# ===============================================================
+# 主程序入口
+# ===============================================================
 case "$1" in
     install)
         fix_env
         echo "请选择部署类型:"
         echo "1. Cloudflare Argo Tunnel (VLESS+WS)"
         echo "2. VLESS-REALITY (直连+Vision)"
-        read -p "选择: " m
-        if [[ "$m" == "1" ]]; then install_argo; else install_reality; fi
-        create_service
+        read -p "选择 [1/2]: " m
+        
+        if [[ "$m" == "1" ]]; then
+            echo "argo" > "$TYPEF"
+            read -p "本地监听端口 (默认8080): " p; echo "${p:-8080}" > "$PORTF"
+            read -p "解析域名: " d; echo "$d" > "$DOMAINF"
+            read -p "Tunnel Token: " t
+            token=$(echo "$t" | grep -oE '[A-Za-z0-9_-]{120,}' | head -n1)
+            [ -z "$token" ] && { echo "Token错误"; exit 1; }
+            echo "$token" > "$TOKENF"
+            echo "/$(head /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c 8)" > "$PATHF"
+            read -p "优先IP版本 (4/6, 默认4): " ip_v; echo "${ip_v:-4}" > "$IP_PREFF"
+        else
+            echo "reality" > "$TYPEF"
+            read -p "Reality 端口 (默认443): " p; echo "${p:-443}" > "$PORTF"
+            download_bin
+            keys=$($XRAY x25519)
+            echo "$keys" | grep "Private key:" | awk '{print $3}' > "$PRIVF"
+            echo "$keys" | grep "Public key:" | awk '{print $3}' > "$PUBF"
+            openssl rand -hex 8 > "$SIDF"
+        fi
+        
+        cat /proc/sys/kernel/random/uuid > "$UUIDF"
+        download_bin
+        install_to_system
+        run_xray
+        [[ "$(cat "$TYPEF")" == "argo" ]] && run_argo
+        show_config
         ;;
     start)
-        fix_env
         run_xray
-        [[ "$(cat $TYPEF)" == "argo" ]] && run_argo
+        run_argo
         ;;
     cron)
-        pgrep -x "xray" > /dev/null || $0 start
-        if [[ "$(cat $TYPEF)" == "argo" ]]; then
-             pgrep -x "cloudflared" > /dev/null || $0 start
+        pgrep -x "xray" > /dev/null || run_xray
+        if [[ "$(cat "$TYPEF" 2>/dev/null)" == "argo" ]]; then
+            pgrep -x "cloudflared" > /dev/null || run_argo
         fi
         ;;
-    menu)
-        echo "---------- 节点管理菜单 ----------"
+    menu|*)
+        if [ "$1" != "menu" ] && [ "$1" != "" ]; then 
+            # 允许直接执行 argo start 等
+            shift; "$0" "$@"; exit
+        fi
+        echo "========== Argo/Reality 管理工具 =========="
         echo "1. 重启服务"
-        echo "2. 查看 Argo 日志 (仅限Tunnel模式)"
-        echo "3. 查看当前连接链接"
-        echo "4. 彻底卸载"
-        read -p "请选择 [1-4]: " n
-        case "$n" in
-            1) $0 start ;;
-            2) [ -f "$WORKDIR/argo.log" ] && tail -n 20 "$WORKDIR/argo.log" || echo "无日志文件" ;;
-            3)
-                type=$(cat $TYPEF)
-                if [[ "$type" == "argo" ]]; then
-                    echo "vless://$(cat $UUIDF)@$(cat $DOMAINF):443?encryption=none&security=tls&type=ws&host=$(cat $DOMAINF)&path=$(sed 's/\//%2F/g' $PATHF)#Argo-VLESS"
-                else
-                    myip=$(curl -s4m 5 https://api.ipify.org || curl -s6m 5 https://api64.ipify.org)
-                    echo "vless://$(cat $UUIDF)@$myip:$(cat $PORTF)?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.microsoft.com&fp=chrome&pbk=$(cat $WORKDIR/pub)&sid=$(cat $WORKDIR/sid)#Reality-VLESS"
-                fi
-                ;;
-            4)
+        echo "2. 查看当前节点链接"
+        echo "3. 查看 Argo 日志"
+        echo "4. 重新安装/切换模式"
+        echo "5. 彻底卸载"
+        echo "0. 退出"
+        read -p "请选择: " opt
+        case "$opt" in
+            1) "$SCRIPT_PATH" start ;;
+            2) show_config ;;
+            3) [ -f "$WORKDIR/argo.log" ] && tail -n 50 "$WORKDIR/argo.log" || echo "无日志" ;;
+            4) "$SCRIPT_PATH" install ;;
+            5)
                 rc-update del argo >/dev/null 2>&1
                 pkill -9 xray; pkill -9 cloudflared
-                rm -rf $WORKDIR
-                sed -i '/argo.sh cron/d' /var/spool/cron/crontabs/root 2>/dev/null
-                echo "卸载完成"
+                rm -rf "$WORKDIR" "$SCRIPT_PATH" /etc/init.d/argo
+                sed -i "/argo cron/d" /var/spool/cron/crontabs/root 2>/dev/null
+                echo "卸载完成。"
                 ;;
+            *) exit ;;
         esac
-        ;;
-    *)
-        echo "用法: $0 {install|start|menu}"
         ;;
 esac
