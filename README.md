@@ -1,6 +1,10 @@
 `````
 wget -O /usr/local/bin/argo https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/argo.sh && chmod +x /usr/local/bin/argo && argo install
 `````
+ufwssh
+`````
+bash <(curl -fsSL https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/ufwssh.sh)
+`````
 
 komari-cf
 `````
