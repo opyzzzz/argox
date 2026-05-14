@@ -124,7 +124,7 @@ set_ssh_option() {
     local key=$1
     local value=$2
     if grep -qE "^[#]*${key}[[:space:]]" "$SSHD_CONFIG"; then
-        sed -i "s/^[#]*${key}[[:space:]].*/${key} ${value}/" "$SSHD_CONFIG"
+        sed -i "s|^[#]*${key}[[:space:]].*|${key} ${value}|" "$SSHD_CONFIG"
     else
         echo "${key} ${value}" >> "$SSHD_CONFIG"
     fi
