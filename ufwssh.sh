@@ -34,6 +34,22 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
+# ========== 安装必备依赖 ==========
+echo -e "${YELLOW}[0/10] 安装必备依赖...${NC}"
+
+# 更新软件包列表
+apt update
+
+# 安装必备工具
+apt install -y ufw wget curl
+
+# 如果 ufw 未安装则单独安装（兼容性保障）
+if ! command -v ufw &> /dev/null; then
+    apt install -y ufw
+fi
+
+echo -e "${GREEN}依赖安装完成 (ufw, wget, curl)${NC}"
+
 # ========== 交互式配置端口 ==========
 echo -e "${YELLOW}[配置] SSH 端口设置${NC}"
 read -p "请输入新的 SSH 端口号 (1024-65535，默认 2222): " NEW_SSH_PORT
