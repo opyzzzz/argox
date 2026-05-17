@@ -218,7 +218,7 @@ services:
 networks:
   cf-tunnel-net:
     external: true
-KOMARIEOF
+SUBLINKEOF
 
     cd "$SUBLINK_DIR"
     docker compose up -d
