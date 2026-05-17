@@ -7,7 +7,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/mai
 `````
 docker+komari+sublinkpro+cf隧道
 `````
-curl -fsSL https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/KSC-docker.sh | bash
+curl -fsSL https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/KSC-docker.sh -o /tmp/ksc.sh && bash /tmp/ksc.sh && rm -f /tmp/ksc.sh
 `````
 komari-cf
 `````
