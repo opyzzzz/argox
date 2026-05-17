@@ -8,7 +8,7 @@
 set -e
 
 #=========== 全局变量 ===========
-SCRIPT_NAME="docker-manager"
+SCRIPT_NAME="ksc"
 INSTALL_PATH="/usr/local/bin/docker-manager"
 BASE_DIR="/opt"
 KOMARI_DIR="${BASE_DIR}/komari"
