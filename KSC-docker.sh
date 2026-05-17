@@ -1,7 +1,7 @@
 #!/bin/bash
 #===========================================
-# Docker 服务部署管理脚本
-# 版本: 2.2 (完美修正版)
+# Docker 服务集群管理面板
+# 版本: 2.6 (闭环重构统一版)
 # 功能：安装Docker、部署Komari/SublinkPro/CF隧道
 #===========================================
 
@@ -9,7 +9,7 @@ set -e
 
 #=========== 全局变量 ===========
 SCRIPT_NAME="ksc"
-INSTALL_PATH="/usr/local/bin/docker-manager"
+INSTALL_PATH="/usr/local/bin/ksc"
 BASE_DIR="/opt"
 KOMARI_DIR="${BASE_DIR}/komari"
 SUBLINK_DIR="${BASE_DIR}/sublinkpro"
@@ -20,7 +20,7 @@ ENV_FILE="${TUNNEL_DIR}/.env"
 COMPOSE_KOMARI="${KOMARI_DIR}/docker-compose.yml"
 COMPOSE_SUBLINK="${SUBLINK_DIR}/docker-compose.yml"
 COMPOSE_TUNNEL="${TUNNEL_DIR}/docker-compose.yml"
-SCRIPT_VERSION="2.2"
+SCRIPT_VERSION="2.6"
 
 # 颜色定义
 RED='\033[0;31m'
@@ -54,17 +54,6 @@ confirm() {
     [[ "$response" =~ ^[Yy]$ ]]
 }
 
-get_os_type() {
-    if [ -f /etc/os-release ]; then
-        . /etc/os-release
-        echo "$ID"
-    elif [ -f /etc/debian_version ]; then
-        echo "debian"
-    else
-        echo "unknown"
-    fi
-}
-
 #=========== 状态检查函数 ===========
 check_docker_installed() { check_cmd docker; }
 check_docker_running() { systemctl is-active --quiet docker 2>/dev/null; }
@@ -84,17 +73,6 @@ get_container_status() {
     fi
 }
 
-get_status_icon() {
-    local container=$1
-    if check_container_running "$container"; then
-        echo "✅"
-    elif check_container_exists "$container"; then
-        echo "⏸️"
-    else
-        echo "❌"
-    fi
-}
-
 check_environment() {
     local issues=0
     print_info "检测系统环境..."
@@ -105,18 +83,48 @@ check_environment() {
     if ! check_network_exists; then print_warning "共享网络 ${NETWORK_NAME} 不存在"; ((issues++)); fi
     
     if [[ $issues -gt 0 ]]; then
-        print_warning "发现 ${issues} 个问题，部分功能可能不可用"
+        print_warning "发现 ${issues} 个环境缺陷，建议先执行初始化部署"
         return 1
     fi
     print_success "环境检测通过"
     return 0
 }
 
+#=========== Token 读取（高兼容安全封装） ===========
+read_token() {
+    if [[ -f "$ENV_FILE" ]]; then
+        TUNNEL_TOKEN=$(sed -n 's/^TUNNEL_TOKEN=//p' "$ENV_FILE" 2>/dev/null || echo "")
+    else
+        TUNNEL_TOKEN=""
+    fi
+}
+
+#=========== 部署后服务实时存活验证 ===========
+verify_container() {
+    local container=$1
+    print_info "等待服务状态就绪（动态监测中）..."
+    sleep 3
+    if check_container_running "$container"; then
+        print_success "🎉 容器 ${container} 已成功拉起并处于活跃运行状态！"
+        return 0
+    else
+        print_error "❌ 容器 ${container} 启动后异常退出。请稍后执行: docker logs ${container} 排查死因"
+        return 1
+    fi
+}
+
+#=========== 数据备份功能 ===========
 backup_data() {
+    print_title "数据备份程序"
     local timestamp=$(date +%Y%m%d_%H%M%S)
     local backup_path="${BACKUP_DIR}/backup_${timestamp}"
     
-    print_info "创建备份..."
+    if [[ ! -d "$KOMARI_DIR" && ! -d "$SUBLINK_DIR" && ! -d "$TUNNEL_DIR" ]]; then
+        print_warning "未检测到任何已部署的服务数据，取消备份"
+        return 1
+    fi
+    
+    print_info "正在为运行实例建立物理快照..."
     mkdir -p "$backup_path"
     
     for dir in "$KOMARI_DIR" "$SUBLINK_DIR" "$TUNNEL_DIR"; do
@@ -124,21 +132,18 @@ backup_data() {
             cp -r "$dir" "${backup_path}/$(basename "$dir")" 2>/dev/null || true
         fi
     done
-    print_success "备份已保存到: $backup_path"
-    echo "$backup_path"
+    print_success "备份存档成功创建！存放路径: $backup_path"
 }
 
 install_docker() {
-    print_title "安装 Docker 环境"
+    print_title "核心运行时环境检查"
     if check_docker_installed; then
-        print_info "Docker 已安装"
+        print_info "系统已存在 Docker 主程序，跳过安装阶段"
         return 0
     fi
     
-    print_info "开始安装 Docker..."
-    
-    # 采用官方内置环境变量方式配置国内源，完美避开改系统 sources.list 的各种发行版兼容巨坑
-    if confirm "是否使用国内镜像源加速安装? (推荐中国大陆服务器)"; then
+    print_info "正在调取 Docker 引擎安装流水线..."
+    if confirm "是否使用国内阿里云镜像源加速拉取基础依赖组件?"; then
         export DOWNLOAD_URL="https://mirrors.aliyun.com/docker-ce"
     fi
     
@@ -146,7 +151,7 @@ install_docker() {
     systemctl start docker
     systemctl enable docker
     
-    if confirm "是否配置 Docker 镜像加速? (随时可能失效，仅供参考)"; then
+    if confirm "是否配置公共 Docker 镜像加速镜像站? (能明显改善部分受限网络下载慢的问题)"; then
         mkdir -p /etc/docker
         cat > /etc/docker/daemon.json <<'DAEMONEOF'
 {
@@ -159,24 +164,31 @@ install_docker() {
 }
 DAEMONEOF
         systemctl restart docker
-        print_success "镜像加速已配置"
+        print_success "镜像加速站参数载入成功"
     fi
 }
 
 create_network() {
     if check_network_exists; then return 0; fi
-    print_info "创建 Docker 共享网络: ${NETWORK_NAME}"
+    print_info "创建集群共享通信专用容器网络: ${NETWORK_NAME}"
     docker network create "$NETWORK_NAME"
 }
 
 deploy_komari() {
-    print_title "部署 Komari"
+    print_title "建立 Komari 监控节点"
     if check_container_exists "komari"; then
-        docker rm -f komari 2>/dev/null || true
+        print_warning "检测到本地已存在旧的 Komari 容器"
+        if confirm "是否销毁该老容器并以最新镜像重构?"; then
+            docker rm -f komari 2>/dev/null || true
+        else
+            print_info "跳过 Komari 模块构建"
+            return 0
+        fi
     fi
     
     mkdir -p "${KOMARI_DIR}/data"
-    cat > "$COMPOSE_KOMARI" <<'KOMARIEOF'
+    
+    cat > "$COMPOSE_KOMARI" <<'EOF'
 services:
   komari:
     image: ghcr.io/komari-monitor/komari:latest
@@ -189,21 +201,28 @@ services:
 networks:
   cf-tunnel-net:
     external: true
-KOMARIEOF
+EOF
 
     cd "$KOMARI_DIR"
     docker compose up -d
-    print_success "Komari 部署完成"
+    verify_container "komari"
 }
 
 deploy_sublink() {
-    print_title "部署 Sublink Pro"
+    print_title "建立 Sublink Pro 订阅转换控制台"
     if check_container_exists "sublinkpro"; then
-        docker rm -f sublinkpro 2>/dev/null || true
+        print_warning "检测到本地已存在旧的 Sublink Pro 容器"
+        if confirm "是否销毁该老容器并以最新镜像重构?"; then
+            docker rm -f sublinkpro 2>/dev/null || true
+        else
+            print_info "跳过 Sublink Pro 模块构建"
+            return 0
+        fi
     fi
     
     mkdir -p "${SUBLINK_DIR}"/{db,template,logs}
-    cat > "$COMPOSE_SUBLINK" <<'SUBLINKEOF'
+    
+    cat > "$COMPOSE_SUBLINK" <<'EOF'
 services:
   sublinkpro:
     image: zerodeng/sublink-pro
@@ -218,43 +237,43 @@ services:
 networks:
   cf-tunnel-net:
     external: true
-SUBLINKEOF
+EOF
 
     cd "$SUBLINK_DIR"
     docker compose up -d
-    print_success "Sublink Pro 部署完成"
+    verify_container "sublinkpro"
 }
 
 get_cf_token() {
     local token=""
-    print_info "获取 Cloudflare Tunnel Token"
+    print_info "更新 Cloudflare Edge 隧道密钥凭证"
     while true; do
-        read -rsp "请输入 CF Tunnel Token: " token
+        read -rsp "请输入从 Cloudflare 导出的 Tunnel Token: " token
         echo ""
         if [[ -z "$token" ]]; then continue; fi
         break
     done
     
     mkdir -p "$TUNNEL_DIR"
-    # 直接写入 TUNNEL_TOKEN，对齐 Cloudflare 官方容器的标准变量名
     echo "TUNNEL_TOKEN=${token}" > "$ENV_FILE"
     chmod 600 "$ENV_FILE"
+    print_success "凭证安全落盘保存"
 }
 
 deploy_tunnel() {
-    print_title "部署 Cloudflare Tunnel"
-    if [ -f "$ENV_FILE" ]; then source "$ENV_FILE"; fi
+    print_title "构建 Cloudflare 内网穿透边际网关"
+    read_token
     
     if [[ -z "$TUNNEL_TOKEN" ]]; then
         get_cf_token
-        source "$ENV_FILE"
+        read_token
     fi
     
     if check_container_exists "cloudflared"; then
         docker rm -f cloudflared 2>/dev/null || true
     fi
     
-    cat > "$COMPOSE_TUNNEL" <<'TUNNELEOF'
+    cat > "$COMPOSE_TUNNEL" <<'EOF'
 services:
   cloudflared:
     image: cloudflare/cloudflared:latest
@@ -263,20 +282,22 @@ services:
     command: tunnel --no-autoupdate run
     env_file:
       - .env
-    environment:
-      - TUNNEL_TOKEN
     networks:
       - cf-tunnel-net
 networks:
   cf-tunnel-net:
     external: true
-TUNNELEOF
+EOF
 
     cd "$TUNNEL_DIR"
     docker compose up -d
-    print_success "Cloudflare Tunnel 部署完成！请前往 CF 后台配置 Hostname 绑定本地容器服务："
-    print_info "  -> Komari 请绑定到: http://komari:25774"
-    print_info "  -> Sublink Pro 请绑定到: http://sublinkpro:8000"
+    
+    if verify_container "cloudflared"; then
+        print_success "Cloudflare Tunnel 网关集群握手完毕！"
+        print_info "请前往 Zero Trust 面板，将对应的二级域名分别指向内网域名机制："
+        print_info "  -> 📊 状态看板绑定回源路径: http://komari:25774"
+        print_info "  -> 🔗 订阅控制台绑定回源路径: http://sublinkpro:8000"
+    fi
 }
 
 service_control() {
@@ -291,21 +312,46 @@ service_control() {
     esac
     
     if [[ ! -f "${dir}/docker-compose.yml" ]]; then
-        print_error "该服务未部署"
+        print_error "操作受阻：服务 [${service}] 在本地还没有生成过依赖描述文件，请先运行初始化部署。"
         return 1
     fi
     
     cd "$dir"
-    create_network
+    
+    # 【修正 1】：整合修正，只在涉及网络建立和容器重建时校验共享网卡，去除了冗余匹配
+    if [[ "$action" == "start" || "$action" == "update" || "$action" == "rebuild" ]]; then
+        create_network
+    fi
     
     case $action in
-        start) docker compose up -d ;;
-        stop) docker compose stop ;;
-        restart) docker compose restart ;;
-        update) docker compose pull && docker compose up -d ;;
+        start) 
+            print_info "正在尝试拉起容器 [${service}]..."
+            docker compose up -d 
+            ;;
+        stop) 
+            print_info "正在向容器发送平滑停止指令 [${service}]..."
+            docker compose stop 
+            ;;
+        rebuild)
+            # 【修正 1 & 2】：实现真正的物理一键重建 (down + up -d 闭环) 并自动验证
+            print_warning "正在全面一键重建容器 [${service}] (物理销毁旧容器并拉起新实例)..."
+            docker compose down && docker compose up -d
+            verify_container "$service"
+            ;;
+        restart) 
+            print_info "正在重载容器任务 [${service}]..."
+            docker compose restart 
+            ;;
+        update) 
+            print_info "正在连接上游容器中心检索服务 [${service}] 的最新镜像标签..."
+            docker compose pull && docker compose up -d 
+            ;;
         logs) 
-            # 优雅捕获 Ctrl+C，避免看日志按退出时把整个脚本连带干掉
-            print_info "正在查看日志，退出请按 Ctrl+C..."
+            if ! check_container_exists "$service"; then
+                print_error "该容器服务尚未被 Docker 实例化，无日志可循"
+                return 1
+            fi
+            print_info "正在切入 [${service}] 的实时标准流输出日志（安全捕获中，退出请按 Ctrl+C）..."
             set +e
             docker compose logs --tail 100 -f
             set -e
@@ -314,16 +360,24 @@ service_control() {
 }
 
 show_status() {
-    print_title "服务运行状态"
-    printf "  %-20s %-20s %-20s\n" "服务名称" "容器名称" "运行状态"
+    print_title "服务集群当前拓扑快照"
+    printf "  %-20s %-20s %-20s\n" "应用逻辑层" "系统级容器名" "当前健康度"
     printf "  %-20s %-20s %-20s\n" "--------" "--------" "--------"
-    printf "  %-20s %-20s %-42b\n" "Komari" "komari" "$(get_container_status komari)"
-    printf "  %-20s %-20s %-42b\n" "Sublink Pro" "sublinkpro" "$(get_container_status sublinkpro)"
-    printf "  %-20s %-20s %-42b\n" "CF Tunnel" "cloudflared" "$(get_container_status cloudflared)"
+    printf "  %-20s %-20s %-42b\n" "Komari 监控" "komari" "$(get_container_status komari)"
+    printf "  %-20s %-20s %-42b\n" "Sublink Pro 控制台" "sublinkpro" "$(get_container_status sublinkpro)"
+    printf "  %-20s %-20s %-42b\n" "CF Tunnel 隧道" "cloudflared" "$(get_container_status cloudflared)"
     echo ""
 }
 
 init_deploy() {
+    if [[ -d "$KOMARI_DIR" || -d "$SUBLINK_DIR" || -d "$TUNNEL_DIR" ]]; then
+        print_warning "注意：检测到您的服务器此前可能部署过本脚本的相关业务组件。"
+        if ! confirm "执行初始化会尝试覆写并完全重建这些容器，是否同意继续?"; then
+            print_info "已被用户取消，终止部署进程。"
+            return 0
+        fi
+    fi
+
     install_docker
     create_network
     get_cf_token
@@ -334,59 +388,72 @@ init_deploy() {
 }
 
 full_uninstall() {
-    print_title "完全卸载"
-    if ! confirm "确定要完全卸载所有服务和数据吗?"; then return; fi
+    print_title "危险：集群全面清洗与卸载向导"
+    if ! confirm "确定要物理剔除所有的业务容器、网络路由以及您保存的全部配置文件吗?（此操作无法回滚）"; then 
+        return 0
+    fi
     
+    print_warning "正在强制停止并清理集群进程生命周期..."
     cd "$TUNNEL_DIR" 2>/dev/null && docker compose down -v 2>/dev/null || true
     cd "$SUBLINK_DIR" 2>/dev/null && docker compose down -v 2>/dev/null || true
     cd "$KOMARI_DIR" 2>/dev/null && docker compose down -v 2>/dev/null || true
     
+    print_info "注销跨域共享网卡桥接..."
     docker network rm "$NETWORK_NAME" 2>/dev/null || true
+    
+    print_info "擦除磁盘物理遗存配置目录..."
     rm -rf "$KOMARI_DIR" "$SUBLINK_DIR" "$TUNNEL_DIR" "$INSTALL_PATH"
-    print_success "卸载完成。"
-    exit 0
+    print_success "环境已全部回归至纯净初始状态。"
+    
+    return 0
 }
 
 show_menu() {
     clear
-    echo -e "${CYAN}=========================================${NC}"
-    echo -e "${CYAN}    Docker 服务集群管理面板 v${SCRIPT_VERSION}     ${NC}"
-    echo -e "${CYAN}=========================================${NC}"
-    echo "  1) 查看服务状态       2) 初始化全套部署"
-    echo "  3) 启动 Komari        4) 停止 Komari        5) 重启 Komari"
-    echo "  6) 启动 Sublink Pro   7) 停止 Sublink Pro   8) 重启 Sublink Pro"
-    echo "  9) 启动 CF Tunnel     10) 停止 CF Tunnel    11) 重启 CF Tunnel"
-    echo " 12) 查看 Komari 日志   13) 查看 Sublink 日志 14) 查看 Tunnel 日志"
-    echo " 15) 🔑 修改 CF Token   16) 🗑️ 完全卸载        0) 退出"
-    echo -e "${CYAN}=========================================${NC}"
+    echo -e "${CYAN}=====================================================${NC}"
+    echo -e "${CYAN}       Docker 服务集群统一管理面板 v${SCRIPT_VERSION}         ${NC}"
+    echo -e "${CYAN}=====================================================${NC}"
+    echo -e "  1) 查看集群拓扑状态       2) 🚀 初始化全套集群部署"
+    echo -e " -----------------------------------------------------"
+    echo -e "  3) 🚀 启动 Komari监控     4) ⏸️ 停止 Komari监控     5) 🔄 一键重建 Komari"
+    echo -e "  6) 🚀 启动 Sublink转换    7) ⏸️ 停止 Sublink转换    8) 🔄 一键重建 Sublink"
+    echo -e "  9) 🚀 启动 CF Tunnel      10) ⏸️ 停止 CF Tunnel     11) 🔄 一键重建 Tunnel"
+    echo -e " -----------------------------------------------------"
+    echo -e " 12) 📋 审查 Komari 日志    13) 📋 审查 Sublink 日志  14) 📋 审查 Tunnel 日志"
+    echo -e " -----------------------------------------------------"
+    echo -e " 15) 💾 物理快照数据备份    16) 🔑 修改 CF Tunnel 密钥"
+    echo -e " 17) 🗑️ 完全卸载整个集群    0) 退出控制台"
+    echo -e "${CYAN}=====================================================${NC}"
 }
 
 handle_menu() {
     while true; do
         show_menu
-        read -rp "请输入选项: " choice
+        read -rp "请下达数字操作指令: " choice
         case $choice in
             0) exit 0 ;;
             1) show_status ;;
             2) init_deploy ;;
             3) service_control komari start ;;
             4) service_control komari stop ;;
-            5) service_control komari restart ;;
+            5) service_control komari rebuild ;; # 【修正 2】：菜单指令统一映射到规范的 rebuild 分支
             6) service_control sublinkpro start ;;
             7) service_control sublinkpro stop ;;
-            8) service_control sublinkpro restart ;;
+            8) service_control sublinkpro rebuild ;; # 【修正 2】：映射到 rebuild 分支
             9) service_control cloudflared start ;;
             10) service_control cloudflared stop ;;
-            11) service_control cloudflared restart ;;
+            11) service_control cloudflared rebuild ;; # 【修正 2】：映射到 rebuild 分支
             12) service_control komari logs ;;
             13) service_control sublinkpro logs ;;
             14) service_control cloudflared logs ;;
-            15) get_cf_token ;;
-            16) full_uninstall ;;
-            *) print_error "无效选项" ;;
+            15) backup_data ;;
+            16) get_cf_token ;;
+            17) full_uninstall ;;
+            *) print_error "未知指令，请在 0-17 范围内选择" ;;
         esac
         if [[ ! "$choice" =~ ^(12|13|14)$ ]]; then
-            read -rp "按 Enter 继续..."
+            echo ""
+            read -rp "回车(Enter)返回主菜单面板..."
         fi
     done
 }
@@ -394,15 +461,24 @@ handle_menu() {
 main() {
     check_root
     
-    # 安全的快捷命令安装逻辑：防止 Text file busy 覆盖报错
+    # 安全的快捷命令安装逻辑
     if [[ "$(readlink -f "$0")" != "$INSTALL_PATH" ]]; then
         if [[ ! -f "$INSTALL_PATH" ]]; then
-            print_info "正在为您安装快捷全局命令: docker-manager..."
-            cp "$(readlink -f "$0")" "$INSTALL_PATH"
-            chmod +x "$INSTALL_PATH"
-            print_success "安装成功！后续可在系统任意位置输入 docker-manager 直接管理。"
-        else
-            print_info "检测到系统已有快捷命令，本次跳过安装动作。"
+            print_info "首次运行，正在为您在当前环境中建立全局快捷指令: ${SCRIPT_NAME}..."
+            
+            if [[ "$0" == "bash" || ! -f "$0" ]]; then
+                if ! curl -fsSL https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/KSC-docker.sh -o "$INSTALL_PATH" 2>/dev/null; then
+                    print_warning "由于直连 GitHub 失败，快捷命令文件可能写入不完整，系统已自动转入运行态自克隆方案..."
+                    cp "$(readlink -f "$0")" "$INSTALL_PATH" 2>/dev/null || true
+                fi
+            else
+                cp "$(readlink -f "$0")" "$INSTALL_PATH" 2>/dev/null || true
+            fi
+            
+            if [[ -f "$INSTALL_PATH" ]]; then
+                chmod +x "$INSTALL_PATH"
+                print_success "快捷命令写入成功！后续只需在任何路径输入 [ ${SCRIPT_NAME} ] 即可随时管理服务。"
+            fi
         fi
     fi
     
