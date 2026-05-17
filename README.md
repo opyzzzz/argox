@@ -5,7 +5,10 @@ ufwssh
 `````
 bash <(curl -fsSL https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/ufwssh.sh)
 `````
-
+docker+komari+sublinkpro+cf隧道
+`````
+curl -fsSL https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/KSC-docker.sh | bash
+`````
 komari-cf
 `````
 curl -fsSL https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/komari_cf.sh -o /usr/local/bin/komari && chmod +x /usr/local/bin/komari && komari
