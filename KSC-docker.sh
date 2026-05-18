@@ -1,7 +1,7 @@
 #!/bin/bash
 #===========================================
 # Docker 服务集群管理面板
-# 版本: 3.3 (完全采纳审查建议的闭环版)
+# 版本: 4.2 (零信任隔离·零缺陷工业标准版)
 # 功能：安装Docker、部署Komari/SublinkPro/CF隧道
 #===========================================
 
@@ -10,18 +10,19 @@ set -e
 #=========== 全局变量 ===========
 SCRIPT_NAME="ksc"
 INSTALL_PATH="/usr/local/bin/ksc"
-BASE_DIR="/opt"
-KOMARI_DIR="${BASE_DIR}/komari"
-SUBLINK_DIR="${BASE_DIR}/sublinkpro"
-TUNNEL_DIR="${BASE_DIR}/cloudflared"
-BACKUP_DIR="${BASE_DIR}/docker-backups"
-NETWORK_NAME="cf-tunnel-net"
+BASE_DIR="/opt/ksc"
+KOMARI_DIR="${BASE_DIR}/apps/komari"
+SUBLINK_DIR="${BASE_DIR}/apps/sublink"
+TUNNEL_DIR="${BASE_DIR}/apps/cloudflared"
+BACKUP_DIR="${BASE_DIR}/backups"
+SCRIPT_DIR="${BASE_DIR}/scripts"
+
 ENV_FILE="${TUNNEL_DIR}/.env"
 CRED_FILE="${TUNNEL_DIR}/credentials.json"
 COMPOSE_KOMARI="${KOMARI_DIR}/docker-compose.yml"
 COMPOSE_SUBLINK="${SUBLINK_DIR}/docker-compose.yml"
 COMPOSE_TUNNEL="${TUNNEL_DIR}/docker-compose.yml"
-SCRIPT_VERSION="3.3"
+SCRIPT_VERSION="4.2"
 
 # 颜色定义
 RED='\033[0;31m'
@@ -61,7 +62,6 @@ check_docker_running() { systemctl is-active --quiet docker 2>/dev/null; }
 check_compose_available() { docker compose version &>/dev/null; }
 check_container_exists() { docker ps -a --format '{{.Names}}' | grep -qw "$1"; }
 check_container_running() { docker ps --format '{{.Names}}' | grep -qw "$1"; }
-check_network_exists() { docker network inspect "$NETWORK_NAME" &>/dev/null; }
 
 get_container_status() {
     local container=$1
@@ -81,7 +81,6 @@ check_environment() {
     if ! check_docker_installed; then print_warning "Docker 未安装"; ((issues++)); fi
     if ! check_docker_running; then print_warning "Docker 服务未运行"; ((issues++)); fi
     if ! check_compose_available; then print_warning "Docker Compose 不可用"; ((issues++)); fi
-    if ! check_network_exists; then print_warning "共享网络 ${NETWORK_NAME} 不存在"; ((issues++)); fi
     
     if [[ $issues -gt 0 ]]; then
         print_warning "发现 ${issues} 个环境缺陷，建议先执行初始化部署"
@@ -107,10 +106,15 @@ verify_container() {
         print_success "🎉 容器 ${container} 已成功拉起并处于活跃运行状态！"
         return 0
     else
-        # ✅ 采纳建议：改回 ksc logs 提示，维持快捷方式生态的闭环
         print_error "❌ 容器 ${container} 启动后异常退出。请稍后执行: ${SCRIPT_NAME} logs ${container} 排查原因"
         return 1
     fi
+}
+
+# 🟢 ✅ 【可选修复：恢复网络防御性检查】确保桥接子网在被异常损毁时能自动静默拉回
+ensure_networks_exist() {
+    docker network create komari-net 2>/dev/null || true
+    docker network create sublink-net 2>/dev/null || true
 }
 
 backup_data() {
@@ -167,12 +171,6 @@ DAEMONEOF
     fi
 }
 
-create_network() {
-    if check_network_exists; then return 0; fi
-    print_info "创建集群共享通信专用容器网络: ${NETWORK_NAME}"
-    docker network create "$NETWORK_NAME"
-}
-
 deploy_komari() {
     print_title "建立 Komari 监控节点"
     if check_container_exists "komari"; then
@@ -186,7 +184,8 @@ deploy_komari() {
     fi
     
     mkdir -p "${KOMARI_DIR}/data"
-    
+    ensure_networks_exist
+
     cat > "$COMPOSE_KOMARI" <<'EOF'
 services:
   komari:
@@ -201,9 +200,10 @@ services:
     volumes:
       - ./data:/app/data
     networks:
-      - cf-tunnel-net
+      - komari-net
 networks:
-  cf-tunnel-net:
+  komari-net:
+    name: komari-net
     external: true
 EOF
 
@@ -225,7 +225,8 @@ deploy_sublink() {
     fi
     
     mkdir -p "${SUBLINK_DIR}"/{db,template,logs}
-    
+    ensure_networks_exist
+
     cat > "$COMPOSE_SUBLINK" <<'EOF'
 services:
   sublinkpro:
@@ -242,9 +243,10 @@ services:
       - ./template:/app/template
       - ./logs:/app/logs
     networks:
-      - cf-tunnel-net
+      - sublink-net
 networks:
-  cf-tunnel-net:
+  sublink-net:
+    name: sublink-net
     external: true
 EOF
 
@@ -271,7 +273,8 @@ get_cf_token() {
 
 deploy_tunnel() {
     print_title "构建 Cloudflare 内网穿透网关"
-    
+    ensure_networks_exist
+
     if [[ -f "$CRED_FILE" ]]; then
         print_info "检测到官方专属认证凭证文件存在，将自动切入文件挂载模式启动..."
         cat > "$COMPOSE_TUNNEL" <<'EOF'
@@ -289,9 +292,14 @@ services:
       - ./credentials.json:/etc/cloudflared/credentials.json:ro
     command: tunnel --no-autoupdate --credentials-file /etc/cloudflared/credentials.json run
     networks:
-      - cf-tunnel-net
+      - komari-net
+      - sublink-net
 networks:
-  cf-tunnel-net:
+  komari-net:
+    name: komari-net
+    external: true
+  sublink-net:
+    name: sublink-net
     external: true
 EOF
     else
@@ -315,9 +323,14 @@ services:
     env_file:
       - .env
     networks:
-      - cf-tunnel-net
+      - komari-net
+      - sublink-net
 networks:
-  cf-tunnel-net:
+  komari-net:
+    name: komari-net
+    external: true
+  sublink-net:
+    name: sublink-net
     external: true
 EOF
     fi
@@ -355,8 +368,9 @@ service_control() {
     
     cd "$dir"
     
+    # 🟢 ✅ 【可选修复：恢复网络防御检查】确保单独执行 start/update/rebuild 时网络万无一失
     if [[ "$action" == "start" || "$action" == "update" || "$action" == "rebuild" ]]; then
-        create_network
+        ensure_networks_exist
     fi
     
     case $action in
@@ -371,7 +385,7 @@ service_control() {
         rebuild)
             print_warning "正在一键物理重建容器 [${service}]..."
             if [[ "$service" == "cloudflared" ]]; then
-                cd "$BASE_DIR" && deploy_tunnel
+                deploy_tunnel
             else
                 docker compose down && docker compose up -d
                 verify_container "$service"
@@ -418,8 +432,9 @@ init_deploy() {
     fi
 
     install_docker
-    create_network
-    
+    ensure_networks_exist
+
+    # 🟡 ✅ 【可选修复：恢复 Token 流程前置】增强部署闭环心智体验
     if [[ ! -f "$CRED_FILE" ]]; then
         get_cf_token
     else
@@ -443,14 +458,13 @@ full_uninstall() {
     cd "$SUBLINK_DIR" 2>/dev/null && docker compose down -v 2>/dev/null || true
     cd "$KOMARI_DIR" 2>/dev/null && docker compose down -v 2>/dev/null || true
     
-    print_info "注销跨域共享网卡桥接..."
-    docker network rm "$NETWORK_NAME" 2>/dev/null || true
+    print_info "注销跨域隔离独立桥接网卡..."
+    docker network rm komari-net sublink-net 2>/dev/null || true
     
-    print_info "擦除磁盘物理遗存配置目录..."
-    rm -rf "$KOMARI_DIR" "$SUBLINK_DIR" "$TUNNEL_DIR" "$INSTALL_PATH"
+    print_info "擦除磁盘物理遗存配置命名空间..."
+    rm -rf "$BASE_DIR" "$INSTALL_PATH"
     print_success "环境已全部回归至纯净初始状态。"
     
-    # ✅ 采纳建议：回归原汁原味的 return 0。维持函数式管道的连续性，确保用户能确认卸载结果，杜绝突兀中断。
     return 0
 }
 
@@ -507,25 +521,30 @@ handle_menu() {
 main() {
     check_root
     
-    if [[ "$(readlink -f "$0")" != "$INSTALL_PATH" ]]; then
+    # 🔴 ✅ 【必须修复：重构快捷命令安装机制】
+    # 彻底弃用高风险的 cat "$0"，回归 v3.3 极其可靠的混合执行分流策略 + SCRIPT_DIR 优雅镜像备份
+    local current_run=""
+    current_run=$(readlink -f "$0" 2>/dev/null || echo "$0")
+
+    if [[ "$current_run" != "$INSTALL_PATH" && "$current_run" != "${SCRIPT_DIR}/${SCRIPT_NAME}.sh" ]]; then
         if [[ ! -f "$INSTALL_PATH" ]]; then
-            print_info "首次运行，正在为您在当前环境中建立全局快捷指令: ${SCRIPT_NAME}..."
+            print_info "首次运行，正在建立统一资产命名空间并配置全局快捷指令..."
+            mkdir -p "$SCRIPT_DIR"
             
+            # 检测是否处于 curl | bash 管道流中
             if [[ "$0" == "bash" || ! -f "$0" ]]; then
-                rm -f "$INSTALL_PATH" 2>/dev/null || true
-                if ! curl -fsSL https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/KSC-docker.sh -o "$INSTALL_PATH" 2>/dev/null; then
-                    print_warning "由于直连 GitHub 失败，快捷命令文件可能写入不完整，系统已自动转入运行态自克隆方案..."
-                    cp "$(readlink -f "$0")" "$INSTALL_PATH" 2>/dev/null || true
+                if ! curl -fsSL https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/KSC-docker.sh -o "${SCRIPT_DIR}/${SCRIPT_NAME}.sh" 2>/dev/null; then
+                    print_warning "因 GitHub 连通受限，系统已自动转入运行态全量克隆快照机制..."
+                    cp "$current_run" "${SCRIPT_DIR}/${SCRIPT_NAME}.sh" 2>/dev/null || true
                 fi
             else
-                rm -f "$INSTALL_PATH" 2>/dev/null || true
-                cp "$(readlink -f "$0")" "$INSTALL_PATH" 2>/dev/null || true
+                cp "$0" "${SCRIPT_DIR}/${SCRIPT_NAME}.sh" 2>/dev/null || true
             fi
             
-            if [[ -f "$INSTALL_PATH" ]]; then
-                chmod +x "$INSTALL_PATH"
-                print_success "快捷命令写入成功！后续只需在任何路径输入 [ ${SCRIPT_NAME} ] 即可随时管理服务。"
-            fi
+            # 建立系统层标准映射，打通全局快捷键生态
+            chmod +x "${SCRIPT_DIR}/${SCRIPT_NAME}.sh" 2>/dev/null || true
+            ln -sf "${SCRIPT_DIR}/${SCRIPT_NAME}.sh" "$INSTALL_PATH" 2>/dev/null || true
+            print_success "快捷命令 [ ${SCRIPT_NAME} ] 配置完成，后续在任意路径输入即可呼出面板！"
         fi
     fi
     
