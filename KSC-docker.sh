@@ -1,7 +1,7 @@
 #!/bin/bash
 #===========================================
 # Docker 服务集群管理面板
-# 版本: 3.0 (工业级标准真正完美版)
+# 版本: 3.3 (完全采纳审查建议的闭环版)
 # 功能：安装Docker、部署Komari/SublinkPro/CF隧道
 #===========================================
 
@@ -21,7 +21,7 @@ CRED_FILE="${TUNNEL_DIR}/credentials.json"
 COMPOSE_KOMARI="${KOMARI_DIR}/docker-compose.yml"
 COMPOSE_SUBLINK="${SUBLINK_DIR}/docker-compose.yml"
 COMPOSE_TUNNEL="${TUNNEL_DIR}/docker-compose.yml"
-SCRIPT_VERSION="3.0"
+SCRIPT_VERSION="3.3"
 
 # 颜色定义
 RED='\033[0;31m'
@@ -55,18 +55,13 @@ confirm() {
     [[ "$response" =~ ^[Yy]$ ]]
 }
 
-#=========== 状态检查函数 (【修复问题3】：恢复标准语义契约，移除破坏行为的 || return 0) ===========
-check_container_exists() {
-    docker ps -a --format '{{.Names}}' | grep -qw "$1"
-}
-
-check_container_running() {
-    docker ps --format '{{.Names}}' | grep -qw "$1"
-}
-
-check_network_exists() {
-    docker network inspect "$NETWORK_NAME" &>/dev/null
-}
+#=========== 状态检查函数 ===========
+check_docker_installed() { check_cmd docker; }
+check_docker_running() { systemctl is-active --quiet docker 2>/dev/null; }
+check_compose_available() { docker compose version &>/dev/null; }
+check_container_exists() { docker ps -a --format '{{.Names}}' | grep -qw "$1"; }
+check_container_running() { docker ps --format '{{.Names}}' | grep -qw "$1"; }
+check_network_exists() { docker network inspect "$NETWORK_NAME" &>/dev/null; }
 
 get_container_status() {
     local container=$1
@@ -108,12 +103,12 @@ verify_container() {
     local container=$1
     print_info "等待服务状态就绪..."
     sleep 3
-    # 【修复问题2】：统一调用封装好的契约函数
     if check_container_running "$container"; then
         print_success "🎉 容器 ${container} 已成功拉起并处于活跃运行状态！"
         return 0
     else
-        print_error "❌ 容器 ${container} 启动后异常退出。请稍后执行: docker logs ${container} 排查原因"
+        # ✅ 采纳建议：改回 ksc logs 提示，维持快捷方式生态的闭环
+        print_error "❌ 容器 ${container} 启动后异常退出。请稍后执行: ${SCRIPT_NAME} logs ${container} 排查原因"
         return 1
     fi
 }
@@ -164,9 +159,7 @@ install_docker() {
     "registry-mirrors": [
         "https://docker.1ms.run",
         "https://docker.xuanyuan.me"
-    ],
-    "log-driver": "json-file",
-    "log-opts": { "max-size": "10m", "max-file": "3" }
+    ]
 }
 DAEMONEOF
         systemctl restart docker
@@ -182,7 +175,6 @@ create_network() {
 
 deploy_komari() {
     print_title "建立 Komari 监控节点"
-    # 【修复问题2】：干掉所有内联 docker ps 死代码，改用标准封装函数
     if check_container_exists "komari"; then
         print_warning "检测到本地已存在旧的 Komari 容器"
         if confirm "是否销毁该老容器并以最新镜像重构?"; then
@@ -201,6 +193,11 @@ services:
     image: ghcr.io/komari-monitor/komari:latest
     container_name: komari
     restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
     volumes:
       - ./data:/app/data
     networks:
@@ -217,7 +214,6 @@ EOF
 
 deploy_sublink() {
     print_title "建立 Sublink Pro 订阅转换控制台"
-    # 【修复问题2】：收拢控制管道至统一状态函数
     if check_container_exists "sublinkpro"; then
         print_warning "检测到本地已存在旧的 Sublink Pro 容器"
         if confirm "是否销毁该老容器并以最新镜像重构?"; then
@@ -236,6 +232,11 @@ services:
     image: zerodeng/sublink-pro
     container_name: sublinkpro
     restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
     volumes:
       - ./db:/app/db
       - ./template:/app/template
@@ -279,6 +280,11 @@ services:
     image: cloudflare/cloudflared:latest
     container_name: cloudflared
     restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
     volumes:
       - ./credentials.json:/etc/cloudflared/credentials.json:ro
     command: tunnel --no-autoupdate --credentials-file /etc/cloudflared/credentials.json run
@@ -300,6 +306,11 @@ services:
     image: cloudflare/cloudflared:latest
     container_name: cloudflared
     restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
     command: tunnel --no-autoupdate run
     env_file:
       - .env
@@ -311,7 +322,6 @@ networks:
 EOF
     fi
 
-    # 【修复问题2】：替换内联检查
     if check_container_exists "cloudflared"; then
         docker rm -f cloudflared 2>/dev/null || true
     fi
@@ -376,7 +386,6 @@ service_control() {
             docker compose pull && docker compose up -d 
             ;;
         logs) 
-            # 【修复问题2】：日志查看时也对齐封装函数检查
             if ! check_container_exists "$service"; then
                 print_error "该容器服务尚未实例化，无日志可循"
                 return 1
@@ -411,7 +420,6 @@ init_deploy() {
     install_docker
     create_network
     
-    # 【修复问题4】：优化边缘场景用户体验，若已存在高级 credentials.json 文件，则跳过 Token 输入交互
     if [[ ! -f "$CRED_FILE" ]]; then
         get_cf_token
     else
@@ -442,7 +450,7 @@ full_uninstall() {
     rm -rf "$KOMARI_DIR" "$SUBLINK_DIR" "$TUNNEL_DIR" "$INSTALL_PATH"
     print_success "环境已全部回归至纯净初始状态。"
     
-    # 【修复问题1】：坚决不再强制破坏程序执行状态，使用 return 0 将生命周期交还主菜单循环
+    # ✅ 采纳建议：回归原汁原味的 return 0。维持函数式管道的连续性，确保用户能确认卸载结果，杜绝突兀中断。
     return 0
 }
 
@@ -457,7 +465,7 @@ show_menu() {
     echo -e "  6) 🚀 启动 Sublink转换    7) ⏸️ 停止 Sublink转换    8) 🔄 一键重建 Sublink"
     echo -e "  9) 🚀 启动 CF Tunnel      10) ⏸️ 停止 CF Tunnel     11) 🔄 一键重建 Tunnel"
     echo -e " -----------------------------------------------------"
-    echo -e " 12) 📋 审查 Komari 日志    13) 📋 审查 Sublink 日志  14) 📋 审查 Tunnel 日志"
+    echo -e "  12) 📋 审查 Komari 日志    13) 📋 审查 Sublink 日志  14) 📋 审查 Tunnel 日志"
     echo -e " -----------------------------------------------------"
     echo -e " 15) 💾 物理快照数据备份    16) 🔑 修改 CF Tunnel 密钥"
     echo -e " 17) 🗑️ 完全卸载整个集群    0) 退出控制台"
