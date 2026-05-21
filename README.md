@@ -20,7 +20,7 @@ curl -fsSL https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/uufw.
 
 dns
 `````
-wget -qO- https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/dns.sh | sh
+curl -fsSL https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/smart_dns.sh -o smart_dns.sh && chmod +x smart_dns.sh && ./smart_dns.sh && rm -f smart_dns.sh
 `````
 
 dnsplus-DOT
