@@ -1,10 +1,9 @@
 #!/bin/sh
-# 上方特意使用 /bin/sh 确保 Alpine 与 Debian 极简环境的绝对兼容性
 
 # ==============================================================================
 # 脚本名称: smart_dns.sh
-# 描述: 智能自适应网络接管 DNS 脚本（支持 Debian / Alpine）
-# 特点: 自动探测【纯IPv4 / 纯IPv6 / 双栈】，按需写入，无 chattr 锁，防 DHCP 篡改
+# 描述: 智能自适应网络接管 DNS 脚本（完美兼容 Debian / Alpine 纯净及容器环境）
+# 特点: 自动探测【纯IPv4/纯IPv6/双栈】，动态按需分配，零阻塞，无 chattr 强锁
 # ==============================================================================
 
 # 严格模式：出错即退出
@@ -29,38 +28,44 @@ elif [ -f /etc/debian_version ]; then
 fi
 echo "[信息] 检测到当前操作系统: $SYSTEM"
 
-# 3. 网络环境动态探测（核心改进：拒绝盲目写入）
+# 3. 网络环境动态探测（修复：针对 set -e 做了安全隔离，适配 Alpine ping）
 HAS_IPV4=0
-# 尝试连接 Cloudflare 的 IPv4 DNS（仅测试底层连接，不依赖域名解析）
-if ping -c 1 -W 2 1.1.1.1 >/dev/null 2>&1; then
+HAS_IPV6=0
+
+echo "[配置] 正在探测网络出站能力，请稍候..."
+
+# 探测 IPv4
+if ping -c 1 -w 2 1.1.1.1 >/dev/null 2>&1; then
     HAS_IPV4=1
 fi
 
-HAS_IPV6=0
-# 尝试连接 Cloudflare 的 IPv6 DNS 节点（仅测试底层连接，不依赖域名解析）
-# 在某些环境中 ping6 可能不存在，改用 ping -6 命令做兼容性适配
+# 探测 IPv6 (安全隔离，防止因 ping 失败直接触发 set -e 导致脚本闪退)
+set +e
 if command -v ping6 >/dev/null 2>&1; then
-    if ping6 -c 1 -W 2 2606:4700:4700::1111 >/dev/null 2>&1; then
+    if ping6 -c 1 -w 2 2606:4700:4700::1111 >/dev/null 2>&1; then
         HAS_IPV6=1
     fi
-elif ping -6 -c 1 -W 2 2606:4700:4700::1111 >/dev/null 2>&1; then
-    HAS_IPV6=1
+else
+    if ping -6 -c 1 -w 2 2606:4700:4700::1111 >/dev/null 2>&1; then
+        HAS_IPV6=1
+    fi
 fi
+set -e # 恢复严格模式
 
 # 打印检测到的网络架构
 if [ $HAS_IPV4 -eq 1 ] && [ $HAS_IPV6 -eq 1 ]; then
-    echo "[网络] 检测结果: 双方双栈网络 (IPv4 + IPv6)"
+    echo "[网络] 检测结果: 原生双栈网络 (IPv4 + IPv6)"
 elif [ $HAS_IPV4 -eq 1 ]; then
     echo "[网络] 检测结果: 纯 IPv4 网络 (不带 IPv6)"
 elif [ $HAS_IPV6 -eq 1 ]; then
     echo "[网络] 检测结果: 纯 IPv6 网络 (不带 IPv4)"
 else
-    echo "[警告] 未检测到有效的公网出站路由，将默认采用双栈 DNS 配置！"
+    echo "[警告] 未检测到公网有效路由，为防止断网，默认启用双栈 DNS 配置！"
     HAS_IPV4=1
     HAS_IPV6=1
 fi
 
-# 4. 彻底解除旧脚本遗留的底层 chattr 文件锁（防止后续流程无法写入）
+# 4. 彻底解除可能存在的底层 chattr 文件锁（防止文件无法写入）
 if command -v chattr >/dev/null 2>&1; then
     if [ -f /etc/resolv.conf ]; then
         chattr -i /etc/resolv.conf 2>/dev/null || true
@@ -74,19 +79,21 @@ if [ -L /etc/resolv.conf ]; then
 fi
 
 # ==============================================================================
-# 核心逻辑：分系统配置原生网络组件，从根源防止 DHCP / NetworkManager 篡改
+# 核心逻辑：分系统配置原生网络组件，防止被 DHCP / 网络管理器篡改覆盖
 # ==============================================================================
 
 if [ "$SYSTEM" = "debian" ]; then
     echo "[配置] 正在优化 Debian 网络管理服务..."
 
-    # 1) 彻底停用并禁用 systemd-resolved 冲突服务
-    if systemctl is-enabled systemd-resolved >/dev/null 2>&1 || systemctl is-active systemd-resolved >/dev/null 2>&1; then
-        echo " -> 正在关闭并禁用 systemd-resolved 服务..."
-        systemctl disable --now systemd-resolved 2>/dev/null || true
+    # 1) 彻底停用并禁用 systemd-resolved 冲突服务（增加 systemctl 存在性检查）
+    if command -v systemctl >/dev/null 2>&1; then
+        if systemctl is-enabled systemd-resolved >/dev/null 2>&1 || systemctl is-active systemd-resolved >/dev/null 2>&1; then
+            echo " -> 正在关闭并禁用 systemd-resolved 服务..."
+            systemctl disable --now systemd-resolved 2>/dev/null || true
+        fi
     fi
 
-    # 2) 阻止 NetworkManager 篡改 DNS
+    # 2) 阻止 NetworkManager 篡改 DNS（修复：移除不兼容 Alpine 的 echo -e，改用 printf）
     if [ -d /etc/NetworkManager ]; then
         NM_CONF="/etc/NetworkManager/NetworkManager.conf"
         if [ -f "$NM_CONF" ]; then
@@ -95,10 +102,10 @@ if [ "$SYSTEM" = "debian" ]; then
                 sed -i '/^dns=/d' "$NM_CONF"
                 sed -i '/\[main\]/a dns=none' "$NM_CONF"
             else
-                echo -e "[main]\ndns=none" >> "$NM_CONF"
+                printf "[main]\ndns=none\n" >> "$NM_CONF"
             fi
-            # 异步重启 NetworkManager 防止当前 SSH 终端瞬间中断卡死
-            if pgrep NetworkManager >/dev/null 2>&1; then
+            # 异步重启 NetworkManager（增加环境安全校验）
+            if command -v systemctl >/dev/null 2>&1 && pgrep NetworkManager >/dev/null 2>&1; then
                 systemctl restart NetworkManager >/dev/null 2>&1 &
             fi
         fi
@@ -111,7 +118,7 @@ if [ "$SYSTEM" = "debian" ]; then
             echo " -> 配置 dhclient 原生属性限制 DHCP 篡改..."
             sed -i '/supersede domain-name-servers/d' "$DHCLIENT_CONF"
             
-            # 根据前述网络探测结果，优雅按需生成限制行
+            # 根据前述网络探测结果，动态精确生成限制行
             if [ $HAS_IPV4 -eq 1 ] && [ $HAS_IPV6 -eq 1 ]; then
                 echo "supersede domain-name-servers 8.8.8.8, 1.1.1.1, 2001:4860:4860::8888, 2001:4860:4860::8844;" >> "$DHCLIENT_CONF"
             elif [ $HAS_IPV4 -eq 1 ]; then
@@ -120,14 +127,14 @@ if [ "$SYSTEM" = "debian" ]; then
                 echo "supersede domain-name-servers 2001:4860:4860::8888, 2001:4860:4860::8844;" >> "$DHCLIENT_CONF"
             fi
         fi
-        # 清理可能残留的旧防篡改钩子脚本（防止发生内部死锁）
+        # 清理可能残留的旧防篡改钩子脚本
         rm -f /etc/dhcp/dhclient-enter-hooks.d/nodnsupdate
     fi
 
 elif [ "$SYSTEM" = "alpine" ]; then
     echo "[配置] 正在优化 Alpine 网络管理服务..."
 
-    # 1) 阻止 udhcpc 篡改 DNS (Alpine 默认的 DHCP 客户端)
+    # 1) 阻止 udhcpc 篡改 DNS (Alpine 的默认 DHCP 客户端)
     if [ -f /etc/udhcpc/udhcpc.conf ]; then
         sed -i '/^RESOLV_CONF=/d' /etc/udhcpc/udhcpc.conf
         echo 'RESOLV_CONF="no"' >> /etc/udhcpc/udhcpc.conf
@@ -142,18 +149,18 @@ else
 fi
 
 # ==============================================================================
-# 根据探测结果，动态精确写入 /etc/resolv.conf
+# 动态精确写入 /etc/resolv.conf
 # ==============================================================================
 echo "[配置] 正在按需写入最精确的系统 DNS..."
 
-# 先生成文件头部说明
+# 清空并生成文件头部说明
 cat > /etc/resolv.conf << 'EOF'
 # ====================================================================
 #  DNS Configuration - Managed Naturally, Dynamically & Safely
 # ====================================================================
 EOF
 
-# 按需追加 nameserver
+# 按探测结果动态追加
 if [ $HAS_IPV4 -eq 1 ]; then
     echo "nameserver 8.8.8.8" >> /etc/resolv.conf
     echo "nameserver 1.1.1.1" >> /etc/resolv.conf
@@ -169,16 +176,16 @@ cat >> /etc/resolv.conf << 'EOF'
 options timeout:2 attempts:3 rotate
 EOF
 
-# 优雅设置只读权限（普通 444 权限，允许所有核心读取，防外部胡乱覆盖，无需强锁）
+# 设置安全的系统可读权限（允许读取，限制外部乱改）
 chmod 444 /etc/resolv.conf
 
 echo ""
 echo "=========================================="
-echo "    ✔ 智能 DNS 安全接管配置已全部完成！"
+echo "    ✔ 智能自适应 DNS 接管配置已全部完成！"
 echo "=========================================="
 echo "当前 VPS 有效 DNS 状态:"
 echo "------------------------------------------"
 cat /etc/resolv.conf
 echo "------------------------------------------"
-echo "[提示] 建议执行重启命令使您的节点无缝同步新网络环境。"
+echo "[提示] 建议重启一次节点服务以无缝同步新网络环境。"
 echo "=========================================="
