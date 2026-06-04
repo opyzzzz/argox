@@ -1,10 +1,10 @@
 #!/bin/sh
 #==================================================
-# SmartDNS 智能部署脚本 v5.4 (LTS生产版)
+# SmartDNS 智能部署脚本 v5.5 (LTS生产版)
 # 上游: 纯 DoH + DoT (无传统UDP)
 # 策略: GitHub最新版优先 -> 包管理器备用
 # 守护: inotify实时保护 resolv.conf (fallback cron)
-# 修复: 竞态条件、BusyBox细节兼容、安全权限、卸载清理
+# 修复: 下载前自动覆写公网DNS、BusyBox深度兼容
 # 兼容: Alpine/Debian/Ubuntu (LXC/KVM/NAT/Docker)
 # 更新: 2026-06-05
 #==================================================
@@ -36,7 +36,6 @@ cleanup_stale_lock() {
     if [ -d "$LOCK_FILE.dir" ]; then
         local lock_mtime now age
         lock_mtime=$(stat -c%Y "$LOCK_FILE.dir" 2>/dev/null || stat -f%m "$LOCK_FILE.dir" 2>/dev/null || echo 0)
-        # date +%s fallback: awk srand() 近似时间戳
         now=$(date +%s 2>/dev/null || awk 'BEGIN{srand(); print srand()}' 2>/dev/null || echo 0)
         age=$((now - lock_mtime))
         if [ "$age" -gt 1800 ] || [ "$age" -lt 0 ]; then
@@ -111,13 +110,11 @@ nslookup_with_timeout() {
     if command -v timeout >/dev/null 2>&1; then
         timeout "$timeout_sec" nslookup "$@" 2>/dev/null
     else
-        # 后台执行 + 超时杀手（带竞态保护）
         nslookup "$@" 2>/dev/null &
         local pid=$!
         ( sleep "$timeout_sec" && kill $pid 2>/dev/null ) &
         local killer=$!
         wait $pid 2>/dev/null
-        # nslookup 完成，取消超时杀手并回收
         kill $killer 2>/dev/null
         wait $killer 2>/dev/null
     fi
@@ -137,7 +134,7 @@ if [ "${1:-}" = "--uninstall" ] || [ "${1:-}" = "-u" ]; then
         INIT="none"
     fi
     
-    # 读取端口信息（awk 兼容 BusyBox）
+    # 读取端口信息
     PORT=53
     if [ -f /etc/smartdns/smartdns.conf ]; then
         PORT=$(awk '/^bind/{for(i=1;i<=NF;i++) if($i~/:([[:digit:]]+)/){split($i,a,":"); print a[length(a)]; exit}}' /etc/smartdns/smartdns.conf 2>/dev/null)
@@ -184,7 +181,7 @@ if [ "${1:-}" = "--uninstall" ] || [ "${1:-}" = "-u" ]; then
     kill_process "smartdns"
     sleep 1
     
-    # 清理 iptables（先带comment后不带）
+    # 清理 iptables
     for proto in udp tcp; do
         iptables -t nat -D OUTPUT -p $proto --dport 53 -j REDIRECT --to-port "$PORT" -m comment --comment "SmartDNS-redirect" 2>/dev/null
         iptables -t nat -D OUTPUT -p $proto --dport 53 -j REDIRECT --to-port "$PORT" 2>/dev/null
@@ -236,6 +233,7 @@ EOF
     rm -f /usr/local/bin/resolv-check.sh
     rm -f /etc/resolv.conf.smartdns.bak
     rm -f /etc/resolv.conf.link.bak
+    rm -f /etc/resolv.conf.bak.pre-install
     
     rm -f /usr/bin/smartdns /usr/sbin/smartdns /usr/local/bin/smartdns
     rm -rf /etc/smartdns
@@ -384,11 +382,9 @@ else
 fi
 log_info "虚拟化: $VIRT"
 
-# IPv6 检测（增加容器 fallback）
 HAS_IPV6=false
 HAS_IPV4=true
 ip route get 2606:4700:4700::1111 >/dev/null 2>&1 && HAS_IPV6=true
-# 容器 fallback: 检查 /proc/net/if_inet6
 if [ "$HAS_IPV6" = false ] && [ -f /proc/net/if_inet6 ] && [ -s /proc/net/if_inet6 ]; then
     HAS_IPV6=true
     log_info "通过 /proc/net/if_inet6 检测到 IPv6 支持（容器环境）"
@@ -413,7 +409,25 @@ if [ -n "$LOG_SPACE" ] && [ "$LOG_SPACE" -lt 5120 ]; then
 fi
 
 #==================================================
-# 第2步: 安装 SmartDNS
+# 第2步: 确保下载前 DNS 可用
+#==================================================
+log_step "确保 DNS 可用"
+
+if [ -f /etc/resolv.conf ] && ! grep -q "127.0.0.1" /etc/resolv.conf 2>/dev/null; then
+    log_ok "DNS 已是公网配置"
+else
+    [ -f /etc/resolv.conf ] && cp /etc/resolv.conf /etc/resolv.conf.bak.pre-install 2>/dev/null
+    cat > /etc/resolv.conf << 'EOF'
+nameserver 1.1.1.1
+nameserver 8.8.8.8
+nameserver 2606:4700:4700::1111
+nameserver 2001:4860:4860::8888
+EOF
+    log_info "已临时设置公网 DNS 用于下载"
+fi
+
+#==================================================
+# 第3步: 安装 SmartDNS
 #==================================================
 log_step "安装 SmartDNS"
 
@@ -493,7 +507,7 @@ else
 fi
 
 #==================================================
-# 第3步: 准备环境和工具
+# 第4步: 准备环境和工具
 #==================================================
 log_step "准备环境"
 
@@ -515,21 +529,18 @@ if [ "$INIT" = "systemd" ]; then
     fi
 fi
 
-# 选择端口 - 检查是否 SmartDNS 自身占用（ss → lsof → pid 文件 三级 fallback）
+# 选择端口
 PORT=53
 USE_IPTABLES=false
 is_smartdns_port() {
-    # 第一级: ss 检测
     if ss -tulnp 2>/dev/null | grep ":53 " | grep -q smartdns 2>/dev/null; then
         return 0
     fi
-    # 第二级: lsof 检测
     if command -v lsof >/dev/null 2>&1; then
         if lsof -i :53 2>/dev/null | grep -q smartdns; then
             return 0
         fi
     fi
-    # 第三级: pid 文件检测
     if [ -f /run/smartdns.pid ]; then
         local pid
         pid=$(cat /run/smartdns.pid 2>/dev/null)
@@ -564,7 +575,7 @@ else
 fi
 
 #==================================================
-# 第4步: 生成配置
+# 第5步: 生成配置
 #==================================================
 log_step "生成配置 (纯 DoH + DoT)"
 
@@ -574,7 +585,7 @@ mkdir -p /etc/smartdns
 
 cat > /etc/smartdns/smartdns.conf << EOF
 #==========================================
-# SmartDNS 配置 v5.4 (LTS生产版)
+# SmartDNS 配置 v5.5 (LTS生产版)
 # 上游: DoH + DoT (无传统 UDP)
 # 版本: $SMARTDNS_VER | 来源: $SMARTDNS_SOURCE
 # 时间: $(date '+%Y-%m-%d %H:%M:%S')
@@ -684,16 +695,22 @@ fi
 echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 
 #==================================================
-# 第5步: 配置系统 DNS
+# 第6步: 配置系统 DNS
 #==================================================
 log_step "配置系统 DNS"
 
-# 5.1 备份
+# 6.1 清理预安装备份
+if [ -f /etc/resolv.conf.bak.pre-install ]; then
+    log_info "清理下载前 DNS 备份"
+    rm -f /etc/resolv.conf.bak.pre-install
+fi
+
+# 6.2 备份当前 resolv.conf
 if [ -f /etc/resolv.conf ] && [ ! -L /etc/resolv.conf ]; then
     cp /etc/resolv.conf /etc/resolv.conf.bak.$(date +%Y%m%d-%H%M%S) 2>/dev/null
 fi
 
-# 5.2 处理符号链接（重试最多3次，每次间隔2秒）
+# 6.3 处理符号链接
 if [ -L /etc/resolv.conf ]; then
     log_info "检测到 /etc/resolv.conf 为符号链接"
     cp /etc/resolv.conf /etc/resolv.conf.link.bak 2>/dev/null
@@ -717,14 +734,14 @@ if [ -L /etc/resolv.conf ]; then
     fi
 fi
 
-# 5.3 检测容器挂载点
+# 6.4 检测容器挂载点
 if [ "$USE_IPTABLES" = false ] && mount 2>/dev/null | grep -q "on /etc/resolv.conf "; then
     log_warn "检测到 /etc/resolv.conf 为挂载点（容器环境）"
     log_info "将使用 iptables redirect 方案"
     USE_IPTABLES=true
 fi
 
-# 5.4 测试 ::1 连通性
+# 6.5 测试 ::1 连通性
 IPV6_LOOPBACK_OK=false
 if [ "$HAS_IPV6" = true ]; then
     log_info "测试 ::1 连通性..."
@@ -736,7 +753,7 @@ if [ "$HAS_IPV6" = true ]; then
     fi
 fi
 
-# 5.5 写入 resolv.conf（含安全权限）
+# 6.6 写入 resolv.conf
 if [ "$USE_IPTABLES" = false ]; then
     cat > /etc/resolv.conf << EOF
 nameserver 127.0.0.1
@@ -749,11 +766,10 @@ EOF
     cp /etc/resolv.conf /etc/resolv.conf.smartdns.bak
     chmod 600 /etc/resolv.conf.smartdns.bak
     log_ok "系统 DNS -> 127.0.0.1$( $IPV6_LOOPBACK_OK && echo ' + ::1' )"
-else
-    log_info "跳过直接写入 resolv.conf，依赖 iptables redirect"
+else    log_info "跳过直接写入 resolv.conf，依赖 iptables redirect"
 fi
 
-# 5.6 DHCP 客户端
+# 6.7 DHCP 客户端
 if [ -f /etc/dhcpcd.conf ] && ! grep -q "nohook resolv.conf" /etc/dhcpcd.conf; then
     echo "" >> /etc/dhcpcd.conf
     echo "# SmartDNS - 禁止 DHCP 修改 DNS" >> /etc/dhcpcd.conf
@@ -761,14 +777,14 @@ if [ -f /etc/dhcpcd.conf ] && ! grep -q "nohook resolv.conf" /etc/dhcpcd.conf; t
     log_info "已配置 dhcpcd 不覆盖 DNS"
 fi
 
-# 5.7 Alpine udhcpc
+# 6.8 Alpine udhcpc
 if [ -d /etc/udhcpc ] || [ -f /etc/alpine-release ]; then
     mkdir -p /etc/udhcpc
     echo 'RESOLV_CONF="NO"' > /etc/udhcpc/udhcpc.conf
     log_info "已配置 udhcpc 不覆盖 DNS"
 fi
 
-# 5.8 NetworkManager
+# 6.9 NetworkManager
 if command -v NetworkManager >/dev/null 2>&1; then
     log_info "检测到 NetworkManager"
     if command -v nmcli >/dev/null 2>&1; then
@@ -788,7 +804,7 @@ EOF
     fi
 fi
 
-# 5.9 iptables redirect
+# 6.10 iptables redirect
 if [ "$USE_IPTABLES" = true ] || [ "$PORT" != "53" ]; then
     log_step "配置 iptables redirect"
     
@@ -797,7 +813,6 @@ if [ "$USE_IPTABLES" = true ] || [ "$PORT" != "53" ]; then
         apt) apt-get install -y -qq iptables 2>/dev/null ;;
     esac
     
-    # IPv4（带comment fallback）
     for proto in udp tcp; do
         if ! iptables -t nat -C OUTPUT -p $proto --dport 53 -j REDIRECT --to-port "$PORT" 2>/dev/null; then
             iptables -t nat -A OUTPUT -p $proto --dport 53 -j REDIRECT --to-port "$PORT" -m comment --comment "SmartDNS-redirect" 2>/dev/null || \
@@ -806,7 +821,6 @@ if [ "$USE_IPTABLES" = true ] || [ "$PORT" != "53" ]; then
         fi
     done
     
-    # IPv6
     if [ "$IPV6_LOOPBACK_OK" = true ] || [ "$HAS_IPV6" = true ]; then
         if command -v ip6tables >/dev/null 2>&1; then
             for proto in udp tcp; do
@@ -819,7 +833,6 @@ if [ "$USE_IPTABLES" = true ] || [ "$PORT" != "53" ]; then
         fi
     fi
     
-    # 持久化
     mkdir -p /etc/iptables
     case "$PKG_MGR" in
         apk)
@@ -842,17 +855,17 @@ if [ "$USE_IPTABLES" = true ] || [ "$PORT" != "53" ]; then
 fi
 
 #==================================================
-# 第6步: 部署 resolv.conf 守护
+# 第7步: 部署 resolv.conf 守护
 #==================================================
 log_step "部署 resolv.conf 守护"
 
 GUARD_MODE=$(ensure_inotify)
 mkdir -p /usr/local/bin
 
-# 6.1 创建守护脚本
+# 7.1 创建守护脚本
 cat > /usr/local/bin/resolv-guard.sh << 'GUARDEOF'
 #!/bin/sh
-# SmartDNS resolv.conf 实时守护 v5.4
+# SmartDNS resolv.conf 实时守护 v5.5
 
 BAK="/etc/resolv.conf.smartdns.bak"
 CONF="/etc/resolv.conf"
@@ -864,7 +877,6 @@ get_size() {
 }
 
 files_differ() {
-    # 返回0表示不同，1表示相同
     [ "$(get_size "$1")" != "$(get_size "$2")" ] && return 0
     
     if command -v cmp >/dev/null 2>&1; then
@@ -897,11 +909,11 @@ log_rotate() {
     fi
 }
 
-# 避免重复运行（pidof → pgrep -f 精确匹配 → ps 兜底）
+# 避免重复运行
 if command -v pidof >/dev/null 2>&1; then
     pidof -o $$ "resolv-guard.sh" >/dev/null 2>&1 && exit 0
 elif command -v pgrep >/dev/null 2>&1; then
-    pgrep -f "^/bin/sh.*resolv-guard\.sh" | grep -v $$ | grep -q . 2>/dev/null && exit 0
+    pgrep -f "resolv-guard\.sh" | grep -v $$ | grep -q . 2>/dev/null && exit 0
 else
     ps | grep "resolv-guard\.sh" | grep -v grep | grep -v $$ | grep -q . && exit 0
 fi
@@ -916,7 +928,6 @@ last_hour=""
 recovery_count=0
 error_count=0
 
-# 等待目录存在
 while [ ! -d "$(dirname "$CONF")" ]; do
     sleep 2
     error_count=$((error_count + 1))
@@ -967,7 +978,7 @@ GUARDEOF
 
 chmod 700 /usr/local/bin/resolv-guard.sh
 
-# 6.2 注册服务
+# 7.2 注册服务
 case "$INIT" in
     systemd)
         cat > /etc/systemd/system/resolv-guard.service << EOF
@@ -1015,7 +1026,7 @@ EOF
         ;;
 esac
 
-# 6.3 fallback cron
+# 7.3 fallback cron
 if [ "$GUARD_MODE" = "cron" ]; then
     log_warn "inotify 不可用，启用 cron fallback（每分钟检查）"
     
@@ -1077,7 +1088,7 @@ CHECKEOF
     log_ok "cron 检查任务已添加"
 fi
 
-# 6.4 验证守护
+# 7.4 验证守护
 sleep 2
 if process_running "resolv-guard.sh"; then
     log_ok "resolv.conf 实时守护已启动"
@@ -1089,7 +1100,7 @@ else
     fi
 fi
 
-# 6.5 Alpine local.d
+# 7.5 Alpine local.d
 if [ "$INIT" = "openrc" ]; then
     mkdir -p /etc/local.d
     cat > /etc/local.d/smartdns-fix.start << 'EOF'
@@ -1106,12 +1117,11 @@ EOF
     rc-update add local default 2>/dev/null
 fi
 
-# 设置守护日志权限（全路径）
 touch /var/log/resolv-guard.log 2>/dev/null && chmod 600 /var/log/resolv-guard.log 2>/dev/null
 [ -f /var/log/resolv-guard.log.old ] && chmod 600 /var/log/resolv-guard.log.old 2>/dev/null
 
 #==================================================
-# 第7步: 启动服务
+# 第8步: 启动服务
 #==================================================
 log_step "启动 SmartDNS"
 
@@ -1178,7 +1188,7 @@ if ! process_running "smartdns"; then
 fi
 
 #==================================================
-# 第8步: 验证
+# 第9步: 验证
 #==================================================
 log_step "验证 DNS 解析"
 
@@ -1218,7 +1228,7 @@ if [ "$IPV6_LOOPBACK_OK" = true ]; then
     fi
 fi
 
-# 加密 DNS 检测（修复 grep \s 兼容性）
+# 加密 DNS 检测
 if [ "$IS_NEW" = true ]; then
     echo ""
     log_step "加密 DNS 连通性检测"
@@ -1274,7 +1284,7 @@ if [ "$IS_NEW" = true ]; then
     fi
 fi
 
-# 守护进程验证（sleep 改为 2 秒兼容 BusyBox）
+# 守护进程验证
 if [ "$GUARD_MODE" = "inotify" ] && [ "$USE_IPTABLES" = false ]; then
     echo ""
     log_step "守护进程验证"
