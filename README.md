@@ -9,9 +9,9 @@ docker+komari+sublinkpro+cf隧道
 `````
 curl -fsSL https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/KSC-docker.sh -o /tmp/ksc.sh && bash /tmp/ksc.sh && rm -f /tmp/ksc.sh
 `````
-komari-cf
+DNS-DEL
 `````
-curl -fsSL https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/komari_cf.sh -o /usr/local/bin/komari && chmod +x /usr/local/bin/komari && komari
+curl -fsSL https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/dns-del.sh | bash
 `````
 uufw防火墙
 `````
