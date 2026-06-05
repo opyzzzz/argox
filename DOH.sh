@@ -1,12 +1,12 @@
 #!/bin/sh
 #==================================================
-# SmartDNS 智能部署脚本 v4.6 (原版 + cron 守护)
-# 上游: 纯 DoH + DoT (无传统UDP)
+# SmartDNS 智能部署脚本 v4.9
+# 上游: 纯 DoH + DoT (IPv4/IPv6 自适应)
 # 策略: GitHub最新版优先 -> 包管理器备用
-# 优化: speed-check适配、工具检测、旧版警告
-# 新增: cron 守护（每分钟检查恢复 resolv.conf）
+# 守护: cron 每分钟检查恢复 resolv.conf
+# 改进: 纯IPv6适配、Alpine/cron备份自适应网络栈
 # 兼容: Alpine/Debian/Ubuntu (LXC/KVM/NAT/Docker)
-# 更新: 2026-06-05
+# 更新: 2026-06-06
 #==================================================
 
 set +e
@@ -58,7 +58,6 @@ if [ "${1:-}" = "--uninstall" ] || [ "${1:-}" = "-u" ]; then
     pkill smartdns 2>/dev/null
     sleep 1
     
-    # 清理 cron
     crontab -l 2>/dev/null | grep -v "resolv-check.sh" | crontab - 2>/dev/null
     rm -f /usr/local/bin/resolv-check.sh
     rm -f /etc/resolv.conf.smartdns.bak
@@ -123,21 +122,17 @@ port_in_use() {
     return 1
 }
 
-# 确保检测工具可用
 ensure_tools() {
     local tools_missing=""
     
-    # 下载工具
     if ! command -v wget >/dev/null 2>&1 && ! command -v curl >/dev/null 2>&1; then
         tools_missing="$tools_missing wget"
     fi
     
-    # 端口检测工具
     if ! command -v ss >/dev/null 2>&1 && ! command -v netstat >/dev/null 2>&1; then
         tools_missing="$tools_missing iproute2"
     fi
     
-    # DNS 测试工具
     if ! command -v nslookup >/dev/null 2>&1; then
         case "$PKG_MGR" in
             apk) tools_missing="$tools_missing bind-tools" ;;
@@ -145,7 +140,6 @@ ensure_tools() {
         esac
     fi
     
-    # DoH/DoT 检测工具
     if ! command -v curl >/dev/null 2>&1; then
         tools_missing="$tools_missing curl"
     fi
@@ -199,12 +193,22 @@ fi
 log_info "虚拟化: $VIRT"
 
 HAS_IPV6=false
+HAS_IPV4=true
 ip route get 2606:4700:4700::1111 >/dev/null 2>&1 && HAS_IPV6=true
+ip route get 1.1.1.1 >/dev/null 2>&1 || HAS_IPV4=false
 BINDV6ONLY=$(sysctl net.ipv6.bindv6only 2>/dev/null | awk '{print $3}')
-log_info "IPv6: $( $HAS_IPV6 && echo '支持' || echo '不支持' )"
+
+if [ "$HAS_IPV4" = true ] && [ "$HAS_IPV6" = true ]; then
+    NETSTACK="双栈"
+elif [ "$HAS_IPV4" = true ]; then
+    NETSTACK="纯IPv4"
+else
+    NETSTACK="纯IPv6"
+fi
+log_info "网络栈: $NETSTACK"
 
 #==================================================
-# 第2步: 安装 SmartDNS（需要网络）
+# 第2步: 安装 SmartDNS
 #==================================================
 log_step "安装 SmartDNS"
 
@@ -227,6 +231,9 @@ if download_file "$GITHUB_URL" "/tmp/smartdns"; then
 fi
 
 if [ -z "$SMARTDNS_BIN" ]; then
+    if [ "$HAS_IPV4" = false ]; then
+        log_warn "纯 IPv6 环境下载失败，尝试包管理器..."
+    fi
     log_warn "GitHub 下载失败，尝试包管理器..."
     case "$PKG_MGR" in
         apk)
@@ -284,10 +291,8 @@ fi
 #==================================================
 log_step "准备环境"
 
-# 确保工具
 ensure_tools
 
-# 处理 systemd-resolved
 if [ "$INIT" = "systemd" ]; then
     if systemctl is-active systemd-resolved >/dev/null 2>&1; then
         log_info "停用 systemd-resolved..."
@@ -299,7 +304,6 @@ if [ "$INIT" = "systemd" ]; then
     fi
 fi
 
-# 选择端口
 PORT=53
 if port_in_use 53; then
     log_warn "端口 53 被占用:"
@@ -324,7 +328,7 @@ fi
 #==================================================
 # 第4步: 生成配置
 #==================================================
-log_step "生成配置 (纯 DoH + DoT)"
+log_step "生成配置 (纯 DoH + DoT, $NETSTACK)"
 
 mkdir -p /etc/smartdns
 [ -f /etc/smartdns/smartdns.conf ] && \
@@ -332,8 +336,8 @@ mkdir -p /etc/smartdns
 
 cat > /etc/smartdns/smartdns.conf << EOF
 #==========================================
-# SmartDNS 配置 v4.6 (cron守护版)
-# 上游: DoH + DoT (无传统 UDP)
+# SmartDNS 配置 v4.9
+# 上游: DoH + DoT ($NETSTACK)
 # 版本: $SMARTDNS_VER | 来源: $SMARTDNS_SOURCE
 # 时间: $(date '+%Y-%m-%d %H:%M:%S')
 #==========================================
@@ -341,7 +345,6 @@ cat > /etc/smartdns/smartdns.conf << EOF
 server-name smartdns
 EOF
 
-# 绑定地址
 if [ "$HAS_IPV6" = true ] && [ "$BINDV6ONLY" = "1" ]; then
     cat >> /etc/smartdns/smartdns.conf << EOF
 bind [::]:${PORT}
@@ -355,18 +358,11 @@ fi
 
 cat >> /etc/smartdns/smartdns.conf << EOF
 
-# 缓存
 cache-size 4096
 prefetch-domain yes
-
-# 日志
 log-level info
 log-file /var/log/smartdns.log
-
-# 响应模式
 response-mode fastest-ip
-
-# TTL
 rr-ttl 300
 rr-ttl-min 60
 EOF
@@ -374,78 +370,79 @@ EOF
 if [ "$IS_NEW" = true ]; then
     cat >> /etc/smartdns/smartdns.conf << 'EOF'
 
-# 过期缓存
 serve-expired yes
-
-# 日志轮转
 log-size 2m
 log-num 2
-
-# 速度检测（优化: 仅检测加密端口）
 speed-check-mode tcp:443,tcp:853
-
-# IPv4 环境
 force-AAAA-SOA yes
-
-# EDNS
 edns-client-subnet
 EOF
 fi
 
-# 上游 DNS
 if [ "$IS_NEW" = true ]; then
-    cat >> /etc/smartdns/smartdns.conf << 'EOF'
+    if [ "$HAS_IPV4" = true ]; then
+        cat >> /etc/smartdns/smartdns.conf << 'EOF'
 
-#==========================================
-# 上游 DNS - 纯加密 (DoH + DoT)
-# 无传统 UDP, 防止 ISP 劫持/监控
-#==========================================
-
-# === DoH (DNS over HTTPS) ===
+# IPv4 DoH
 server-https https://cloudflare-dns.com/dns-query
 server-https https://dns.google/dns-query
 server-https https://dns.quad9.net/dns-query
 
-# === DoT (DNS over TLS) ===
-server-tls 1.1.1.1:853 -host-name cloudflare-dns.com
+# IPv4 DoT
 server-tls 1.0.0.1:853 -host-name cloudflare-dns.com
-server-tls 8.8.8.8:853 -host-name dns.google
 server-tls 8.8.4.4:853 -host-name dns.google
-server-tls 9.9.9.9:853 -host-name dns.quad9.net
 server-tls 149.112.112.112:853 -host-name dns.quad9.net
 EOF
-else
-    # 旧版降级
-    cat >> /etc/smartdns/smartdns.conf << 'EOF'
+    fi
 
-#==========================================
-# 上游 DNS - UDP 降级模式
-# ⚠ 此版本不支持 DoH/DoT
-# 请升级到 GitHub 最新版获得加密支持
-#==========================================
+    if [ "$HAS_IPV6" = true ]; then
+        cat >> /etc/smartdns/smartdns.conf << 'EOF'
+
+# IPv6 DoH
+server-https https://[2606:4700:4700::1111]/dns-query
+server-https https://[2001:4860:4860::8888]/dns-query
+server-https https://[2620:fe::9]/dns-query
+
+# IPv6 DoT
+server-tls 2606:4700:4700::1001:853 -host-name cloudflare-dns.com
+server-tls 2001:4860:4860::8844:853 -host-name dns.google
+server-tls 2620:fe::fe:853 -host-name dns.quad9.net
+EOF
+    fi
+else
+    cat >> /etc/smartdns/smartdns.conf << EOF
 
 server 1.1.1.1
 server 8.8.8.8
 server 9.9.9.9
+EOF
+    if [ "$HAS_IPV6" = true ]; then
+        cat >> /etc/smartdns/smartdns.conf << EOF
 server 2606:4700:4700::1111
 server 2001:4860:4860::8888
 server 2620:fe::9
 EOF
+    fi
 fi
 
 log_ok "配置已生成"
 
 echo ""
 echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${BOLD}  上游 DNS 配置${NC}"
+echo -e "${BOLD}  上游 DNS 配置 ($NETSTACK)${NC}"
 echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 if [ "$IS_NEW" = true ]; then
-    echo -e "  ${GREEN}DoH (3):${NC} Cloudflare, Google, Quad9"
-    echo -e "  ${GREEN}DoT (6):${NC} Cloudflare×2, Google×2, Quad9×2"
+    if [ "$HAS_IPV4" = true ]; then
+        echo -e "  ${GREEN}IPv4 DoH (3):${NC} Cloudflare Google Quad9"
+        echo -e "  ${GREEN}IPv4 DoT (3):${NC} Cloudflare Google Quad9"
+    fi
+    if [ "$HAS_IPV6" = true ]; then
+        echo -e "  ${GREEN}IPv6 DoH (3):${NC} Cloudflare Google Quad9"
+        echo -e "  ${GREEN}IPv6 DoT (3):${NC} Cloudflare Google Quad9"
+    fi
     echo -e "  ${RED}UDP:${NC}  无 (纯加密)"
 else
-    echo -e "  ${YELLOW}UDP (6):${NC} Cloudflare, Google, Quad9 (+IPv6)"
-    echo -e "  ${RED}DoH/DoT:${NC} 不支持 (旧版)"
+    echo -e "  ${YELLOW}UDP:${NC} 旧版降级模式"
 fi
 echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 
@@ -458,14 +455,16 @@ log_step "配置系统 DNS"
     cp /etc/resolv.conf /etc/resolv.conf.bak.$(date +%Y%m%d-%H%M%S) 2>/dev/null
 
 chattr -i /etc/resolv.conf 2>/dev/null
-cat > /etc/resolv.conf << 'EOF'
-nameserver 127.0.0.1
-nameserver ::1
-options edns0 trust-ad
-EOF
+> /etc/resolv.conf
+if [ "$HAS_IPV4" = true ]; then
+    echo "nameserver 127.0.0.1" >> /etc/resolv.conf
+fi
+if [ "$HAS_IPV6" = true ]; then
+    echo "nameserver ::1" >> /etc/resolv.conf
+fi
+echo "options edns0 trust-ad" >> /etc/resolv.conf
 chattr +i /etc/resolv.conf 2>/dev/null || log_warn "无法锁定 (容器环境正常)"
 
-# 创建守护备份
 cp /etc/resolv.conf /etc/resolv.conf.smartdns.bak 2>/dev/null
 chmod 600 /etc/resolv.conf.smartdns.bak 2>/dev/null
 
@@ -476,18 +475,18 @@ chmod 600 /etc/resolv.conf.smartdns.bak 2>/dev/null
     rc-service dhcpcd restart 2>/dev/null
 }
 
-log_ok "系统 DNS -> 127.0.0.1"
+log_ok "系统 DNS -> 127.0.0.1$( $HAS_IPV6 && echo ' + ::1' )"
 
 #==================================================
 # 第6步: Alpine 开机自启
 #==================================================
 if [ "$INIT" = "openrc" ]; then
     mkdir -p /etc/local.d
-    cat > /etc/local.d/smartdns-fix.start << 'EOF'
+    cat > /etc/local.d/smartdns-fix.start << EOF
 #!/bin/sh
 sleep 3
 chattr -i /etc/resolv.conf 2>/dev/null
-cat > /etc/resolv.conf << 'INNEREOF'
+cat > /etc/resolv.conf << INNEREOF
 nameserver 127.0.0.1
 nameserver ::1
 options edns0 trust-ad
@@ -500,43 +499,37 @@ EOF
 fi
 
 #==================================================
-# 第6.5步: 部署 cron 守护（全系统通用）
+# 第7步: cron 守护
 #==================================================
 log_step "部署 cron 守护"
 
-cat > /usr/local/bin/resolv-check.sh << 'EOF'
+cat > /usr/local/bin/resolv-check.sh << EOF
 #!/bin/sh
-# SmartDNS resolv.conf cron 守护
-
 BAK="/etc/resolv.conf.smartdns.bak"
 CONF="/etc/resolv.conf"
 
-# 首次运行创建备份
-if [ ! -f "$BAK" ]; then
-    cat > "$BAK" << 'INNER'
+if [ ! -f "\$BAK" ]; then
+    cat > "\$BAK" << INNER
 nameserver 127.0.0.1
 nameserver ::1
 options edns0 trust-ad
 INNER
-    chmod 600 "$BAK"
+    chmod 600 "\$BAK"
 fi
 
-# 检查并恢复
-if ! cmp -s "$BAK" "$CONF" 2>/dev/null; then
-    chattr -i "$CONF" 2>/dev/null
-    cp "$BAK" "$CONF"
-    chattr +i "$CONF" 2>/dev/null
+if ! cmp -s "\$BAK" "\$CONF" 2>/dev/null; then
+    chattr -i "\$CONF" 2>/dev/null
+    cp "\$BAK" "\$CONF"
+    chattr +i "\$CONF" 2>/dev/null
 fi
 EOF
 
 chmod 700 /usr/local/bin/resolv-check.sh
-
-# 添加 crontab
 (crontab -l 2>/dev/null | grep -v "resolv-check.sh"; echo "* * * * * /usr/local/bin/resolv-check.sh") | crontab -
-log_ok "cron 守护已添加（每分钟检查）"
+log_ok "cron 守护已添加"
 
 #==================================================
-# 第7步: 启动服务
+# 第8步: 启动服务
 #==================================================
 log_step "启动 SmartDNS"
 
@@ -602,7 +595,7 @@ if ! pgrep smartdns >/dev/null 2>&1; then
 fi
 
 #==================================================
-# 第8步: 验证
+# 第9步: 验证
 #==================================================
 log_step "验证 DNS 解析"
 
@@ -610,7 +603,12 @@ sleep 2
 ALL_OK=true
 
 echo ""
-for domain in google.com github.com cloudflare.com; do
+for domain in google.com ipv6.google.com cloudflare.com; do
+    if [ "$domain" = "ipv6.google.com" ] && [ "$HAS_IPV6" = false ]; then
+        log_info "ipv6.google.com 跳过（无 IPv6）"
+        continue
+    fi
+    
     if [ "$PORT" = "53" ]; then
         RESULT=$(nslookup -timeout=5 $domain 127.0.0.1 2>&1)
     else
@@ -626,12 +624,10 @@ for domain in google.com github.com cloudflare.com; do
     fi
 done
 
-# 加密 DNS 检测
 if [ "$IS_NEW" = true ]; then
     echo ""
     log_step "加密 DNS 连通性检测"
     
-    # DoH
     echo -e "${BOLD}DoH (DNS over HTTPS):${NC}"
     for item in "Cloudflare|https://cloudflare-dns.com/dns-query" "Google|https://dns.google/dns-query" "Quad9|https://dns.quad9.net/dns-query"; do
         NAME="${item%%|*}"
@@ -647,7 +643,6 @@ if [ "$IS_NEW" = true ]; then
         fi
     done
     
-    # DoT
     echo ""
     echo -e "${BOLD}DoT (DNS over TLS):${NC}"
     for item in "Cloudflare|1.1.1.1|853" "Google|8.8.8.8|853" "Quad9|9.9.9.9|853"; do
@@ -668,7 +663,6 @@ if [ "$IS_NEW" = true ]; then
     done
 fi
 
-# 完成
 echo ""
 echo -e "${GREEN}${BOLD}╔══════════════════════════════════════════════╗${NC}"
 if [ "$ALL_OK" = true ]; then
@@ -683,8 +677,9 @@ echo -e "${BOLD}服务信息:${NC}"
 echo -e "  版本: ${CYAN}$SMARTDNS_VER${NC}"
 echo -e "  来源: ${CYAN}$SMARTDNS_SOURCE${NC}"
 echo -e "  端口: ${CYAN}127.0.0.1:${PORT}${NC}"
+echo -e "  网络栈: ${CYAN}$NETSTACK${NC}"
 if [ "$IS_NEW" = true ]; then
-    echo -e "  模式: ${GREEN}纯 DoH + DoT (无 UDP)${NC}"
+    echo -e "  模式: ${GREEN}纯 DoH + DoT (每服务商各1 DoH + 1 DoT)${NC}"
     echo -e "  隐私: ${GREEN}DNS 查询完全加密${NC}"
 else
     echo -e "  模式: ${YELLOW}UDP 降级 (旧版)${NC}"
