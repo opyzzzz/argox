@@ -374,7 +374,6 @@ serve-expired yes
 log-size 2m
 log-num 2
 speed-check-mode tcp:443,tcp:853
-edns-client-subnet
 EOF
 
     # force-AAAA-SOA 仅在纯 IPv4 环境启用
