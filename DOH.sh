@@ -1,10 +1,10 @@
 #!/bin/sh
 #==================================================
-# SmartDNS 智能部署脚本 v4.10
+# SmartDNS 智能部署脚本 v5
 # 上游: 纯 DoH + DoT (IPv4/IPv6 自适应)
 # 策略: GitHub最新版优先 -> 包管理器备用
 # 守护: cron 每分钟检查恢复 resolv.conf
-# 修复: force-AAAA-SOA 改为仅在纯IPv4环境启用
+# 修复: 删除无效的 edns-client-subnet 配置
 # 兼容: Alpine/Debian/Ubuntu (LXC/KVM/NAT/Docker)
 # 更新: 2026-06-06
 #==================================================
@@ -336,7 +336,7 @@ mkdir -p /etc/smartdns
 
 cat > /etc/smartdns/smartdns.conf << EOF
 #==========================================
-# SmartDNS 配置 v4.10
+# SmartDNS 配置 v4.11
 # 上游: DoH + DoT ($NETSTACK)
 # 版本: $SMARTDNS_VER | 来源: $SMARTDNS_SOURCE
 # 时间: $(date '+%Y-%m-%d %H:%M:%S')
@@ -376,7 +376,6 @@ log-num 2
 speed-check-mode tcp:443,tcp:853
 EOF
 
-    # force-AAAA-SOA 仅在纯 IPv4 环境启用
     if [ "$HAS_IPV6" = false ]; then
         echo "force-AAAA-SOA yes" >> /etc/smartdns/smartdns.conf
     fi
