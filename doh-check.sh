@@ -1,7 +1,7 @@
 #!/bin/sh
 #==================================================
-# SmartDNS 部署后功能检测脚本 v2.3
-# 修复: 上游DNS检测支持DoH/DoT/DoQ/DoH3
+# SmartDNS 部署后功能检测脚本 v2.4
+# 修复: Google DoH 使用 /resolve 端点
 # 用法: wget -qO- https://.../smartdns-check.sh | sh
 # 更新: 2026-06-06
 #==================================================
@@ -27,7 +27,7 @@ ICON_INFO="${CYAN}ℹ${NC}"
 print_header() {
     echo ""
     echo -e "${BOLD}${MAGENTA}╔══════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${BOLD}${MAGENTA}║  SmartDNS 功能检测脚本 v2.3                             ║${NC}"
+    echo -e "${BOLD}${MAGENTA}║  SmartDNS 功能检测脚本 v2.4                             ║${NC}"
     echo -e "${BOLD}${MAGENTA}║  检测时间: $(date '+%Y-%m-%d %H:%M:%S')                        ║${NC}"
     echo -e "${BOLD}${MAGENTA}╚══════════════════════════════════════════════════════════╝${NC}"
     echo ""
@@ -255,24 +255,33 @@ print_section "🔒 第5部分: DoH/DoT 加密 DNS 检测"
 
 print_sub "DoH 连通性"
 if command -v curl >/dev/null 2>&1; then
-    for item in "Cloudflare|https://cloudflare-dns.com/dns-query" "Google|https://dns.google/dns-query"; do
-        NAME="${item%%|*}"
-        URL="${item##*|}"
-        if curl -s --max-time 5 -H "accept: application/dns-json" "${URL}?name=google.com&type=A" 2>/dev/null | grep -q '"Status":\s*0'; then
-            check_pass "$NAME DoH 正常"
-        else
-            check_warn "$NAME DoH 异常" "检查防火墙 443 端口"
-        fi
-    done
+    # Cloudflare 使用 /dns-query
+    if curl -s --max-time 5 -H "accept: application/dns-json" "https://cloudflare-dns.com/dns-query?name=google.com&type=A" 2>/dev/null | grep -q '"Status":\s*0'; then
+        check_pass "Cloudflare DoH 正常"
+    else
+        check_warn "Cloudflare DoH 异常"
+    fi
+    
+    # Google 使用 /resolve（GET 请求专用端点）
+    if curl -s --max-time 5 -H "accept: application/dns-json" "https://dns.google/resolve?name=google.com&type=A" 2>/dev/null | grep -q '"Status":\s*0'; then
+        check_pass "Google DoH 正常"
+    else
+        check_warn "Google DoH 异常" "可能被阻断，可换 AliDNS"
+    fi
+    
+    # Quad9 使用 /dns-query
+    if curl -s --max-time 5 -H "accept: application/dns-json" "https://dns.quad9.net/dns-query?name=google.com&type=A" 2>/dev/null | grep -q '"Status":\s*0'; then
+        check_pass "Quad9 DoH 正常"
+    else
+        check_warn "Quad9 DoH 异常"
+    fi
 else
     check_warn "curl 未安装，跳过 DoH 检测"
 fi
 
 print_sub "DoT 连通性"
-for item in "Cloudflare|1.1.1.1|853" "Google|8.8.8.8|853"; do
+for item in "Cloudflare|1.1.1.1|853" "Google|8.8.8.8|853" "Quad9|9.9.9.9|853"; do
     NAME="${item%%|*}"
-    IP="${item##*|}"
-    IP="${IP%%|*}"
     IP=$(echo "$item" | awk -F'|' '{print $2}')
     PORT=$(echo "$item" | awk -F'|' '{print $3}')
     if command -v nc >/dev/null 2>&1; then
