@@ -1,7 +1,7 @@
 #!/bin/sh
 #==================================================
-# SmartDNS 部署后功能检测脚本 v2.5
-# 修复: Cloudflare/Google/Quad9 DoH 检测逻辑
+# SmartDNS 部署后功能检测脚本 v2.6
+# 新增: 上游 DNS 解析测试
 # 用法: wget -qO- https://.../smartdns-check.sh | sh
 # 更新: 2026-06-06
 #==================================================
@@ -27,7 +27,7 @@ ICON_INFO="${CYAN}ℹ${NC}"
 print_header() {
     echo ""
     echo -e "${BOLD}${MAGENTA}╔══════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${BOLD}${MAGENTA}║  SmartDNS 功能检测脚本 v2.5                             ║${NC}"
+    echo -e "${BOLD}${MAGENTA}║  SmartDNS 功能检测脚本 v2.6                             ║${NC}"
     echo -e "${BOLD}${MAGENTA}║  检测时间: $(date '+%Y-%m-%d %H:%M:%S')                        ║${NC}"
     echo -e "${BOLD}${MAGENTA}╚══════════════════════════════════════════════════════════╝${NC}"
     echo ""
@@ -245,13 +245,70 @@ for domain in ipv6.google.com cloudflare.com; do
 done
 
 #==================================================
-# 第5部分: 加密 DNS 检测
+# 第5部分: 上游 DNS 解析测试
 #==================================================
-print_section "第5部分: DoH/DoT 加密 DNS 检测"
+print_section "第5部分: 上游 DNS 解析测试"
+
+print_sub "UDP 上游"
+if [ -f "$CONFIG_FILE" ] && grep -q "^server " "$CONFIG_FILE" 2>/dev/null; then
+    grep "^server " "$CONFIG_FILE" 2>/dev/null | head -6 | while read line; do
+        IP=$(echo "$line" | awk '{print $2}' | cut -d: -f1)
+        if nslookup -timeout=3 google.com $IP >/dev/null 2>&1; then
+            TIME=$(nslookup -timeout=3 google.com $IP 2>&1 | grep "time" | awk '{print $NF}' || echo "?")
+            echo -e "  ${ICON_OK} $IP"
+        else
+            echo -e "  ${ICON_FAIL} $IP 不可达"
+        fi
+    done
+else
+    check_info "UDP 上游" "未配置"
+fi
+
+print_sub "DoH 上游"
+if [ -f "$CONFIG_FILE" ] && grep -q "^server-https" "$CONFIG_FILE" 2>/dev/null; then
+    grep "^server-https" "$CONFIG_FILE" 2>/dev/null | head -6 | while read line; do
+        URL=$(echo "$line" | awk '{print $2}')
+        NAME=$(echo "$URL" | sed 's|https://||;s|/dns-query||;s|/resolve||;s|\[||;s|\]||')
+        # 根据 URL 选择合适的检测方式
+        case "$URL" in
+            *dns.google*)
+                TEST_URL="https://dns.google/resolve?name=google.com&type=A"
+                ;;
+            *)
+                TEST_URL="${URL}?name=google.com&type=A"
+                ;;
+        esac
+        if curl -s --max-time 5 "$TEST_URL" -H "accept: application/dns-json" 2>/dev/null | grep -q '"Status":\s*0'; then
+            echo -e "  ${ICON_OK} $NAME"
+        else
+            echo -e "  ${ICON_FAIL} $NAME 不可达"
+        fi
+    done
+else
+    check_info "DoH 上游" "未配置"
+fi
+
+print_sub "DoT 上游"
+if [ -f "$CONFIG_FILE" ] && grep -q "^server-tls" "$CONFIG_FILE" 2>/dev/null; then
+    grep "^server-tls" "$CONFIG_FILE" 2>/dev/null | head -6 | while read line; do
+        IP=$(echo "$line" | awk '{print $2}' | cut -d: -f1)
+        if nc -z -w 3 "$IP" 853 2>/dev/null; then
+            echo -e "  ${ICON_OK} $IP"
+        else
+            echo -e "  ${ICON_FAIL} $IP 不可达"
+        fi
+    done
+else
+    check_info "DoT 上游" "未配置"
+fi
+
+#==================================================
+# 第6部分: 加密 DNS 公网连通性
+#==================================================
+print_section "第6部分: DoH/DoT 公网连通性"
 
 print_sub "DoH 连通性"
 if command -v curl >/dev/null 2>&1; then
-    # Cloudflare: /dns-query 支持 GET
     if curl -s --max-time 5 "https://cloudflare-dns.com/dns-query?name=google.com" \
         -H "accept: application/dns-json" 2>/dev/null | grep -q '"Status":\s*0'; then
         check_pass "Cloudflare DoH 正常"
@@ -259,7 +316,6 @@ if command -v curl >/dev/null 2>&1; then
         check_warn "Cloudflare DoH 异常"
     fi
     
-    # Google: /resolve 是 GET 请求专用端点
     if curl -s --max-time 5 "https://dns.google/resolve?name=google.com&type=A" \
         -H "accept: application/dns-json" 2>/dev/null | grep -q '"Status":\s*0'; then
         check_pass "Google DoH 正常"
@@ -267,10 +323,8 @@ if command -v curl >/dev/null 2>&1; then
         check_warn "Google DoH 异常" "国内可能被阻断"
     fi
     
-    # Quad9: /dns-query 只支持 POST，用 wire format 检测
     if curl -s --max-time 5 -X POST "https://dns.quad9.net/dns-query" \
         -H "Content-Type: application/dns-message" \
-        -H "accept: application/dns-json" \
         --data "AAABAAABAAAAAAAAA3d3dwdleGFtcGxlA2NvbQAAAQAB" 2>/dev/null | grep -q .; then
         check_pass "Quad9 DoH 正常"
     else
@@ -297,9 +351,9 @@ for item in "Cloudflare|1.1.1.1|853" "Google|8.8.8.8|853" "Quad9|9.9.9.9|853"; d
 done
 
 #==================================================
-# 第6部分: resolv.conf
+# 第7部分: resolv.conf
 #==================================================
-print_section "第6部分: resolv.conf 状态"
+print_section "第7部分: resolv.conf 状态"
 
 if [ -L /etc/resolv.conf ]; then
     check_warn "resolv.conf 是符号链接"
@@ -324,9 +378,9 @@ if [ -f /etc/resolv.conf ]; then
 fi
 
 #==================================================
-# 第7部分: 性能测试
+# 第8部分: 性能测试
 #==================================================
-print_section "第7部分: 性能测试"
+print_section "第8部分: 性能测试"
 
 print_sub "缓存测试"
 START=$(date +%s%N 2>/dev/null || echo 0)
@@ -344,9 +398,9 @@ check_info "缓存查询" "${SECOND}ms"
 [ "$SECOND" -le "$FIRST" ] 2>/dev/null && check_pass "缓存生效" || check_warn "缓存可能未生效"
 
 #==================================================
-# 第8部分: 系统资源
+# 第9部分: 系统资源
 #==================================================
-print_section "第8部分: 系统资源"
+print_section "第9部分: 系统资源"
 
 DISK_AVAIL=$(df -h / 2>/dev/null | tail -1 | awk '{print $4}')
 MEM_AVAIL=$(free -m 2>/dev/null | awk 'NR==2 {print $7}')
