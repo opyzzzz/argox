@@ -1,4 +1,3 @@
-cat > /tmp/uninstall-smartdns.sh << 'EOF'
 #!/bin/sh
 #==================================================
 # SmartDNS 综合卸载脚本 v2.2
@@ -132,7 +131,3 @@ echo "========================================"
 echo "  卸载完成！DNS: Cloudflare + Google"
 echo "========================================"
 cat /etc/resolv.conf
-EOF
-
-chmod +x /tmp/uninstall-smartdns.sh
-/tmp/uninstall-smartdns.sh
