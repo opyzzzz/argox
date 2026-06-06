@@ -1,7 +1,7 @@
 #!/bin/sh
 #==================================================
-# SmartDNS 部署后功能检测脚本 v2.6
-# 新增: 上游 DNS 解析测试
+# SmartDNS 部署后功能检测脚本 v2.7
+# 修复: Quad9 DoH 使用 POST 检测
 # 用法: wget -qO- https://.../smartdns-check.sh | sh
 # 更新: 2026-06-06
 #==================================================
@@ -27,7 +27,7 @@ ICON_INFO="${CYAN}ℹ${NC}"
 print_header() {
     echo ""
     echo -e "${BOLD}${MAGENTA}╔══════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${BOLD}${MAGENTA}║  SmartDNS 功能检测脚本 v2.6                             ║${NC}"
+    echo -e "${BOLD}${MAGENTA}║  SmartDNS 功能检测脚本 v2.7                             ║${NC}"
     echo -e "${BOLD}${MAGENTA}║  检测时间: $(date '+%Y-%m-%d %H:%M:%S')                        ║${NC}"
     echo -e "${BOLD}${MAGENTA}╚══════════════════════════════════════════════════════════╝${NC}"
     echo ""
@@ -254,7 +254,6 @@ if [ -f "$CONFIG_FILE" ] && grep -q "^server " "$CONFIG_FILE" 2>/dev/null; then
     grep "^server " "$CONFIG_FILE" 2>/dev/null | head -6 | while read line; do
         IP=$(echo "$line" | awk '{print $2}' | cut -d: -f1)
         if nslookup -timeout=3 google.com $IP >/dev/null 2>&1; then
-            TIME=$(nslookup -timeout=3 google.com $IP 2>&1 | grep "time" | awk '{print $NF}' || echo "?")
             echo -e "  ${ICON_OK} $IP"
         else
             echo -e "  ${ICON_FAIL} $IP 不可达"
@@ -269,20 +268,33 @@ if [ -f "$CONFIG_FILE" ] && grep -q "^server-https" "$CONFIG_FILE" 2>/dev/null; 
     grep "^server-https" "$CONFIG_FILE" 2>/dev/null | head -6 | while read line; do
         URL=$(echo "$line" | awk '{print $2}')
         NAME=$(echo "$URL" | sed 's|https://||;s|/dns-query||;s|/resolve||;s|\[||;s|\]||')
-        # 根据 URL 选择合适的检测方式
         case "$URL" in
             *dns.google*)
-                TEST_URL="https://dns.google/resolve?name=google.com&type=A"
+                if curl -s --max-time 5 "https://dns.google/resolve?name=google.com&type=A" \
+                    -H "accept: application/dns-json" 2>/dev/null | grep -q '"Status":\s*0'; then
+                    echo -e "  ${ICON_OK} $NAME"
+                else
+                    echo -e "  ${ICON_FAIL} $NAME 不可达"
+                fi
+                ;;
+            *quad9*)
+                if curl -s --max-time 5 -X POST "$URL" \
+                    -H "Content-Type: application/dns-message" \
+                    --data "AAABAAABAAAAAAAAA3d3dwdleGFtcGxlA2NvbQAAAQAB" 2>/dev/null | grep -q .; then
+                    echo -e "  ${ICON_OK} $NAME"
+                else
+                    echo -e "  ${ICON_FAIL} $NAME 不可达"
+                fi
                 ;;
             *)
-                TEST_URL="${URL}?name=google.com&type=A"
+                if curl -s --max-time 5 "${URL}?name=google.com&type=A" \
+                    -H "accept: application/dns-json" 2>/dev/null | grep -q '"Status":\s*0'; then
+                    echo -e "  ${ICON_OK} $NAME"
+                else
+                    echo -e "  ${ICON_FAIL} $NAME 不可达"
+                fi
                 ;;
         esac
-        if curl -s --max-time 5 "$TEST_URL" -H "accept: application/dns-json" 2>/dev/null | grep -q '"Status":\s*0'; then
-            echo -e "  ${ICON_OK} $NAME"
-        else
-            echo -e "  ${ICON_FAIL} $NAME 不可达"
-        fi
     done
 else
     check_info "DoH 上游" "未配置"
@@ -303,7 +315,7 @@ else
 fi
 
 #==================================================
-# 第6部分: 加密 DNS 公网连通性
+# 第6部分: DoH/DoT 公网连通性
 #==================================================
 print_section "第6部分: DoH/DoT 公网连通性"
 
