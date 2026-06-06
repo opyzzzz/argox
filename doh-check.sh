@@ -1,7 +1,7 @@
 #!/bin/sh
 #==================================================
-# SmartDNS 部署后功能检测脚本 v2.4
-# 修复: Google DoH 使用 /resolve 端点
+# SmartDNS 部署后功能检测脚本 v2.5
+# 修复: Cloudflare/Google/Quad9 DoH 检测逻辑
 # 用法: wget -qO- https://.../smartdns-check.sh | sh
 # 更新: 2026-06-06
 #==================================================
@@ -27,7 +27,7 @@ ICON_INFO="${CYAN}ℹ${NC}"
 print_header() {
     echo ""
     echo -e "${BOLD}${MAGENTA}╔══════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${BOLD}${MAGENTA}║  SmartDNS 功能检测脚本 v2.4                             ║${NC}"
+    echo -e "${BOLD}${MAGENTA}║  SmartDNS 功能检测脚本 v2.5                             ║${NC}"
     echo -e "${BOLD}${MAGENTA}║  检测时间: $(date '+%Y-%m-%d %H:%M:%S')                        ║${NC}"
     echo -e "${BOLD}${MAGENTA}╚══════════════════════════════════════════════════════════╝${NC}"
     echo ""
@@ -81,7 +81,7 @@ safe_int() {
 # 第1部分: 系统环境
 #==================================================
 print_header
-print_section "📋 第1部分: 系统环境"
+print_section "第1部分: 系统环境"
 
 print_sub "操作系统"
 if [ -f /etc/alpine-release ]; then
@@ -99,7 +99,7 @@ check_info "运行时间" "$(uptime | sed 's/.*up //; s/,.*//')"
 
 print_sub "虚拟化环境"
 if grep -q "container=lxc" /proc/1/environ 2>/dev/null; then
-    check_warn "LXC 容器环境" "某些功能可能受限"
+    check_warn "LXC 容器环境"
 elif grep -q "docker" /proc/1/cgroup 2>/dev/null || [ -f /.dockerenv ]; then
     check_warn "Docker 容器环境"
 else
@@ -121,7 +121,7 @@ fi
 #==================================================
 # 第2部分: SmartDNS 安装状态
 #==================================================
-print_section "🔍 第2部分: SmartDNS 安装状态"
+print_section "第2部分: SmartDNS 安装状态"
 
 print_sub "程序文件"
 SMARTDNS_BIN=""
@@ -139,28 +139,26 @@ done
 print_sub "配置文件"
 CONFIG_FILE="/etc/smartdns/smartdns.conf"
 if [ -f "$CONFIG_FILE" ]; then
-    check_pass "配置文件存在: $CONFIG_FILE"
+    check_pass "配置文件存在"
     
     grep -q "^bind" "$CONFIG_FILE" && check_pass "bind 配置存在" || check_fail "缺少 bind 配置"
     
     UDP_COUNT=$(grep -c "^server " "$CONFIG_FILE" 2>/dev/null || echo 0)
     DOH_COUNT=$(grep -c "^server-https" "$CONFIG_FILE" 2>/dev/null || echo 0)
     DOT_COUNT=$(grep -c "^server-tls" "$CONFIG_FILE" 2>/dev/null || echo 0)
-    DOQ_COUNT=$(grep -c "^server-quic" "$CONFIG_FILE" 2>/dev/null || echo 0)
-    DOH3_COUNT=$(grep -c "^server-h3" "$CONFIG_FILE" 2>/dev/null || echo 0)
     
-    TOTAL_UPSTREAM=$((UDP_COUNT + DOH_COUNT + DOT_COUNT + DOQ_COUNT + DOH3_COUNT))
+    TOTAL_UPSTREAM=$((UDP_COUNT + DOH_COUNT + DOT_COUNT))
     
     if [ "$TOTAL_UPSTREAM" -gt 0 ]; then
         check_pass "上游 DNS: $TOTAL_UPSTREAM 个"
-        check_info "上游统计" "UDP:$UDP_COUNT DoH:$DOH_COUNT DoT:$DOT_COUNT DoQ:$DOQ_COUNT DoH3:$DOH3_COUNT"
+        check_info "上游统计" "UDP:$UDP_COUNT DoH:$DOH_COUNT DoT:$DOT_COUNT"
     else
         check_fail "缺少上游 DNS 配置"
     fi
     
     echo ""
     echo -e "  ${BOLD}配置摘要:${NC}"
-    grep -E "^bind|^server |^server-https|^server-tls|^server-quic|^server-h3" "$CONFIG_FILE" 2>/dev/null | while read line; do
+    grep -E "^bind|^server |^server-https|^server-tls" "$CONFIG_FILE" 2>/dev/null | while read line; do
         echo -e "    ${CYAN}$line${NC}"
     done
 else
@@ -174,9 +172,8 @@ if [ -f "$LOG_FILE" ]; then
     ERRORS=$(grep -c "ERROR" "$LOG_FILE" 2>/dev/null || echo 0)
     ERRORS=$(safe_int "$ERRORS")
     if [ "$ERRORS" -gt 0 ]; then
-        check_warn "日志中有 $ERRORS 条错误" "查看: tail -50 $LOG_FILE"
+        check_warn "日志中有 $ERRORS 条错误"
         echo ""
-        echo -e "  ${BOLD}最近错误:${NC}"
         grep "ERROR" "$LOG_FILE" 2>/dev/null | tail -3 | while read line; do
             echo -e "    ${RED}$line${NC}"
         done
@@ -190,13 +187,12 @@ fi
 #==================================================
 # 第3部分: 进程与服务
 #==================================================
-print_section "⚙️ 第3部分: 进程与服务"
+print_section "第3部分: 进程与服务"
 
 print_sub "进程状态"
 if pgrep smartdns >/dev/null 2>&1; then
     PID=$(pgrep smartdns | head -1)
     check_pass "SmartDNS 运行中 (PID: $PID)"
-    
     MEM=$(ps -p $PID -o rss --no-headers 2>/dev/null | awk '{printf "%.1f MB", $1/1024}')
     check_info "内存使用" "${MEM:-未知}"
 else
@@ -210,8 +206,8 @@ case "$INIT" in
             check_pass "systemd 服务: active" || \
             check_fail "systemd 服务: inactive"
         systemctl is-enabled smartdns >/dev/null 2>&1 && \
-            check_pass "systemd 已启用" || \
-            check_warn "systemd 未启用开机自启"
+            check_pass "开机自启: 已启用" || \
+            check_warn "开机自启: 未启用"
         ;;
     openrc)
         rc-service smartdns status 2>&1 | grep -q "started" && \
@@ -226,7 +222,7 @@ esac
 #==================================================
 # 第4部分: DNS 解析测试
 #==================================================
-print_section "🌐 第4部分: DNS 解析测试"
+print_section "第4部分: DNS 解析测试"
 
 print_sub "IPv4 解析"
 for domain in google.com github.com cloudflare.com; do
@@ -244,33 +240,38 @@ for domain in ipv6.google.com cloudflare.com; do
         IP=$(nslookup -timeout=3 -type=AAAA $domain 127.0.0.1 2>/dev/null | grep "Address" | tail -1 | awk '{print $NF}')
         check_pass "$domain → $IP"
     else
-        check_warn "$domain AAAA 记录解析失败" "可能无 IPv6 上游"
+        check_warn "$domain AAAA 解析失败" "可能无 IPv6 上游"
     fi
 done
 
 #==================================================
 # 第5部分: 加密 DNS 检测
 #==================================================
-print_section "🔒 第5部分: DoH/DoT 加密 DNS 检测"
+print_section "第5部分: DoH/DoT 加密 DNS 检测"
 
 print_sub "DoH 连通性"
 if command -v curl >/dev/null 2>&1; then
-    # Cloudflare 使用 /dns-query
-    if curl -s --max-time 5 -H "accept: application/dns-json" "https://cloudflare-dns.com/dns-query?name=google.com&type=A" 2>/dev/null | grep -q '"Status":\s*0'; then
+    # Cloudflare: /dns-query 支持 GET
+    if curl -s --max-time 5 "https://cloudflare-dns.com/dns-query?name=google.com" \
+        -H "accept: application/dns-json" 2>/dev/null | grep -q '"Status":\s*0'; then
         check_pass "Cloudflare DoH 正常"
     else
         check_warn "Cloudflare DoH 异常"
     fi
     
-    # Google 使用 /resolve（GET 请求专用端点）
-    if curl -s --max-time 5 -H "accept: application/dns-json" "https://dns.google/resolve?name=google.com&type=A" 2>/dev/null | grep -q '"Status":\s*0'; then
+    # Google: /resolve 是 GET 请求专用端点
+    if curl -s --max-time 5 "https://dns.google/resolve?name=google.com&type=A" \
+        -H "accept: application/dns-json" 2>/dev/null | grep -q '"Status":\s*0'; then
         check_pass "Google DoH 正常"
     else
-        check_warn "Google DoH 异常" "可能被阻断，可换 AliDNS"
+        check_warn "Google DoH 异常" "国内可能被阻断"
     fi
     
-    # Quad9 使用 /dns-query
-    if curl -s --max-time 5 -H "accept: application/dns-json" "https://dns.quad9.net/dns-query?name=google.com&type=A" 2>/dev/null | grep -q '"Status":\s*0'; then
+    # Quad9: /dns-query 只支持 POST，用 wire format 检测
+    if curl -s --max-time 5 -X POST "https://dns.quad9.net/dns-query" \
+        -H "Content-Type: application/dns-message" \
+        -H "accept: application/dns-json" \
+        --data "AAABAAABAAAAAAAAA3d3dwdleGFtcGxlA2NvbQAAAQAB" 2>/dev/null | grep -q .; then
         check_pass "Quad9 DoH 正常"
     else
         check_warn "Quad9 DoH 异常"
@@ -298,7 +299,7 @@ done
 #==================================================
 # 第6部分: resolv.conf
 #==================================================
-print_section "📝 第6部分: resolv.conf 状态"
+print_section "第6部分: resolv.conf 状态"
 
 if [ -L /etc/resolv.conf ]; then
     check_warn "resolv.conf 是符号链接"
@@ -325,7 +326,7 @@ fi
 #==================================================
 # 第7部分: 性能测试
 #==================================================
-print_section "📊 第7部分: 性能测试"
+print_section "第7部分: 性能测试"
 
 print_sub "缓存测试"
 START=$(date +%s%N 2>/dev/null || echo 0)
@@ -345,7 +346,7 @@ check_info "缓存查询" "${SECOND}ms"
 #==================================================
 # 第8部分: 系统资源
 #==================================================
-print_section "💾 第8部分: 系统资源"
+print_section "第8部分: 系统资源"
 
 DISK_AVAIL=$(df -h / 2>/dev/null | tail -1 | awk '{print $4}')
 MEM_AVAIL=$(free -m 2>/dev/null | awk 'NR==2 {print $7}')
@@ -359,7 +360,7 @@ check_info "内存可用" "${MEM_AVAIL}MB"
 #==================================================
 # 最终报告
 #==================================================
-print_section "📊 检测报告"
+print_section "检测报告"
 
 echo ""
 echo -e "  ${GREEN}通过: $PASS${NC}"
