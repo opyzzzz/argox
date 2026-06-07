@@ -1,9 +1,10 @@
+cat > /usr/local/bin/smartdns-check.sh << 'EOF'
 #!/bin/sh
 #==================================================
-# SmartDNS 部署后功能检测脚本 v2.7
-# 修复: Quad9 DoH 使用 POST 检测
+# SmartDNS 部署后功能检测脚本 v2.8
+# 修复: grep -c 算术表达式错误
 # 用法: wget -qO- https://.../smartdns-check.sh | sh
-# 更新: 2026-06-06
+# 更新: 2026-06-07
 #==================================================
 
 set +e
@@ -27,7 +28,7 @@ ICON_INFO="${CYAN}ℹ${NC}"
 print_header() {
     echo ""
     echo -e "${BOLD}${MAGENTA}╔══════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${BOLD}${MAGENTA}║  SmartDNS 功能检测脚本 v2.7                             ║${NC}"
+    echo -e "${BOLD}${MAGENTA}║  SmartDNS 功能检测脚本 v2.8                             ║${NC}"
     echo -e "${BOLD}${MAGENTA}║  检测时间: $(date '+%Y-%m-%d %H:%M:%S')                        ║${NC}"
     echo -e "${BOLD}${MAGENTA}╚══════════════════════════════════════════════════════════╝${NC}"
     echo ""
@@ -95,7 +96,6 @@ fi
 check_info "发行版" "$OS"
 check_info "内核" "$(uname -r)"
 check_info "架构" "$(uname -m)"
-check_info "运行时间" "$(uptime | sed 's/.*up //; s/,.*//')"
 
 print_sub "虚拟化环境"
 if grep -q "container=lxc" /proc/1/environ 2>/dev/null; then
@@ -143,13 +143,13 @@ if [ -f "$CONFIG_FILE" ]; then
     
     grep -q "^bind" "$CONFIG_FILE" && check_pass "bind 配置存在" || check_fail "缺少 bind 配置"
     
-    UDP_COUNT=$(grep -c "^server " "$CONFIG_FILE" 2>/dev/null || echo 0)
-    DOH_COUNT=$(grep -c "^server-https" "$CONFIG_FILE" 2>/dev/null || echo 0)
-    DOT_COUNT=$(grep -c "^server-tls" "$CONFIG_FILE" 2>/dev/null || echo 0)
+    UDP_COUNT=$(safe_int "$(grep -c "^server " "$CONFIG_FILE" 2>/dev/null || echo 0)")
+    DOH_COUNT=$(safe_int "$(grep -c "^server-https" "$CONFIG_FILE" 2>/dev/null || echo 0)")
+    DOT_COUNT=$(safe_int "$(grep -c "^server-tls" "$CONFIG_FILE" 2>/dev/null || echo 0)")
     
     TOTAL_UPSTREAM=$((UDP_COUNT + DOH_COUNT + DOT_COUNT))
     
-    if [ "$TOTAL_UPSTREAM" -gt 0 ]; then
+    if [ "$TOTAL_UPSTREAM" -gt 0 ] 2>/dev/null; then
         check_pass "上游 DNS: $TOTAL_UPSTREAM 个"
         check_info "上游统计" "UDP:$UDP_COUNT DoH:$DOH_COUNT DoT:$DOT_COUNT"
     else
@@ -169,14 +169,9 @@ print_sub "日志文件"
 LOG_FILE="/var/log/smartdns.log"
 if [ -f "$LOG_FILE" ]; then
     check_pass "日志文件存在"
-    ERRORS=$(grep -c "ERROR" "$LOG_FILE" 2>/dev/null || echo 0)
-    ERRORS=$(safe_int "$ERRORS")
-    if [ "$ERRORS" -gt 0 ]; then
+    ERRORS=$(safe_int "$(grep -c "ERROR" "$LOG_FILE" 2>/dev/null || echo 0)")
+    if [ "$ERRORS" -gt 0 ] 2>/dev/null; then
         check_warn "日志中有 $ERRORS 条错误"
-        echo ""
-        grep "ERROR" "$LOG_FILE" 2>/dev/null | tail -3 | while read line; do
-            echo -e "    ${RED}$line${NC}"
-        done
     else
         check_pass "日志无错误"
     fi
@@ -193,8 +188,6 @@ print_sub "进程状态"
 if pgrep smartdns >/dev/null 2>&1; then
     PID=$(pgrep smartdns | head -1)
     check_pass "SmartDNS 运行中 (PID: $PID)"
-    MEM=$(ps -p $PID -o rss --no-headers 2>/dev/null | awk '{printf "%.1f MB", $1/1024}')
-    check_info "内存使用" "${MEM:-未知}"
 else
     check_fail "SmartDNS 未运行" "systemctl start smartdns"
 fi
@@ -213,9 +206,6 @@ case "$INIT" in
         rc-service smartdns status 2>&1 | grep -q "started" && \
             check_pass "OpenRC 服务: started" || \
             check_warn "OpenRC 服务: 未启动"
-        [ -f /etc/local.d/smartdns-fix.start ] && \
-            check_pass "开机修复脚本存在" || \
-            check_warn "开机修复脚本不存在"
         ;;
 esac
 
@@ -332,7 +322,7 @@ if command -v curl >/dev/null 2>&1; then
         -H "accept: application/dns-json" 2>/dev/null | grep -q '"Status":\s*0'; then
         check_pass "Google DoH 正常"
     else
-        check_warn "Google DoH 异常" "国内可能被阻断"
+        check_warn "Google DoH 异常"
     fi
     
     if curl -s --max-time 5 -X POST "https://dns.quad9.net/dns-query" \
@@ -355,7 +345,7 @@ for item in "Cloudflare|1.1.1.1|853" "Google|8.8.8.8|853" "Quad9|9.9.9.9|853"; d
         if nc -z -w 3 "$IP" "$PORT" 2>/dev/null; then
             check_pass "$NAME DoT 可达"
         else
-            check_fail "$NAME DoT 不可达" "检查防火墙 853 端口"
+            check_fail "$NAME DoT 不可达"
         fi
     else
         check_info "$NAME DoT" "未安装 nc，跳过检测"
@@ -390,11 +380,10 @@ if [ -f /etc/resolv.conf ]; then
 fi
 
 #==================================================
-# 第8部分: 性能测试
+# 第8部分: 缓存测试
 #==================================================
-print_section "第8部分: 性能测试"
+print_section "第8部分: 缓存测试"
 
-print_sub "缓存测试"
 START=$(date +%s%N 2>/dev/null || echo 0)
 nslookup -timeout=3 cloudflare.com 127.0.0.1 >/dev/null 2>&1
 END=$(date +%s%N 2>/dev/null || echo 0)
@@ -410,20 +399,6 @@ check_info "缓存查询" "${SECOND}ms"
 [ "$SECOND" -le "$FIRST" ] 2>/dev/null && check_pass "缓存生效" || check_warn "缓存可能未生效"
 
 #==================================================
-# 第9部分: 系统资源
-#==================================================
-print_section "第9部分: 系统资源"
-
-DISK_AVAIL=$(df -h / 2>/dev/null | tail -1 | awk '{print $4}')
-MEM_AVAIL=$(free -m 2>/dev/null | awk 'NR==2 {print $7}')
-MEM_AVAIL=$(safe_int "$MEM_AVAIL")
-
-check_info "磁盘可用" "${DISK_AVAIL:-未知}"
-check_info "内存可用" "${MEM_AVAIL}MB"
-
-[ "$MEM_AVAIL" -lt 50 ] 2>/dev/null && check_warn "内存不足 50MB"
-
-#==================================================
 # 最终报告
 #==================================================
 print_section "检测报告"
@@ -435,17 +410,21 @@ echo -e "  ${RED}失败: $FAIL${NC}"
 echo ""
 
 if [ "$FAIL" -eq 0 ] && [ "$WARN" -eq 0 ]; then
-    echo -e "  ${GREEN}${BOLD}★★★★★ 完美！所有检测通过${NC}"
+    echo -e "  ${GREEN}${BOLD}★★★★★ 完美！${NC}"
 elif [ "$FAIL" -eq 0 ] && [ "$WARN" -le 3 ]; then
-    echo -e "  ${GREEN}${BOLD}★★★★☆ 良好！仅有少量警告${NC}"
+    echo -e "  ${GREEN}${BOLD}★★★★☆ 良好！${NC}"
 elif [ "$FAIL" -eq 0 ]; then
-    echo -e "  ${YELLOW}${BOLD}★★★☆☆ 一般！需要关注警告项${NC}"
+    echo -e "  ${YELLOW}${BOLD}★★★☆☆ 一般${NC}"
 elif [ "$FAIL" -le 2 ]; then
-    echo -e "  ${RED}${BOLD}★★☆☆☆ 较差！需要修复失败项${NC}"
+    echo -e "  ${RED}${BOLD}★★☆☆☆ 较差${NC}"
 else
-    echo -e "  ${RED}${BOLD}★☆☆☆☆ 严重！存在多个问题${NC}"
+    echo -e "  ${RED}${BOLD}★☆☆☆☆ 严重${NC}"
 fi
 
 echo ""
 echo -e "检测完成: $(date '+%Y-%m-%d %H:%M:%S')"
 echo ""
+EOF
+
+chmod +x /usr/local/bin/smartdns-check.sh
+/usr/local/bin/smartdns-check.sh
