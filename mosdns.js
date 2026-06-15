@@ -41,12 +41,8 @@ detect_os() {
     case "$OS" in
         debian|ubuntu|raspbian) OS="debian" ;;
         alpine) OS="alpine" ;;
-        *)
-            log_error "不支持的操作系统: $OS"
-            exit 1
-            ;;
+        *) log_error "不支持的操作系统: $OS"; exit 1 ;;
     esac
-
     [ -z "$VER" ] && VER="unknown"
     log_info "检测到系统: $OS $VER"
 }
@@ -64,42 +60,21 @@ detect_arch() {
                 MOSDNS_ARCH="mips64le"
             else
                 MOSDNS_ARCH="mips64"
-            fi
-            ;;
+            fi ;;
         riscv64)       MOSDNS_ARCH="riscv64" ;;
-        *)
-            log_error "不支持的架构: $ARCH"
-            exit 1
-            ;;
+        *) log_error "不支持的架构: $ARCH"; exit 1 ;;
     esac
     log_info "检测到架构: $ARCH -> $MOSDNS_ARCH"
 }
 
 detect_network_stack() {
-    IPV4_OK=false
-    IPV6_OK=false
-
-    if curl -4 -s --connect-timeout 3 --max-time 5 -o /dev/null -w "%{http_code}" https://1.1.1.1 2>/dev/null | grep -q '^[23]'; then
-        IPV4_OK=true
-    fi
-
-    if curl -6 -s --connect-timeout 3 --max-time 5 -o /dev/null -w "%{http_code}" https://cloudflare.com 2>/dev/null | grep -q '^[23]'; then
-        IPV6_OK=true
-    fi
-
-    if $IPV4_OK && $IPV6_OK; then
-        NETWORK_STACK="dual"
-        log_info "检测到双栈网络环境"
-    elif $IPV4_OK; then
-        NETWORK_STACK="ipv4"
-        log_info "检测到纯IPv4网络环境"
-    elif $IPV6_OK; then
-        NETWORK_STACK="ipv6"
-        log_info "检测到纯IPv6网络环境"
-    else
-        log_error "无可用网络连接"
-        exit 1
-    fi
+    IPV4_OK=false; IPV6_OK=false
+    curl -4 -s --connect-timeout 3 --max-time 5 -o /dev/null -w "%{http_code}" https://1.1.1.1 2>/dev/null | grep -q '^[23]' && IPV4_OK=true
+    curl -6 -s --connect-timeout 3 --max-time 5 -o /dev/null -w "%{http_code}" https://cloudflare.com 2>/dev/null | grep -q '^[23]' && IPV6_OK=true
+    if $IPV4_OK && $IPV6_OK; then NETWORK_STACK="dual"; log_info "检测到双栈网络环境"
+    elif $IPV4_OK; then NETWORK_STACK="ipv4"; log_info "检测到纯IPv4网络环境"
+    elif $IPV6_OK; then NETWORK_STACK="ipv6"; log_info "检测到纯IPv6网络环境"
+    else log_error "无可用网络连接"; exit 1; fi
 }
 
 # ============================================
@@ -108,14 +83,8 @@ detect_network_stack() {
 install_dependencies() {
     log_info "检测并安装依赖..."
     MISSING_DEPS=""
-    for dep in curl unzip; do
-        if ! command -v $dep >/dev/null 2>&1; then
-            MISSING_DEPS="$MISSING_DEPS $dep"
-        fi
-    done
-    if ! command -v ip >/dev/null 2>&1 && ! command -v ifconfig >/dev/null 2>&1; then
-        MISSING_DEPS="$MISSING_DEPS iproute2"
-    fi
+    for dep in curl unzip; do command -v $dep >/dev/null 2>&1 || MISSING_DEPS="$MISSING_DEPS $dep"; done
+    command -v ip >/dev/null 2>&1 || command -v ifconfig >/dev/null 2>&1 || MISSING_DEPS="$MISSING_DEPS iproute2"
     MISSING_DEPS=$(echo "$MISSING_DEPS" | sed 's/^ *//')
     [ -z "$MISSING_DEPS" ] && { log_info "所有依赖已安装"; return 0; }
 
@@ -142,7 +111,6 @@ install_dependencies() {
             done ;;
     esac
     set -e
-
     for dep in $MISSING_DEPS; do
         case "$dep" in
             curl|unzip) command -v $dep >/dev/null 2>&1 || { log_error "依赖 $dep 安装失败"; exit 1; } ;;
@@ -159,42 +127,29 @@ install_mosdns() {
     log_info "开始安装 mosdns $VERSION..."
     DOWNLOAD_URL="https://github.com/IrineSistiana/mosdns/releases/download/${VERSION}/mosdns-linux-${MOSDNS_ARCH}.zip"
     WORK_DIR="/tmp/mosdns_install_$$"
-    rm -rf "$WORK_DIR"
-    mkdir -p "$WORK_DIR" "$INSTALL_DIR"
-
+    rm -rf "$WORK_DIR"; mkdir -p "$WORK_DIR" "$INSTALL_DIR"
     log_info "下载 mosdns..."
-    if ! curl -L --connect-timeout 10 --retry 3 --max-time 60 -o "$WORK_DIR/mosdns.zip" "$DOWNLOAD_URL"; then
-        log_error "下载失败"; rm -rf "$WORK_DIR"; exit 1
-    fi
-
+    curl -L --connect-timeout 10 --retry 3 --max-time 60 -o "$WORK_DIR/mosdns.zip" "$DOWNLOAD_URL" || { log_error "下载失败"; rm -rf "$WORK_DIR"; exit 1; }
     FILE_SIZE=$(stat -c%s "$WORK_DIR/mosdns.zip" 2>/dev/null || echo 0)
-    if [ "$FILE_SIZE" -lt 1024 ]; then
-        log_error "下载的文件太小"; rm -rf "$WORK_DIR"; exit 1
-    fi
+    [ "$FILE_SIZE" -lt 1024 ] && { log_error "下载的文件太小"; rm -rf "$WORK_DIR"; exit 1; }
     unzip -t -q "$WORK_DIR/mosdns.zip" >/dev/null 2>&1 || { log_error "无效zip包"; rm -rf "$WORK_DIR"; exit 1; }
-
     log_info "解压文件..."
     mkdir -p "$WORK_DIR/extracted"
     unzip -o -q "$WORK_DIR/mosdns.zip" -d "$WORK_DIR/extracted" || { log_error "解压失败"; rm -rf "$WORK_DIR"; exit 1; }
-
-    BINARY=$(find "$WORK_DIR/extracted" -type f -executable \
-        ! -name "*.zip" ! -name "*.md" ! -name "*.txt" ! -name "*.yaml" ! -name "*.yml" \
-        ! -name "*.json" ! -name "*.toml" ! -name "LICENSE" ! -name "README*" \
-        -name "mosdns*" 2>/dev/null | head -1)
+    BINARY=$(find "$WORK_DIR/extracted" -type f -executable ! -name "*.zip" ! -name "*.md" ! -name "*.txt" ! -name "*.yaml" ! -name "*.yml" ! -name "*.json" ! -name "*.toml" ! -name "LICENSE" ! -name "README*" -name "mosdns*" 2>/dev/null | head -1)
     [ -z "$BINARY" ] && { log_error "未找到二进制文件"; rm -rf "$WORK_DIR"; exit 1; }
-
-    cp "$BINARY" "$BIN_PATH"
-    chmod +x "$BIN_PATH"
+    cp "$BINARY" "$BIN_PATH"; chmod +x "$BIN_PATH"
     rm -rf "$WORK_DIR"
     "$BIN_PATH" version >/dev/null 2>&1 || { log_error "二进制验证失败"; exit 1; }
     log_info "mosdns 安装完成"
 }
 
 # ============================================
-# 模块5: 生成配置文件（已修正 servers）
+# 模块5: 生成配置文件（彻底重写，杜绝 YAML 错误）
 # ============================================
 generate_config() {
     log_info "生成配置文件..."
+    # 根据网络栈准备上游地址（用空格分隔的列表）
     case "$NETWORK_STACK" in
         ipv4)
             CF_IPS="1.1.1.1 1.0.0.1"
@@ -228,8 +183,14 @@ generate_config() {
             ;;
     esac
 
+    # 生成 IP 列表字符串（用于 YAML 中）
+    CF_IP_LIST=""; for ip in $CF_IPS; do CF_IP_LIST="${CF_IP_LIST}        - addr: \"$ip\"\n"; done
+    GOOGLE_IP_LIST=""; for ip in $GOOGLE_IPS; do GOOGLE_IP_LIST="${GOOGLE_IP_LIST}        - addr: \"$ip\"\n"; done
+
+    # 备份旧配置
     [ -f "$CONFIG_PATH" ] && cp "$CONFIG_PATH" "${CONFIG_PATH}.bak.$(date +%Y%m%d%H%M%S)"
 
+    # 一次性生成完整配置（确保所有缩进正确，无多余空格）
     cat > "$CONFIG_PATH" << EOF
 log:
   level: info
@@ -250,14 +211,7 @@ plugins:
           enable_http3: false
         - addr: "${CF_TLS}"
           enable_http3: false
-EOF
-
-    for ip in $CF_IPS; do
-        echo "        - addr: \"$ip\"" >> "$CONFIG_PATH"
-    done
-
-    cat >> "$CONFIG_PATH" << EOF
-
+$(printf "$CF_IP_LIST")
   - tag: forward_google
     type: forward
     args:
@@ -266,14 +220,7 @@ EOF
           enable_http3: false
         - addr: "${GOOGLE_TLS}"
           enable_http3: false
-EOF
-
-    for ip in $GOOGLE_IPS; do
-        echo "        - addr: \"$ip\"" >> "$CONFIG_PATH"
-    done
-
-    cat >> "$CONFIG_PATH" << 'EOF'
-
+$(printf "$GOOGLE_IP_LIST")
   - tag: concurrent_query
     type: concurrent
     args:
@@ -285,12 +232,9 @@ EOF
     type: sequence
     args:
       - exec: cache
-      - exec: $concurrent_query
+      - exec: \$concurrent_query
 
 servers:
-EOF
-
-    cat >> "$CONFIG_PATH" << EOF
   - exec: main_sequence
     listener:
       addr: "${LISTEN_ADDR}"
@@ -304,6 +248,7 @@ EOF
     timeout: 5s
 EOF
 
+    # 双栈添加 IPv6 监听
     if [ -n "${LISTEN_ADDR_V6:-}" ]; then
         cat >> "$CONFIG_PATH" << EOF
 
@@ -321,7 +266,7 @@ EOF
 EOF
     fi
 
-    # 简化验证：直接尝试 dry-run
+    # 验证配置（可选）
     if "$BIN_PATH" start -c "$CONFIG_PATH" --dry-run >/dev/null 2>&1; then
         log_info "配置文件 dry-run 验证通过"
     else
@@ -337,10 +282,7 @@ EOF
 # ============================================
 setup_logrotate() {
     log_info "配置日志轮转..."
-    mkdir -p "$LOG_DIR"
-    touch "$LOG_FILE"
-    chmod 644 "$LOG_FILE"
-
+    mkdir -p "$LOG_DIR"; touch "$LOG_FILE"; chmod 644 "$LOG_FILE"
     if id nobody >/dev/null 2>&1; then
         if getent group nogroup >/dev/null 2>&1; then
             chown nobody:nogroup "$LOG_DIR" "$LOG_FILE" 2>/dev/null || true
@@ -348,7 +290,6 @@ setup_logrotate() {
             chown nobody:nobody "$LOG_DIR" "$LOG_FILE" 2>/dev/null || true
         fi
     fi
-
     case "$OS" in
         debian)
             if command -v logrotate >/dev/null 2>&1; then
@@ -367,45 +308,35 @@ setup_logrotate() {
 EOF
                 log_info "logrotate 配置完成"
             else
-                log_warn "logrotate 未安装，使用备用方案"
                 setup_fallback_logrotate
-            fi
-            ;;
+            fi ;;
         alpine) setup_fallback_logrotate ;;
     esac
 }
 
 setup_fallback_logrotate() {
-    if [ -d /etc/periodic/daily ]; then
-        ROTATE_SCRIPT="/etc/periodic/daily/mosdns-logrotate"
-    elif [ -d /etc/cron.daily ]; then
-        ROTATE_SCRIPT="/etc/cron.daily/mosdns-logrotate"
-    else
-        mkdir -p /etc/cron.daily
-        ROTATE_SCRIPT="/etc/cron.daily/mosdns-logrotate"
-    fi
+    if [ -d /etc/periodic/daily ]; then ROTATE_SCRIPT="/etc/periodic/daily/mosdns-logrotate"
+    elif [ -d /etc/cron.daily ]; then ROTATE_SCRIPT="/etc/cron.daily/mosdns-logrotate"
+    else mkdir -p /etc/cron.daily; ROTATE_SCRIPT="/etc/cron.daily/mosdns-logrotate"; fi
     cat > "$ROTATE_SCRIPT" << 'ALPINE'
 #!/bin/sh
-LOG_FILE="/var/log/mosdns/mosdns.log"
-MAX_SIZE=10485760
-MAX_FILES=7
+LOG_FILE="/var/log/mosdns/mosdns.log"; MAX_SIZE=10485760; MAX_FILES=7
 [ -f "$LOG_FILE" ] || exit 0
 SIZE=$(stat -c%s "$LOG_FILE" 2>/dev/null || echo 0)
 [ "$SIZE" -gt "$MAX_SIZE" ] || exit 0
 LOCK_FILE="${LOG_FILE}.lock"
-(
-    flock -x 9 || exit 0
-    i=$((MAX_FILES - 1))
-    while [ $i -ge 0 ]; do
-        [ -f "${LOG_FILE}.${i}" ] && mv "${LOG_FILE}.${i}" "${LOG_FILE}.$((i + 1))"
-        i=$((i - 1))
-    done
-    cp "$LOG_FILE" "${LOG_FILE}.0"
-    truncate -s 0 "$LOG_FILE"
+( flock -x 9 || exit 0
+  i=$((MAX_FILES - 1))
+  while [ $i -ge 0 ]; do
+    [ -f "${LOG_FILE}.${i}" ] && mv "${LOG_FILE}.${i}" "${LOG_FILE}.$((i + 1))"
+    i=$((i - 1))
+  done
+  cp "$LOG_FILE" "${LOG_FILE}.0"
+  truncate -s 0 "$LOG_FILE"
 ) 9>"$LOCK_FILE"
 ALPINE
     chmod +x "$ROTATE_SCRIPT"
-    log_info "备用日志轮转方案配置完成 ($ROTATE_SCRIPT)"
+    log_info "备用日志轮转配置完成 ($ROTATE_SCRIPT)"
 }
 
 # ============================================
@@ -415,13 +346,8 @@ setup_service() {
     log_info "配置系统服务..."
     set +e
     case "$OS" in
-        debian)
-            systemctl stop "$SERVICE_NAME" 2>/dev/null
-            [ -f /etc/systemd/system/${SERVICE_NAME}.service ] && rm -f /etc/systemd/system/${SERVICE_NAME}.service && systemctl daemon-reload 2>/dev/null
-            ;;
-        alpine)
-            rc-service "$SERVICE_NAME" stop 2>/dev/null
-            ;;
+        debian) systemctl stop "$SERVICE_NAME" 2>/dev/null; rm -f /etc/systemd/system/${SERVICE_NAME}.service; systemctl daemon-reload 2>/dev/null ;;
+        alpine) rc-service "$SERVICE_NAME" stop 2>/dev/null ;;
     esac
     set -e
 
@@ -447,28 +373,21 @@ ProtectSystem=full
 ProtectHome=true
 ReadWritePaths=$LOG_DIR $INSTALL_DIR
 PrivateTmp=true
-ProtectKernelTunables=true
-ProtectKernelModules=true
-ProtectControlGroups=true
 LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target
 EOF
-            systemctl daemon-reload
-            systemctl enable "$SERVICE_NAME" >/dev/null 2>&1
+            systemctl daemon-reload; systemctl enable "$SERVICE_NAME" >/dev/null 2>&1
             systemctl start "$SERVICE_NAME" || { log_error "systemd 启动失败"; journalctl -u "$SERVICE_NAME" -n 20 --no-pager 2>/dev/null; exit 1; }
             sleep 2
-            systemctl is-active --quiet "$SERVICE_NAME" || { log_error "服务未能保持运行"; journalctl -u "$SERVICE_NAME" -n 20 --no-pager 2>/dev/null; exit 1; }
-            log_info "systemd 服务配置完成"
-            ;;
+            systemctl is-active --quiet "$SERVICE_NAME" || { log_error "服务未保持运行"; exit 1; }
+            log_info "systemd 服务配置完成" ;;
         alpine)
             cat > /etc/init.d/${SERVICE_NAME} << EOF
 #!/sbin/openrc-run
-
 name="mosdns"
 description="MosDNS DNS Server"
-
 command="$BIN_PATH"
 command_args="start -c $CONFIG_PATH"
 command_background=true
@@ -476,23 +395,15 @@ pidfile="/var/run/\${RC_SVCNAME}.pid"
 output_log="$LOG_FILE"
 error_log="$LOG_FILE"
 
-depend() {
-    need net
-    after firewall
-}
-
-start_pre() {
-    checkpath --directory --mode 0755 /var/log/mosdns
-    checkpath --file --mode 0644 /var/log/mosdns/mosdns.log
-}
+depend() { need net; after firewall; }
+start_pre() { checkpath --directory --mode 0755 /var/log/mosdns; checkpath --file --mode 0644 /var/log/mosdns/mosdns.log; }
 EOF
             chmod +x /etc/init.d/${SERVICE_NAME}
             rc-update add "$SERVICE_NAME" default >/dev/null 2>&1
-            rc-service "$SERVICE_NAME" start || { log_error "OpenRC 启动失败"; tail -n 20 "$LOG_FILE" 2>/dev/null; exit 1; }
+            rc-service "$SERVICE_NAME" start || { log_error "OpenRC 启动失败"; tail -n 20 "$LOG_FILE"; exit 1; }
             sleep 2
-            rc-service "$SERVICE_NAME" status >/dev/null 2>&1 || { log_error "服务未能保持运行"; tail -n 20 "$LOG_FILE" 2>/dev/null; exit 1; }
-            log_info "OpenRC 服务配置完成"
-            ;;
+            rc-service "$SERVICE_NAME" status >/dev/null 2>&1 || { log_error "服务未保持运行"; tail -n 20 "$LOG_FILE"; exit 1; }
+            log_info "OpenRC 服务配置完成" ;;
     esac
 }
 
@@ -502,70 +413,31 @@ EOF
 setup_dns() {
     log_info "配置系统DNS保护..."
     if command -v cloud-init >/dev/null 2>&1 && cloud-init status 2>/dev/null | grep -q "running\|done"; then
-        log_warn "检测到cloud-init，创建兼容配置"
         mkdir -p /etc/cloud/cloud.cfg.d
         echo "manage_resolv_conf: false" > /etc/cloud/cloud.cfg.d/99-mosdns-dns.cfg
     fi
 
     case "$OS" in
         debian)
-            systemctl is-active --quiet systemd-resolved 2>/dev/null && { systemctl stop systemd-resolved 2>/dev/null; systemctl disable systemd-resolved 2>/dev/null; log_info "已停用 systemd-resolved"; }
-            if [ -L /etc/resolv.conf ]; then
-                REAL_RESOLV=$(readlink -f /etc/resolv.conf 2>/dev/null)
-                rm -f /etc/resolv.conf
-                [ -n "$REAL_RESOLV" ] && [ -f "$REAL_RESOLV" ] && cp "$REAL_RESOLV" /etc/resolv.conf.original 2>/dev/null
-            fi
+            systemctl is-active --quiet systemd-resolved 2>/dev/null && { systemctl stop systemd-resolved; systemctl disable systemd-resolved; log_info "已停用 systemd-resolved"; }
+            [ -L /etc/resolv.conf ] && { REAL_RESOLV=$(readlink -f /etc/resolv.conf); rm -f /etc/resolv.conf; [ -n "$REAL_RESOLV" ] && [ -f "$REAL_RESOLV" ] && cp "$REAL_RESOLV" /etc/resolv.conf.original; }
             [ ! -f /etc/resolv.conf.original ] && [ -f /etc/resolv.conf ] && [ ! -L /etc/resolv.conf ] && { cp /etc/resolv.conf /etc/resolv.conf.original; log_info "已备份原始 resolv.conf"; }
-
-            if [ "$NETWORK_STACK" = "ipv6" ]; then
-                printf "nameserver ::1\noptions timeout:2\noptions attempts:3\n" > /etc/resolv.conf
-            elif [ "$NETWORK_STACK" = "dual" ]; then
-                printf "nameserver 127.0.0.1\nnameserver ::1\noptions timeout:2\noptions attempts:3\n" > /etc/resolv.conf
-            else
-                printf "nameserver 127.0.0.1\noptions timeout:2\noptions attempts:3\n" > /etc/resolv.conf
-            fi
-
-            command -v resolvconf >/dev/null 2>&1 && {
-                printf "nameserver 127.0.0.1\n" | resolvconf -a lo.mosdns 2>/dev/null || true
-                [ "$NETWORK_STACK" != "ipv4" ] && printf "nameserver ::1\n" | resolvconf -a lo.mosdns 2>/dev/null || true
-            }
-            [ -d /etc/NetworkManager/conf.d ] && {
-                printf "[main]\ndns=none\nsystemd-resolved=false\n" > /etc/NetworkManager/conf.d/90-mosdns-dns.conf
-                systemctl is-active --quiet NetworkManager 2>/dev/null && systemctl reload NetworkManager 2>/dev/null || true
-                log_info "NetworkManager DNS配置已更新"
-            }
-            [ -f /etc/dhcp/dhclient.conf ] && ! grep -q "^supersede domain-name-servers 127.0.0.1;" /etc/dhcp/dhclient.conf 2>/dev/null && {
-                echo "supersede domain-name-servers 127.0.0.1;" >> /etc/dhcp/dhclient.conf
-                [ "$NETWORK_STACK" != "ipv4" ] && echo "prepend domain-name-servers ::1;" >> /etc/dhcp/dhclient.conf
-                log_info "dhclient DNS配置已更新"
-            }
+            if [ "$NETWORK_STACK" = "ipv6" ]; then printf "nameserver ::1\noptions timeout:2\noptions attempts:3\n" > /etc/resolv.conf
+            elif [ "$NETWORK_STACK" = "dual" ]; then printf "nameserver 127.0.0.1\nnameserver ::1\noptions timeout:2\noptions attempts:3\n" > /etc/resolv.conf
+            else printf "nameserver 127.0.0.1\noptions timeout:2\noptions attempts:3\n" > /etc/resolv.conf; fi
+            command -v resolvconf >/dev/null 2>&1 && { printf "nameserver 127.0.0.1\n" | resolvconf -a lo.mosdns 2>/dev/null; [ "$NETWORK_STACK" != "ipv4" ] && printf "nameserver ::1\n" | resolvconf -a lo.mosdns; }
+            [ -d /etc/NetworkManager/conf.d ] && { printf "[main]\ndns=none\nsystemd-resolved=false\n" > /etc/NetworkManager/conf.d/90-mosdns-dns.conf; systemctl reload NetworkManager 2>/dev/null; }
+            [ -f /etc/dhcp/dhclient.conf ] && ! grep -q "^supersede domain-name-servers 127.0.0.1;" /etc/dhcp/dhclient.conf 2>/dev/null && { echo "supersede domain-name-servers 127.0.0.1;" >> /etc/dhcp/dhclient.conf; [ "$NETWORK_STACK" != "ipv4" ] && echo "prepend domain-name-servers ::1;" >> /etc/dhcp/dhclient.conf; }
             [ -d /etc/netplan ] && command -v netplan >/dev/null 2>&1 && {
-                if [ "$NETWORK_STACK" != "ipv4" ]; then
-                    printf "network:\n  version: 2\n  ethernets:\n    all:\n      nameservers:\n        addresses: [127.0.0.1, \"::1\"]\n" > /etc/netplan/90-mosdns-dns.yaml
-                else
-                    printf "network:\n  version: 2\n  ethernets:\n    all:\n      nameservers:\n        addresses: [127.0.0.1]\n" > /etc/netplan/90-mosdns-dns.yaml
-                fi
-                netplan apply 2>/dev/null || true
-                log_info "netplan DNS配置已更新"
-            }
-            ;;
+                if [ "$NETWORK_STACK" != "ipv4" ]; then printf "network:\n  version: 2\n  ethernets:\n    all:\n      nameservers:\n        addresses: [127.0.0.1, \"::1\"]\n" > /etc/netplan/90-mosdns-dns.yaml
+                else printf "network:\n  version: 2\n  ethernets:\n    all:\n      nameservers:\n        addresses: [127.0.0.1]\n" > /etc/netplan/90-mosdns-dns.yaml; fi
+                netplan apply 2>/dev/null; } ;;
         alpine)
             [ ! -f /etc/resolv.conf.original ] && [ -f /etc/resolv.conf ] && cp /etc/resolv.conf /etc/resolv.conf.original
-            if [ "$NETWORK_STACK" = "ipv6" ]; then
-                echo "nameserver ::1" > /etc/resolv.conf
-            elif [ "$NETWORK_STACK" = "dual" ]; then
-                printf "nameserver 127.0.0.1\nnameserver ::1\n" > /etc/resolv.conf
-            else
-                echo "nameserver 127.0.0.1" > /etc/resolv.conf
-            fi
-            [ -f /etc/udhcpc/udhcpc.conf ] && {
-                if grep -q "^RESOLV_CONF=" /etc/udhcpc/udhcpc.conf 2>/dev/null; then
-                    sed -i 's/^RESOLV_CONF=.*/RESOLV_CONF="NO"/' /etc/udhcpc/udhcpc.conf
-                else
-                    echo 'RESOLV_CONF="NO"' >> /etc/udhcpc/udhcpc.conf
-                fi
-                log_info "udhcpc DNS配置已更新"
-            }
+            if [ "$NETWORK_STACK" = "ipv6" ]; then echo "nameserver ::1" > /etc/resolv.conf
+            elif [ "$NETWORK_STACK" = "dual" ]; then printf "nameserver 127.0.0.1\nnameserver ::1\n" > /etc/resolv.conf
+            else echo "nameserver 127.0.0.1" > /etc/resolv.conf; fi
+            [ -f /etc/udhcpc/udhcpc.conf ] && { grep -q "^RESOLV_CONF=" /etc/udhcpc/udhcpc.conf 2>/dev/null && sed -i 's/^RESOLV_CONF=.*/RESOLV_CONF="NO"/' /etc/udhcpc/udhcpc.conf || echo 'RESOLV_CONF="NO"' >> /etc/udhcpc/udhcpc.conf; }
             mkdir -p /etc/network/if-up.d
             cat > /etc/network/if-up.d/mosdns-dns << 'ALPINEDNS'
 #!/bin/sh
@@ -574,8 +446,7 @@ if [ "$IFACE" != "lo" ] && [ -f /etc/resolv.conf.original ]; then
     ip -6 addr show scope global 2>/dev/null | grep -q inet6 && echo "nameserver ::1" >> /etc/resolv.conf
 fi
 ALPINEDNS
-            chmod +x /etc/network/if-up.d/mosdns-dns
-            ;;
+            chmod +x /etc/network/if-up.d/mosdns-dns ;;
     esac
     log_info "DNS保护配置完成"
 }
@@ -589,17 +460,10 @@ verify_installation() {
     PID=$(pgrep -x mosdns 2>/dev/null | head -1)
     [ -z "$PID" ] && { log_error "mosdns 未运行"; return 1; }
     log_info "mosdns 运行正常 (PID: $PID)"
-
-    if command -v nslookup >/dev/null 2>&1; then
-        timeout 5 nslookup cloudflare.com 127.0.0.1 >/dev/null 2>&1 && { log_info "DNS测试成功 (nslookup)"; return 0; }
-    fi
-    if command -v host >/dev/null 2>&1; then
-        timeout 5 host cloudflare.com 127.0.0.1 >/dev/null 2>&1 && { log_info "DNS测试成功 (host)"; return 0; }
-    fi
-    if command -v dig >/dev/null 2>&1; then
-        timeout 5 dig @127.0.0.1 +short cloudflare.com >/dev/null 2>&1 && { log_info "DNS测试成功 (dig)"; return 0; }
-    fi
-    log_warn "无法自动验证DNS，请手动检查"
+    if command -v nslookup >/dev/null 2>&1 && timeout 5 nslookup cloudflare.com 127.0.0.1 >/dev/null 2>&1; then log_info "DNS测试成功"; return 0; fi
+    if command -v host >/dev/null 2>&1 && timeout 5 host cloudflare.com 127.0.0.1 >/dev/null 2>&1; then log_info "DNS测试成功"; return 0; fi
+    if command -v dig >/dev/null 2>&1 && timeout 5 dig @127.0.0.1 +short cloudflare.com >/dev/null 2>&1; then log_info "DNS测试成功"; return 0; fi
+    log_warn "自动DNS验证未通过，请手动测试"
     return 0
 }
 
@@ -611,9 +475,7 @@ main() {
     echo "   MosDNS 一键部署脚本"
     echo "   Version: $VERSION"
     echo "========================================"
-    echo ""
     [ "$(id -u)" -ne 0 ] && { log_error "请使用root权限运行"; exit 1; }
-
     detect_os || exit 1
     detect_arch || exit 1
     detect_network_stack || exit 1
@@ -624,16 +486,9 @@ main() {
     setup_service || exit 1
     setup_dns || exit 1
     verify_installation || exit 1
-
     echo ""
     echo "========================================"
     log_info "MosDNS 部署完成！"
-    echo ""
-    log_info "管理命令:"
-    case "$OS" in
-        debian) echo "  systemctl status $SERVICE_NAME" ;;
-        alpine) echo "  rc-service $SERVICE_NAME status" ;;
-    esac
     echo "========================================"
 }
 
