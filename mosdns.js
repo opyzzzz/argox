@@ -1,9 +1,6 @@
 #!/bin/sh
 set -e
 
-# ============================================
-# 模块1: 变量和颜色定义
-# ============================================
 INSTALL_DIR="/opt/mosdns"
 BIN_PATH="$INSTALL_DIR/mosdns"
 CONFIG_PATH="$INSTALL_DIR/config.yaml"
@@ -12,32 +9,20 @@ LOG_FILE="$LOG_DIR/mosdns.log"
 SERVICE_NAME="mosdns"
 VERSION="v5.3.1"
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m'
-
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
 log_info() { printf "${GREEN}[INFO]${NC} %s\n" "$1"; }
 log_warn() { printf "${YELLOW}[WARN]${NC} %s\n" "$1"; }
 log_error() { printf "${RED}[ERROR]${NC} %s\n" "$1"; }
 
-safe_run() { "$@" 2>/dev/null || true; }
-
-# ============================================
-# 模块2: 环境检测
-# ============================================
 detect_os() {
     if [ -f /etc/os-release ]; then
         OS=$(grep "^ID=" /etc/os-release | cut -d= -f2 | tr -d '"')
         VER=$(grep "^VERSION_ID=" /etc/os-release | cut -d= -f2 | tr -d '"')
     elif [ -f /etc/alpine-release ]; then
-        OS="alpine"
-        VER=$(cat /etc/alpine-release)
+        OS="alpine"; VER=$(cat /etc/alpine-release)
     else
-        log_error "不支持的操作系统"
-        exit 1
+        log_error "不支持的操作系统"; exit 1
     fi
-
     case "$OS" in
         debian|ubuntu|raspbian) OS="debian" ;;
         alpine) OS="alpine" ;;
@@ -56,11 +41,7 @@ detect_arch() {
         i386|i686)     MOSDNS_ARCH="386" ;;
         mips64el)      MOSDNS_ARCH="mips64le" ;;
         mips64)
-            if [ "$(printf '\0\1' | od -A n -t d2 | awk '{print $1}')" = "256" ]; then
-                MOSDNS_ARCH="mips64le"
-            else
-                MOSDNS_ARCH="mips64"
-            fi ;;
+            [ "$(printf '\0\1' | od -A n -t d2 | awk '{print $1}')" = "256" ] && MOSDNS_ARCH="mips64le" || MOSDNS_ARCH="mips64" ;;
         riscv64)       MOSDNS_ARCH="riscv64" ;;
         *) log_error "不支持的架构: $ARCH"; exit 1 ;;
     esac
@@ -77,37 +58,25 @@ detect_network_stack() {
     else log_error "无可用网络连接"; exit 1; fi
 }
 
-# ============================================
-# 模块3: 依赖检测和安装
-# ============================================
 install_dependencies() {
     log_info "检测并安装依赖..."
     MISSING_DEPS=""
     for dep in curl unzip; do command -v $dep >/dev/null 2>&1 || MISSING_DEPS="$MISSING_DEPS $dep"; done
-    command -v ip >/dev/null 2>&1 || command -v ifconfig >/dev/null 2>&1 || MISSING_DEPS="$MISSING_DEPS iproute2"
+    (command -v ip >/dev/null 2>&1 || command -v ifconfig >/dev/null 2>&1) || MISSING_DEPS="$MISSING_DEPS iproute2"
     MISSING_DEPS=$(echo "$MISSING_DEPS" | sed 's/^ *//')
     [ -z "$MISSING_DEPS" ] && { log_info "所有依赖已安装"; return 0; }
-
     log_warn "缺少依赖: $MISSING_DEPS"
     set +e
     case "$OS" in
         debian)
             apt-get update -qq 2>/dev/null
             for dep in $MISSING_DEPS; do
-                case "$dep" in
-                    curl) apt-get install -y -qq curl 2>/dev/null ;;
-                    unzip) apt-get install -y -qq unzip 2>/dev/null ;;
-                    iproute2) apt-get install -y -qq iproute2 2>/dev/null ;;
-                esac
+                case "$dep" in curl) apt-get install -y -qq curl 2>/dev/null ;; unzip) apt-get install -y -qq unzip 2>/dev/null ;; iproute2) apt-get install -y -qq iproute2 2>/dev/null ;; esac
             done ;;
         alpine)
             apk update >/dev/null 2>&1
             for dep in $MISSING_DEPS; do
-                case "$dep" in
-                    curl) apk add curl 2>/dev/null ;;
-                    unzip) apk add unzip 2>/dev/null ;;
-                    iproute2) apk add iproute2 2>/dev/null ;;
-                esac
+                case "$dep" in curl) apk add curl 2>/dev/null ;; unzip) apk add unzip 2>/dev/null ;; iproute2) apk add iproute2 2>/dev/null ;; esac
             done ;;
     esac
     set -e
@@ -120,9 +89,6 @@ install_dependencies() {
     log_info "依赖安装完成"
 }
 
-# ============================================
-# 模块4: 下载和安装mosdns
-# ============================================
 install_mosdns() {
     log_info "开始安装 mosdns $VERSION..."
     DOWNLOAD_URL="https://github.com/IrineSistiana/mosdns/releases/download/${VERSION}/mosdns-linux-${MOSDNS_ARCH}.zip"
@@ -144,53 +110,36 @@ install_mosdns() {
     log_info "mosdns 安装完成"
 }
 
-# ============================================
-# 模块5: 生成配置文件（彻底重写，杜绝 YAML 错误）
-# ============================================
 generate_config() {
     log_info "生成配置文件..."
-    # 根据网络栈准备上游地址（用空格分隔的列表）
     case "$NETWORK_STACK" in
         ipv4)
-            CF_IPS="1.1.1.1 1.0.0.1"
-            GOOGLE_IPS="8.8.8.8 8.8.4.4"
-            CF_DOH="https://1.1.1.1/dns-query"
-            CF_TLS="tls://1.1.1.1"
-            GOOGLE_DOH="https://8.8.8.8/dns-query"
-            GOOGLE_TLS="tls://8.8.8.8"
-            LISTEN_ADDR="127.0.0.1:53"
-            LISTEN_ADDR_V6=""
+            CF_IPS="1.1.1.1 1.0.0.1"; GOOGLE_IPS="8.8.8.8 8.8.4.4"
+            CF_DOH="https://1.1.1.1/dns-query"; CF_TLS="tls://1.1.1.1"
+            GOOGLE_DOH="https://8.8.8.8/dns-query"; GOOGLE_TLS="tls://8.8.8.8"
+            LISTEN_ADDR="127.0.0.1:53"; LISTEN_ADDR_V6=""
             ;;
         ipv6)
-            CF_IPS="2606:4700:4700::1111 2606:4700:4700::1001"
-            GOOGLE_IPS="2001:4860:4860::8888 2001:4860:4860::8844"
-            CF_DOH="https://[2606:4700:4700::1111]/dns-query"
-            CF_TLS="tls://[2606:4700:4700::1111]"
-            GOOGLE_DOH="https://[2001:4860:4860::8888]/dns-query"
-            GOOGLE_TLS="tls://[2001:4860:4860::8888]"
-            LISTEN_ADDR="[::1]:53"
-            LISTEN_ADDR_V6=""
+            CF_IPS="2606:4700:4700::1111 2606:4700:4700::1001"; GOOGLE_IPS="2001:4860:4860::8888 2001:4860:4860::8844"
+            CF_DOH="https://[2606:4700:4700::1111]/dns-query"; CF_TLS="tls://[2606:4700:4700::1111]"
+            GOOGLE_DOH="https://[2001:4860:4860::8888]/dns-query"; GOOGLE_TLS="tls://[2001:4860:4860::8888]"
+            LISTEN_ADDR="[::1]:53"; LISTEN_ADDR_V6=""
             ;;
         dual)
-            CF_IPS="1.1.1.1 2606:4700:4700::1111"
-            GOOGLE_IPS="8.8.8.8 2001:4860:4860::8888"
-            CF_DOH="https://cloudflare-dns.com/dns-query"
-            CF_TLS="tls://cloudflare-dns.com"
-            GOOGLE_DOH="https://dns.google/dns-query"
-            GOOGLE_TLS="tls://dns.google"
-            LISTEN_ADDR="127.0.0.1:53"
-            LISTEN_ADDR_V6="[::1]:53"
+            CF_IPS="1.1.1.1 2606:4700:4700::1111"; GOOGLE_IPS="8.8.8.8 2001:4860:4860::8888"
+            CF_DOH="https://cloudflare-dns.com/dns-query"; CF_TLS="tls://cloudflare-dns.com"
+            GOOGLE_DOH="https://dns.google/dns-query"; GOOGLE_TLS="tls://dns.google"
+            LISTEN_ADDR="127.0.0.1:53"; LISTEN_ADDR_V6="[::1]:53"
             ;;
     esac
 
-    # 生成 IP 列表字符串（用于 YAML 中）
-    CF_IP_LIST=""; for ip in $CF_IPS; do CF_IP_LIST="${CF_IP_LIST}        - addr: \"$ip\"\n"; done
-    GOOGLE_IP_LIST=""; for ip in $GOOGLE_IPS; do GOOGLE_IP_LIST="${GOOGLE_IP_LIST}        - addr: \"$ip\"\n"; done
+    # 预生成 IP 列表
+    CF_IP_LINES=""; for ip in $CF_IPS; do CF_IP_LINES="${CF_IP_LINES}        - addr: \"$ip\"\n"; done
+    GOOGLE_IP_LINES=""; for ip in $GOOGLE_IPS; do GOOGLE_IP_LINES="${GOOGLE_IP_LINES}        - addr: \"$ip\"\n"; done
 
-    # 备份旧配置
     [ -f "$CONFIG_PATH" ] && cp "$CONFIG_PATH" "${CONFIG_PATH}.bak.$(date +%Y%m%d%H%M%S)"
 
-    # 一次性生成完整配置（确保所有缩进正确，无多余空格）
+    # 直接生成完整配置（无 server/servers 顶层键）
     cat > "$CONFIG_PATH" << EOF
 log:
   level: info
@@ -211,7 +160,7 @@ plugins:
           enable_http3: false
         - addr: "${CF_TLS}"
           enable_http3: false
-$(printf "$CF_IP_LIST")
+$(printf "$CF_IP_LINES")
   - tag: forward_google
     type: forward
     args:
@@ -220,7 +169,7 @@ $(printf "$CF_IP_LIST")
           enable_http3: false
         - addr: "${GOOGLE_TLS}"
           enable_http3: false
-$(printf "$GOOGLE_IP_LIST")
+$(printf "$GOOGLE_IP_LINES")
   - tag: concurrent_query
     type: concurrent
     args:
@@ -234,52 +183,49 @@ $(printf "$GOOGLE_IP_LIST")
       - exec: cache
       - exec: \$concurrent_query
 
-servers:
-  - exec: main_sequence
-    listener:
-      addr: "${LISTEN_ADDR}"
-      protocol: udp
-    timeout: 5s
+  # 使用 server 插件监听
+  - tag: udp_server
+    type: server
+    args:
+      entry: main_sequence
+      server:
+        addr: "${LISTEN_ADDR}"
+        protocol: udp
 
-  - exec: main_sequence
-    listener:
-      addr: "${LISTEN_ADDR}"
-      protocol: tcp
-    timeout: 5s
+  - tag: tcp_server
+    type: server
+    args:
+      entry: main_sequence
+      server:
+        addr: "${LISTEN_ADDR}"
+        protocol: tcp
 EOF
 
-    # 双栈添加 IPv6 监听
     if [ -n "${LISTEN_ADDR_V6:-}" ]; then
         cat >> "$CONFIG_PATH" << EOF
 
-  - exec: main_sequence
-    listener:
-      addr: "${LISTEN_ADDR_V6}"
-      protocol: udp
-    timeout: 5s
+  - tag: udp6_server
+    type: server
+    args:
+      entry: main_sequence
+      server:
+        addr: "${LISTEN_ADDR_V6}"
+        protocol: udp
 
-  - exec: main_sequence
-    listener:
-      addr: "${LISTEN_ADDR_V6}"
-      protocol: tcp
-    timeout: 5s
+  - tag: tcp6_server
+    type: server
+    args:
+      entry: main_sequence
+      server:
+        addr: "${LISTEN_ADDR_V6}"
+        protocol: tcp
 EOF
-    fi
-
-    # 验证配置（可选）
-    if "$BIN_PATH" start -c "$CONFIG_PATH" --dry-run >/dev/null 2>&1; then
-        log_info "配置文件 dry-run 验证通过"
-    else
-        log_warn "配置文件未能 dry-run 验证，但将继续部署"
     fi
 
     chmod 644 "$CONFIG_PATH"
     log_info "配置文件生成完成"
 }
 
-# ============================================
-# 模块6: 日志轮转配置
-# ============================================
 setup_logrotate() {
     log_info "配置日志轮转..."
     mkdir -p "$LOG_DIR"; touch "$LOG_FILE"; chmod 644 "$LOG_FILE"
@@ -339,9 +285,6 @@ ALPINE
     log_info "备用日志轮转配置完成 ($ROTATE_SCRIPT)"
 }
 
-# ============================================
-# 模块7: 系统服务配置
-# ============================================
 setup_service() {
     log_info "配置系统服务..."
     set +e
@@ -407,16 +350,12 @@ EOF
     esac
 }
 
-# ============================================
-# 模块8: DNS接管和保护
-# ============================================
 setup_dns() {
     log_info "配置系统DNS保护..."
     if command -v cloud-init >/dev/null 2>&1 && cloud-init status 2>/dev/null | grep -q "running\|done"; then
         mkdir -p /etc/cloud/cloud.cfg.d
         echo "manage_resolv_conf: false" > /etc/cloud/cloud.cfg.d/99-mosdns-dns.cfg
     fi
-
     case "$OS" in
         debian)
             systemctl is-active --quiet systemd-resolved 2>/dev/null && { systemctl stop systemd-resolved; systemctl disable systemd-resolved; log_info "已停用 systemd-resolved"; }
@@ -451,9 +390,6 @@ ALPINEDNS
     log_info "DNS保护配置完成"
 }
 
-# ============================================
-# 模块9: 验证安装
-# ============================================
 verify_installation() {
     log_info "验证安装..."
     sleep 2
@@ -467,9 +403,6 @@ verify_installation() {
     return 0
 }
 
-# ============================================
-# 模块10: 主函数
-# ============================================
 main() {
     echo "========================================"
     echo "   MosDNS 一键部署脚本"
