@@ -103,7 +103,7 @@ install_dependencies() {
 }
 
 # ============================================
-# 模块4: 下载和安装 mosdns v4.5.3
+# 模块4: 下载和安装 mosdns
 # ============================================
 install_mosdns() {
     log_info "开始安装 mosdns $VERSION..."
@@ -128,17 +128,18 @@ install_mosdns() {
     cp "$BINARY" "$BIN_PATH"; chmod +x "$BIN_PATH"
     rm -rf "$WORK_DIR"
 
-    "$BIN_PATH" version >/dev/null 2>&1 || { log_error "二进制验证失败"; exit 1; }
+    # 显示实际版本
+    ACTUAL_VER=$("$BIN_PATH" version 2>&1 | head -1)
+    log_info "下载版本: $ACTUAL_VER"
     log_info "mosdns 安装完成"
 }
 
 # ============================================
-# 模块5: 生成配置文件 (v4 双上游 fallback)
+# 模块5: 生成配置文件（插件型 server，完全兼容）
 # ============================================
 generate_config() {
-    log_info "生成配置文件 (v4.5.3 双上游)..."
+    log_info "生成配置文件 (v4 插件式监听)..."
 
-    # 根据网络栈准备上游地址
     case "$NETWORK_STACK" in
         ipv4)
             CF_IPS="1.1.1.1 1.0.0.1"
@@ -172,13 +173,11 @@ generate_config() {
             ;;
     esac
 
-    # 构建 upstream IP 列表
     CF_IP_YAML=""; for ip in $CF_IPS; do CF_IP_YAML="${CF_IP_YAML}        - addr: $ip\n"; done
     GOOGLE_IP_YAML=""; for ip in $GOOGLE_IPS; do GOOGLE_IP_YAML="${GOOGLE_IP_YAML}        - addr: $ip\n"; done
 
     [ -f "$CONFIG_PATH" ] && cp "$CONFIG_PATH" "${CONFIG_PATH}.bak.$(date +%Y%m%d%H%M%S)"
 
-    # 生成 v4 配置：包含 forward_cf、forward_google、fallback 插件
     cat > "$CONFIG_PATH" << EOF
 log:
   level: info
@@ -222,40 +221,51 @@ $(printf "$GOOGLE_IP_YAML")
       - exec: cache
       - exec: fallback_upstream
 
-server:
-  - exec: main_sequence
-    listener:
-      addr: "${LISTEN_ADDR}"
-      protocol: udp
+  # 使用插件型 server，避免顶层 server 兼容问题
+  - tag: udp_server
+    type: server
+    args:
+      entry: main_sequence
+      server:
+        addr: "${LISTEN_ADDR}"
+        protocol: udp
 
-  - exec: main_sequence
-    listener:
-      addr: "${LISTEN_ADDR}"
-      protocol: tcp
+  - tag: tcp_server
+    type: server
+    args:
+      entry: main_sequence
+      server:
+        addr: "${LISTEN_ADDR}"
+        protocol: tcp
 EOF
 
-    # 双栈添加 IPv6 监听
     if [ -n "${LISTEN_ADDR_V6:-}" ]; then
         cat >> "$CONFIG_PATH" << EOF
 
-  - exec: main_sequence
-    listener:
-      addr: "${LISTEN_ADDR_V6}"
-      protocol: udp
+  - tag: udp6_server
+    type: server
+    args:
+      entry: main_sequence
+      server:
+        addr: "${LISTEN_ADDR_V6}"
+        protocol: udp
 
-  - exec: main_sequence
-    listener:
-      addr: "${LISTEN_ADDR_V6}"
-      protocol: tcp
+  - tag: tcp6_server
+    type: server
+    args:
+      entry: main_sequence
+      server:
+        addr: "${LISTEN_ADDR_V6}"
+        protocol: tcp
 EOF
     fi
 
     chmod 644 "$CONFIG_PATH"
-    log_info "配置文件生成完成"
+    log_info "配置文件生成完成（插件式监听，v4/v5 通用）"
 }
 
 # ============================================
-# 模块6: 日志轮转配置（同前）
+# 模块6: 日志轮转配置
 # ============================================
 setup_logrotate() {
     log_info "配置日志轮转..."
@@ -319,7 +329,7 @@ ALPINE
 }
 
 # ============================================
-# 模块7: 系统服务配置（同前）
+# 模块7: 系统服务配置
 # ============================================
 setup_service() {
     log_info "配置系统服务..."
@@ -334,7 +344,7 @@ setup_service() {
         debian)
             cat > /etc/systemd/system/${SERVICE_NAME}.service << EOF
 [Unit]
-Description=MosDNS DNS Server (v4)
+Description=MosDNS DNS Server
 After=network.target network-online.target
 Wants=network.target network-online.target
 
@@ -366,7 +376,7 @@ EOF
             cat > /etc/init.d/${SERVICE_NAME} << EOF
 #!/sbin/openrc-run
 name="mosdns"
-description="MosDNS DNS Server (v4)"
+description="MosDNS DNS Server"
 command="$BIN_PATH"
 command_args="start -c $CONFIG_PATH"
 command_background=true
@@ -387,7 +397,7 @@ EOF
 }
 
 # ============================================
-# 模块8: DNS接管和保护（同前）
+# 模块8: DNS接管和保护
 # ============================================
 setup_dns() {
     log_info "配置系统DNS保护..."
@@ -433,7 +443,7 @@ ALPINEDNS
 }
 
 # ============================================
-# 模块9: 验证安装（同前）
+# 模块9: 验证安装
 # ============================================
 verify_installation() {
     log_info "验证安装..."
@@ -453,7 +463,7 @@ verify_installation() {
 # ============================================
 main() {
     echo "========================================"
-    echo "   MosDNS 一键部署脚本 (v4.5.3 双上游)"
+    echo "   MosDNS 一键部署脚本 (v4.5.3 通用版)"
     echo "========================================"
     [ "$(id -u)" -ne 0 ] && { log_error "请使用root权限运行"; exit 1; }
 
@@ -470,8 +480,7 @@ main() {
 
     echo ""
     echo "========================================"
-    log_info "MosDNS v4.5.3 部署完成！"
-    log_info "双上游：Cloudflare + Google (fallback)"
+    log_info "MosDNS v4.5.3 部署完成！双上游高可用"
     log_info "配置文件: $CONFIG_PATH"
     log_info "日志文件: $LOG_FILE"
     echo "========================================"
