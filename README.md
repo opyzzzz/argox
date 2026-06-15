@@ -28,11 +28,15 @@ dnsplus-DOT
 wget -qO- https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/dnsplus.sh | bash
 `````
 
-DOH
+SmartDNS
 `````
 wget -qO- https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/DOH.sh | bash
 `````
 
+MOSDNS
+`````
+wget -qO- https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/mosdns.js | bash
+`````
 
 check-doh dns
 `````
