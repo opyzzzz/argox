@@ -133,13 +133,11 @@ generate_config() {
             ;;
     esac
 
-    # 预生成 IP 列表
     CF_IP_LINES=""; for ip in $CF_IPS; do CF_IP_LINES="${CF_IP_LINES}        - addr: \"$ip\"\n"; done
     GOOGLE_IP_LINES=""; for ip in $GOOGLE_IPS; do GOOGLE_IP_LINES="${GOOGLE_IP_LINES}        - addr: \"$ip\"\n"; done
 
     [ -f "$CONFIG_PATH" ] && cp "$CONFIG_PATH" "${CONFIG_PATH}.bak.$(date +%Y%m%d%H%M%S)"
 
-    # 直接生成完整配置（无 server/servers 顶层键）
     cat > "$CONFIG_PATH" << EOF
 log:
   level: info
@@ -150,12 +148,11 @@ plugins:
     type: cache
     args:
       size: 4096
-      lazy_cache_ttl: 86400
 
   - tag: forward_cf
     type: forward
     args:
-      upstream:
+      upstreams:
         - addr: "${CF_DOH}"
           enable_http3: false
         - addr: "${CF_TLS}"
@@ -164,7 +161,7 @@ $(printf "$CF_IP_LINES")
   - tag: forward_google
     type: forward
     args:
-      upstream:
+      upstreams:
         - addr: "${GOOGLE_DOH}"
           enable_http3: false
         - addr: "${GOOGLE_TLS}"
@@ -181,9 +178,8 @@ $(printf "$GOOGLE_IP_LINES")
     type: sequence
     args:
       - exec: cache
-      - exec: \$concurrent_query
+      - exec: concurrent_query
 
-  # 使用 server 插件监听
   - tag: udp_server
     type: server
     args:
@@ -220,6 +216,13 @@ EOF
         addr: "${LISTEN_ADDR_V6}"
         protocol: tcp
 EOF
+    fi
+
+    # 尝试用 test 子命令验证
+    if "$BIN_PATH" test -c "$CONFIG_PATH" >/dev/null 2>&1; then
+        log_info "配置文件语法验证通过"
+    else
+        log_warn "配置文件未能通过语法验证，但将继续部署"
     fi
 
     chmod 644 "$CONFIG_PATH"
