@@ -1,7 +1,7 @@
 #!/bin/sh
 #==========================================================================
-# SmartDNS 智能部署脚本 v6.4.2
-# 修复: tmpfs 上 cp 失败 → 统一用 cat > 写入
+# SmartDNS 智能部署脚本 v6.4.3
+# 修复: resolved 策略优先级 + resolv.conf 添加 edns0 trust-ad
 #==========================================================================
 set +e
 
@@ -138,7 +138,6 @@ safe_rc_add() {
     fi
 }
 
-# 写入 resolv.conf（统一用 cat > 绕过 tmpfs 的 cp 限制）
 write_resolv() {
     cat "$RESOLV_TEMPLATE" > /etc/resolv.conf
 }
@@ -220,10 +219,11 @@ module_detect() {
         log_warn "tmpfiles.d 管理 resolv.conf"
     fi
     
-    if $VIRT_IS_CONTAINER && $RESOLV_IS_TMPFS; then
-        TAKEOVER_STRATEGY="podman"
-    elif $SYSTEMD_RESOLVED_RUNNING; then
+    # 策略优先级: resolved > podman > cloudinit > standard
+    if $SYSTEMD_RESOLVED_RUNNING; then
         TAKEOVER_STRATEGY="resolved"
+    elif $VIRT_IS_CONTAINER && $RESOLV_IS_TMPFS; then
+        TAKEOVER_STRATEGY="podman"
     elif $CLOUD_INIT_EXISTS && $CLOUD_INIT_MANAGES_DNS; then
         TAKEOVER_STRATEGY="cloudinit"
     else
@@ -300,10 +300,12 @@ module_config() {
     [ -f /etc/smartdns/smartdns.conf ] && \
         cp /etc/smartdns/smartdns.conf "/etc/smartdns/smartdns.conf.bak.$(date +%Y%m%d-%H%M%S)" 2>/dev/null
     
+    # 预生成 DNS 模板（含 edns0 trust-ad）
     if [ "$HAS_IPV6" = true ] && [ "$HAS_IPV4" = true ]; then
         cat > "$RESOLV_TEMPLATE" << EOF
 nameserver 127.0.0.1
 nameserver ::1
+options edns0 trust-ad
 EOF
         cat > "$RESOLV_FALLBACK" << EOF
 nameserver 1.1.1.1
@@ -314,6 +316,7 @@ EOF
     elif [ "$HAS_IPV6" = true ]; then
         cat > "$RESOLV_TEMPLATE" << EOF
 nameserver ::1
+options edns0 trust-ad
 EOF
         cat > "$RESOLV_FALLBACK" << EOF
 nameserver 2606:4700:4700::1111
@@ -322,6 +325,7 @@ EOF
     else
         cat > "$RESOLV_TEMPLATE" << EOF
 nameserver 127.0.0.1
+options edns0 trust-ad
 EOF
         cat > "$RESOLV_FALLBACK" << EOF
 nameserver 1.1.1.1
@@ -341,7 +345,7 @@ EOF
     fi
     
     cat > /etc/smartdns/smartdns.conf << EOF
-# SmartDNS 配置 v6.4.2
+# SmartDNS 配置 v6.4.3
 # 环境: $OS_TYPE $OS_VER | $VIRT_TYPE | $NET_STACK
 # 版本: $SMARTDNS_VER | 来源: $SMARTDNS_SOURCE
 # 策略: $TAKEOVER_STRATEGY | 时间: $(date '+%Y-%m-%d %H:%M:%S')
@@ -440,7 +444,7 @@ module_dns_takeover() {
         cp /etc/resolv.conf "/etc/resolv.conf.bak.$(date +%Y%m%d-%H%M%S)" 2>/dev/null
     fi
     
-    # 策略B: resolved
+    # 策略: resolved（优先级最高）
     if [ "$TAKEOVER_STRATEGY" = "resolved" ]; then
         log_info "执行策略: 停用 systemd-resolved"
         systemctl stop systemd-resolved 2>/dev/null
@@ -460,7 +464,7 @@ module_dns_takeover() {
         fi
     fi
     
-    # 策略C: cloudinit
+    # 策略: cloudinit
     if [ "$TAKEOVER_STRATEGY" = "cloudinit" ]; then
         log_info "执行策略: 禁用 cloud-init DNS 管理"
         mkdir -p /etc/cloud/cloud.cfg.d
@@ -468,7 +472,7 @@ module_dns_takeover() {
         log_ok "cloud-init DNS 管理已禁用"
     fi
     
-    # 通用: 写入 DNS（用 cat > 绕过 tmpfs 的 cp 限制）
+    # 通用: 写入 DNS
     if [ "$TAKEOVER_STRATEGY" != "resolved" ]; then
         write_resolv
     fi
@@ -515,11 +519,11 @@ SSTART
         log_ok "systemd oneshot 服务已创建"
     fi
     
-    # DNS 守护脚本（restore_dns 也用 cat >）
+    # DNS 守护脚本
     log_info "部署 DNS 文件守护"
     cat > "$GUARD_SCRIPT" << GUARD
 #!/bin/sh
-# SmartDNS DNS 文件守护 v6.4.2
+# SmartDNS DNS 文件守护 v6.4.3
 TARGET="/etc/resolv.conf"
 TEMPLATE="${RESOLV_TEMPLATE}"
 PID_FILE="${PID_FILE}"
@@ -880,7 +884,7 @@ main() {
     fi
     
     echo ""
-    echo -e "${BOLD}SmartDNS 智能部署 v6.4.2${NC}"
+    echo -e "${BOLD}SmartDNS 智能部署 v6.4.3${NC}"
     echo -e "上游: Google + Cloudflare (DoH/DoT/UDP)"
     echo -e "环境: Alpine/Debian (LXC/KVM/Podman)"
     echo ""
