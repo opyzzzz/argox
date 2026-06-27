@@ -1,7 +1,7 @@
 #!/bin/sh
 #==========================================================================
-# SmartDNS 智能部署脚本 v6.3.4
-# 更新: 纯IPv6 环境全适配 + 卸载恢复适配 + 守护注释修正
+# SmartDNS 智能部署脚本 v6.3.5
+# 更新: 全部改用 cat/fprintf 直接写入 + 命令替换换行保护
 #==========================================================================
 set +e
 
@@ -130,18 +130,25 @@ safe_rc_add() {
     fi
 }
 
-# 生成符合当前网络栈的 resolv.conf 内容
-generate_resolv_content() {
+# 直接写入 resolv.conf，不经过变量（避免命令替换吃掉换行）
+write_resolv_conf() {
     if [ "$HAS_IPV6" = true ] && [ "$HAS_IPV4" = true ]; then
-        printf "nameserver 127.0.0.1\nnameserver ::1\n"
+        cat > "$1" << EOF
+nameserver 127.0.0.1
+nameserver ::1
+EOF
     elif [ "$HAS_IPV6" = true ]; then
-        printf "nameserver ::1\n"
+        cat > "$1" << EOF
+nameserver ::1
+EOF
     else
-        printf "nameserver 127.0.0.1\n"
+        cat > "$1" << EOF
+nameserver 127.0.0.1
+EOF
     fi
 }
 
-# 生成启动覆盖的 grep 检测关键词
+# 生成启动覆盖用检测关键词
 get_detect_keyword() {
     if [ "$HAS_IPV4" = true ]; then
         echo "nameserver 127.0.0.1"
@@ -150,14 +157,36 @@ get_detect_keyword() {
     fi
 }
 
-# 生成卸载时的回退 DNS
-generate_fallback_dns() {
+# 生成 resolv.conf 内容为变量（仅 systemd ExecStart 使用，末尾加保护换行）
+get_resolv_content_for_systemd() {
     if [ "$HAS_IPV6" = true ] && [ "$HAS_IPV4" = true ]; then
-        printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\nnameserver 2606:4700:4700::1111\nnameserver 2001:4860:4860::8888\n"
+        printf "nameserver 127.0.0.1\\nnameserver ::1\\n\\n"
     elif [ "$HAS_IPV6" = true ]; then
-        printf "nameserver 2606:4700:4700::1111\nnameserver 2001:4860:4860::8888\n"
+        printf "nameserver ::1\\n\\n"
     else
-        printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\n"
+        printf "nameserver 127.0.0.1\\n\\n"
+    fi
+}
+
+# 卸载时的回退 DNS
+write_fallback_dns() {
+    if [ "$HAS_IPV6" = true ] && [ "$HAS_IPV4" = true ]; then
+        cat > /etc/resolv.conf << EOF
+nameserver 1.1.1.1
+nameserver 8.8.8.8
+nameserver 2606:4700:4700::1111
+nameserver 2001:4860:4860::8888
+EOF
+    elif [ "$HAS_IPV6" = true ]; then
+        cat > /etc/resolv.conf << EOF
+nameserver 2606:4700:4700::1111
+nameserver 2001:4860:4860::8888
+EOF
+    else
+        cat > /etc/resolv.conf << EOF
+nameserver 1.1.1.1
+nameserver 8.8.8.8
+EOF
     fi
 }
 
@@ -335,7 +364,7 @@ module_config() {
     fi
     
     cat > /etc/smartdns/smartdns.conf << EOF
-# SmartDNS 配置 v6.3.4
+# SmartDNS 配置 v6.3.5
 # 环境: $OS_TYPE $OS_VER | $VIRT_TYPE | $NET_STACK
 # 版本: $SMARTDNS_VER | 来源: $SMARTDNS_SOURCE
 # 策略: $TAKEOVER_STRATEGY | 时间: $(date '+%Y-%m-%d %H:%M:%S')
@@ -441,7 +470,6 @@ module_dns_takeover() {
         cp /etc/resolv.conf "/etc/resolv.conf.bak.$(date +%Y%m%d-%H%M%S)" 2>/dev/null
     fi
     
-    RESOLV_CONTENT=$(generate_resolv_content)
     DETECT_KEYWORD=$(get_detect_keyword)
     
     # --- 策略B: resolved ---
@@ -451,7 +479,7 @@ module_dns_takeover() {
         systemctl disable systemd-resolved 2>/dev/null
         systemctl mask systemd-resolved 2>/dev/null
         rm -f /etc/resolv.conf
-        printf "%s" "$RESOLV_CONTENT" > /etc/resolv.conf
+        write_resolv_conf /etc/resolv.conf
         if [ "$TMPFILES_HAS_RESOLV" = true ]; then
             mkdir -p /etc/tmpfiles.d
             printf "# SmartDNS 已接管\n" > /etc/tmpfiles.d/systemd-resolved.conf
@@ -472,37 +500,71 @@ module_dns_takeover() {
         log_ok "cloud-init DNS 管理已禁用"
     fi
     
-    # --- 通用: 写入 DNS 配置 ---
+    # --- 通用: 直接写入 DNS 配置（不经过变量） ---
     if [ "$TAKEOVER_STRATEGY" != "resolved" ]; then
-        printf "%s" "$RESOLV_CONTENT" > /etc/resolv.conf
+        write_resolv_conf /etc/resolv.conf
     fi
     
-    printf "%s" "$RESOLV_CONTENT" > /etc/resolv.conf.smartdns.bak
+    write_resolv_conf /etc/resolv.conf.smartdns.bak
     chmod 644 /etc/resolv.conf.smartdns.bak 2>/dev/null
     
     # --- 启动覆盖脚本 ---
     if [ "$INIT_TYPE" = "openrc" ]; then
         log_info "创建 Alpine 启动覆盖脚本"
         mkdir -p /etc/local.d
-        cat > /etc/local.d/smartdns-dns.start << LSTART
+        
+        # 用 cat heredoc + 直接调用函数，换行符完整保留
+        if [ "$HAS_IPV6" = true ] && [ "$HAS_IPV4" = true ]; then
+            cat > /etc/local.d/smartdns-dns.start << 'LSTART'
 #!/bin/sh
 sleep 5
 for i in 1 2 3 4 5; do
-    if grep -q "${DETECT_KEYWORD}" /etc/resolv.conf 2>/dev/null; then
+    if grep -q "nameserver 127.0.0.1" /etc/resolv.conf 2>/dev/null; then
         exit 0
     fi
     sleep 1
 done
-cat > /etc/resolv.conf << INNER
-${RESOLV_CONTENT}
+cat > /etc/resolv.conf << 'INNER'
+nameserver 127.0.0.1
+nameserver ::1
 INNER
 LSTART
+        elif [ "$HAS_IPV6" = true ]; then
+            cat > /etc/local.d/smartdns-dns.start << 'LSTART'
+#!/bin/sh
+sleep 5
+for i in 1 2 3 4 5; do
+    if grep -q "nameserver ::1" /etc/resolv.conf 2>/dev/null; then
+        exit 0
+    fi
+    sleep 1
+done
+cat > /etc/resolv.conf << 'INNER'
+nameserver ::1
+INNER
+LSTART
+        else
+            cat > /etc/local.d/smartdns-dns.start << 'LSTART'
+#!/bin/sh
+sleep 5
+for i in 1 2 3 4 5; do
+    if grep -q "nameserver 127.0.0.1" /etc/resolv.conf 2>/dev/null; then
+        exit 0
+    fi
+    sleep 1
+done
+cat > /etc/resolv.conf << 'INNER'
+nameserver 127.0.0.1
+INNER
+LSTART
+        fi
         chmod +x /etc/local.d/smartdns-dns.start
         safe_rc_add local default
         log_ok "local.d 启动脚本已创建"
         
     elif [ "$INIT_TYPE" = "systemd" ]; then
         log_info "创建 systemd oneshot 启动覆盖"
+        RESOLV_CONTENT=$(get_resolv_content_for_systemd)
         ESCAPED_CONTENT=$(printf "%s" "$RESOLV_CONTENT" | sed 's/\$/$$/g')
         cat > /etc/systemd/system/smartdns-dns-fix.service << SSTART
 [Unit]
@@ -526,19 +588,17 @@ SSTART
     log_info "部署 DNS 文件守护"
     cat > "$GUARD_SCRIPT" << 'GUARD'
 #!/bin/sh
-# SmartDNS DNS 文件守护 v6.3.4
+# SmartDNS DNS 文件守护 v6.3.5
 TARGET="/etc/resolv.conf"
 BACKUP="/etc/resolv.conf.smartdns.bak"
 PID_FILE="/var/run/smartdns-dns-guard.pid"
 
-# 在子进程中运行守护逻辑，父进程立即退出（兼容 systemd Type=forking）
+# 子进程运行守护逻辑，父进程立即退出（兼容 systemd Type=forking）
 (
-    # 子进程 PID 写入文件供 systemd/OpenRC 跟踪
     echo $$ > "$PID_FILE"
     
     cleanup() {
         rm -f "$PID_FILE"
-        # 清理子进程的子进程（inotify 管道等）
         pkill -P $$ 2>/dev/null
         exit 0
     }
@@ -701,7 +761,6 @@ module_verify() {
     sleep 2
     ALL_OK=true
     
-    # IPv4 解析测试
     if [ "$HAS_IPV4" = true ]; then
         log_info "DNS 解析测试 (IPv4)..."
         for domain in google.com cloudflare.com; do
@@ -722,7 +781,6 @@ module_verify() {
         log_info "跳过 IPv4 解析测试（纯 IPv6 环境）"
     fi
     
-    # IPv6 解析测试
     if [ "$HAS_IPV6" = true ]; then
         log_info "DNS 解析测试 (IPv6)..."
         if [ "$PORT" = "53" ]; then
@@ -738,7 +796,6 @@ module_verify() {
         fi
     fi
     
-    # DoH/DoT 连通性测试（适配网络栈）
     if [ "$IS_VER_NEW" = true ]; then
         echo ""
         log_info "DoH 连通性测试..."
@@ -902,13 +959,12 @@ module_uninstall() {
         log_info "已清理旧版 cron 残留"
     fi
     
-    # 恢复 DNS（适配网络栈）
     BAK=$(ls -t /etc/resolv.conf.bak.* 2>/dev/null | head -1)
     if [ -n "$BAK" ]; then
         cp "$BAK" /etc/resolv.conf
         log_ok "恢复 DNS: $(head -1 /etc/resolv.conf)"
     else
-        generate_fallback_dns > /etc/resolv.conf
+        write_fallback_dns
         log_ok "恢复 DNS（${NET_STACK}）"
     fi
     
@@ -931,7 +987,7 @@ main() {
     fi
     
     echo ""
-    echo -e "${BOLD}SmartDNS 智能部署 v6.3.4${NC}"
+    echo -e "${BOLD}SmartDNS 智能部署 v6.3.5${NC}"
     echo -e "上游: Google + Cloudflare (DoH/DoT/UDP)"
     echo -e "环境: Alpine/Debian (LXC/KVM/Podman)"
     echo ""
