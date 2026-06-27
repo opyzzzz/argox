@@ -23,9 +23,9 @@ dns
 curl -fsSL https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/smart_dns.sh -o smart_dns.sh && chmod +x smart_dns.sh && ./smart_dns.sh && rm -f smart_dns.sh
 `````
 
-dnsplus-DOT
+dns-detective
 `````
-wget -qO- https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/dnsplus.sh | bash
+wget -qO- https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/dns-detective.sh | sh
 `````
 
 SmartDNS
