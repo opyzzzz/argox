@@ -1,7 +1,7 @@
 #!/bin/sh
 #==========================================================================
-# SmartDNS 智能部署脚本 v6.4.9
-# 修复: ensure_tools 合并安装，减少 apt 调用次数
+# SmartDNS 智能部署脚本 v6.4.10
+# 优化: inotify 安装提前到 ensure_tools，与其他工具同批安装
 #==========================================================================
 set +e
 
@@ -108,6 +108,10 @@ ensure_tools() {
     if ! command -v nc >/dev/null 2>&1; then
         case "$PKG_MGR" in apk) tools_missing="$tools_missing netcat-openbsd" ;; apt) tools_missing="$tools_missing netcat-openbsd" ;; esac
     fi
+    # inotify 提前到此处安装，与其他工具同批，共享 apt 缓存
+    if ! command -v inotifywait >/dev/null 2>&1 && ! command -v inotifyd >/dev/null 2>&1; then
+        case "$PKG_MGR" in apk) tools_missing="$tools_missing inotify-tools" ;; apt) tools_missing="$tools_missing inotify-tools" ;; esac
+    fi
     if [ -n "$tools_missing" ]; then
         log_info "安装缺失工具: $tools_missing"
         pkg_install "$tools_missing" || log_warn "部分工具安装失败"
@@ -145,14 +149,7 @@ detect_inotify() {
         INOTIFY_ARGS="-"
         return 0
     fi
-    
-    if pkg_install inotify-tools 3; then
-        INOTIFY_CMD="inotifywait"
-        INOTIFY_ARGS="-m -e modify,close_write"
-        return 0
-    fi
-    
-    log_warn "inotify-tools 安装失败，将使用轻量级轮询"
+    log_warn "inotify 工具不可用，将使用轻量级轮询 (5秒间隔)"
     return 1
 }
 
@@ -357,7 +354,7 @@ EOF
     fi
     
     cat > /etc/smartdns/smartdns.conf << EOF
-# SmartDNS 配置 v6.4.9
+# SmartDNS 配置 v6.4.10
 # 环境: $OS_TYPE $OS_VER | $VIRT_TYPE | $NET_STACK
 # 版本: $SMARTDNS_VER | 来源: $SMARTDNS_SOURCE
 # 策略: $TAKEOVER_STRATEGY | 时间: $(date '+%Y-%m-%d %H:%M:%S')
@@ -526,7 +523,7 @@ SSTART
     log_info "部署 DNS 文件守护"
     cat > "$GUARD_SCRIPT" << GUARD
 #!/bin/sh
-# SmartDNS DNS 文件守护 v6.4.9
+# SmartDNS DNS 文件守护 v6.4.10
 TARGET="/etc/resolv.conf"
 TEMPLATE="${RESOLV_TEMPLATE}"
 PID_FILE="${PID_FILE}"
@@ -892,7 +889,7 @@ main() {
     done
     
     echo ""
-    echo -e "${BOLD}SmartDNS 智能部署 v6.4.9${NC}"
+    echo -e "${BOLD}SmartDNS 智能部署 v6.4.10${NC}"
     echo -e "上游: Google + Cloudflare (DoH/DoT/UDP)"
     echo -e "环境: Alpine/Debian (LXC/KVM/Podman)"
     echo ""
