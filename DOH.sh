@@ -1,7 +1,7 @@
 #!/bin/sh
 #==========================================================================
-# SmartDNS 智能部署脚本 v6.3.5
-# 更新: 全部改用 cat/fprintf 直接写入 + 命令替换换行保护
+# SmartDNS 智能部署脚本 v6.4.1
+# 优化: dns_query 封装 + 守护模板存在检查
 #==========================================================================
 set +e
 
@@ -29,6 +29,10 @@ ARCH=""; PKG_MGR=""
 INOTIFY_CMD=""; INOTIFY_ARGS=""
 PID_FILE="/var/run/smartdns-dns-guard.pid"
 GUARD_SCRIPT="/usr/local/bin/smartdns-dns-guard.sh"
+
+RESOLV_TEMPLATE="/etc/smartdns/resolv.smartdns"
+RESOLV_BACKUP="/etc/resolv.conf.smartdns.bak"
+RESOLV_FALLBACK="/etc/smartdns/resolv.fallback"
 
 download_file() {
     local url="$1" output="$2"
@@ -82,6 +86,17 @@ ensure_tools() {
     fi
 }
 
+# 统一 DNS 查询封装
+dns_query() {
+    local domain="$1" server="$2"
+    if [ "$PORT" = "53" ]; then
+        safe_nslookup "$domain" "$server"
+    else
+        nslookup -timeout=5 -port="$PORT" "$domain" "$server" 2>&1 || \
+        nslookup -port="$PORT" "$domain" "$server" 2>&1
+    fi
+}
+
 safe_nslookup() {
     local domain="$1" server="$2" output
     if output=$(nslookup -timeout=5 "$domain" "$server" 2>&1); then
@@ -130,66 +145,6 @@ safe_rc_add() {
     fi
 }
 
-# 直接写入 resolv.conf，不经过变量（避免命令替换吃掉换行）
-write_resolv_conf() {
-    if [ "$HAS_IPV6" = true ] && [ "$HAS_IPV4" = true ]; then
-        cat > "$1" << EOF
-nameserver 127.0.0.1
-nameserver ::1
-EOF
-    elif [ "$HAS_IPV6" = true ]; then
-        cat > "$1" << EOF
-nameserver ::1
-EOF
-    else
-        cat > "$1" << EOF
-nameserver 127.0.0.1
-EOF
-    fi
-}
-
-# 生成启动覆盖用检测关键词
-get_detect_keyword() {
-    if [ "$HAS_IPV4" = true ]; then
-        echo "nameserver 127.0.0.1"
-    else
-        echo "nameserver ::1"
-    fi
-}
-
-# 生成 resolv.conf 内容为变量（仅 systemd ExecStart 使用，末尾加保护换行）
-get_resolv_content_for_systemd() {
-    if [ "$HAS_IPV6" = true ] && [ "$HAS_IPV4" = true ]; then
-        printf "nameserver 127.0.0.1\\nnameserver ::1\\n\\n"
-    elif [ "$HAS_IPV6" = true ]; then
-        printf "nameserver ::1\\n\\n"
-    else
-        printf "nameserver 127.0.0.1\\n\\n"
-    fi
-}
-
-# 卸载时的回退 DNS
-write_fallback_dns() {
-    if [ "$HAS_IPV6" = true ] && [ "$HAS_IPV4" = true ]; then
-        cat > /etc/resolv.conf << EOF
-nameserver 1.1.1.1
-nameserver 8.8.8.8
-nameserver 2606:4700:4700::1111
-nameserver 2001:4860:4860::8888
-EOF
-    elif [ "$HAS_IPV6" = true ]; then
-        cat > /etc/resolv.conf << EOF
-nameserver 2606:4700:4700::1111
-nameserver 2001:4860:4860::8888
-EOF
-    else
-        cat > /etc/resolv.conf << EOF
-nameserver 1.1.1.1
-nameserver 8.8.8.8
-EOF
-    fi
-}
-
 #==================================================
 # 模块0: 环境检测
 #==================================================
@@ -234,7 +189,7 @@ module_detect() {
     else NET_STACK="纯IPv6"; fi
     log_info "网络栈: $NET_STACK (IPv4: $HAS_IPV4, IPv6: $HAS_IPV6)"
     
-    RESOLV_IS_SYMLINK=false; RESOLV_IS_TMPFS=false; RESOLV_FS_TYPE=""
+    RESOLV_IS_SYMLINK=false; RESOLV_IS_TMPFS=false
     SYSTEMD_RESOLVED_RUNNING=false; CLOUD_INIT_EXISTS=false
     CLOUD_INIT_MANAGES_DNS=false; TMPFILES_HAS_RESOLV=false
     
@@ -243,19 +198,17 @@ module_detect() {
         RESOLV_FS_TYPE=$(df -T /etc/resolv.conf 2>/dev/null | tail -1 | awk '{print $2}')
         [ "$RESOLV_FS_TYPE" = "tmpfs" ] && RESOLV_IS_TMPFS=true
     fi
-    log_info "resolv.conf: 软链接=$RESOLV_IS_SYMLINK, tmpfs=$RESOLV_IS_TMPFS, fs=$RESOLV_FS_TYPE"
+    log_info "resolv.conf: 软链接=$RESOLV_IS_SYMLINK, tmpfs=$RESOLV_IS_TMPFS"
     
-    if command -v resolvectl >/dev/null 2>&1; then
-        if resolvectl status >/dev/null 2>&1; then
-            SYSTEMD_RESOLVED_RUNNING=true
-            log_warn "systemd-resolved 运行中"
-        fi
+    if command -v resolvectl >/dev/null 2>&1 && resolvectl status >/dev/null 2>&1; then
+        SYSTEMD_RESOLVED_RUNNING=true
+        log_warn "systemd-resolved 运行中"
     fi
     
     if command -v cloud-init >/dev/null 2>&1; then
         CLOUD_INIT_EXISTS=true
-        if [ -f /etc/cloud/cloud.cfg ]; then
-            grep -q "resolv_conf\|manage-resolv-conf" /etc/cloud/cloud.cfg 2>/dev/null && CLOUD_INIT_MANAGES_DNS=true
+        if [ -f /etc/cloud/cloud.cfg ] && grep -q "resolv_conf\|manage-resolv-conf" /etc/cloud/cloud.cfg 2>/dev/null; then
+            CLOUD_INIT_MANAGES_DNS=true
         fi
         for cfg in /etc/cloud/cloud.cfg.d/*; do
             [ -f "$cfg" ] || continue
@@ -266,7 +219,7 @@ module_detect() {
     
     if find /usr/lib/tmpfiles.d/ /etc/tmpfiles.d/ -maxdepth 1 -type f -exec grep -l "/etc/resolv.conf" {} \; 2>/dev/null | grep -q .; then
         TMPFILES_HAS_RESOLV=true
-        log_warn "tmpfiles.d 管理 resolv.conf 软链接"
+        log_warn "tmpfiles.d 管理 resolv.conf"
     fi
     
     if $VIRT_IS_CONTAINER && $RESOLV_IS_TMPFS; then
@@ -294,14 +247,12 @@ module_install() {
     TEMP_BIN="/tmp/smartdns-$$"
     
     log_info "尝试 GitHub 最新版..."
-    if download_file "$GITHUB_URL" "$TEMP_BIN"; then
-        if [ -s "$TEMP_BIN" ]; then
-            chmod +x "$TEMP_BIN"
-            mv "$TEMP_BIN" /usr/bin/smartdns
-            SMARTDNS_BIN="/usr/bin/smartdns"
-            SMARTDNS_SOURCE="GitHub"
-            log_ok "GitHub 最新版安装成功"
-        fi
+    if download_file "$GITHUB_URL" "$TEMP_BIN" && [ -s "$TEMP_BIN" ]; then
+        chmod +x "$TEMP_BIN"
+        mv "$TEMP_BIN" /usr/bin/smartdns
+        SMARTDNS_BIN="/usr/bin/smartdns"
+        SMARTDNS_SOURCE="GitHub"
+        log_ok "GitHub 最新版安装成功"
     fi
     rm -f "$TEMP_BIN"
     
@@ -331,28 +282,58 @@ module_install() {
     fi
     
     if [ -z "$SMARTDNS_BIN" ] || [ ! -x "$SMARTDNS_BIN" ]; then
-        log_err "所有安装方式均失败"
-        echo "手动安装: wget $GITHUB_URL -O /usr/bin/smartdns && chmod +x /usr/bin/smartdns"
-        exit 1
+        log_err "所有安装方式均失败"; exit 1
     fi
     
     SMARTDNS_VER=$("$SMARTDNS_BIN" -v 2>&1 | head -1)
     SMARTDNS_VER_NUM=$(get_version_number "$SMARTDNS_BIN")
     [ "$SMARTDNS_VER_NUM" -ge 42 ] 2>/dev/null && IS_VER_NEW=true || IS_VER_NEW=false
     log_info "版本: $SMARTDNS_VER (来源: $SMARTDNS_SOURCE)"
-    [ "$IS_VER_NEW" = true ] && log_ok "支持 upstream-group 自动降级" || log_warn "版本<42，不支持 upstream-group"
+    [ "$IS_VER_NEW" = true ] && log_ok "支持 upstream-group 自动降级"
 }
 
 #==================================================
-# 模块2: 生成配置
+# 模块2: 生成配置与 DNS 模板
 #==================================================
 module_config() {
-    log_step "模块2: 生成配置"
+    log_step "模块2: 生成配置与 DNS 模板"
     
     mkdir -p /etc/smartdns
     [ -f /etc/smartdns/smartdns.conf ] && \
         cp /etc/smartdns/smartdns.conf "/etc/smartdns/smartdns.conf.bak.$(date +%Y%m%d-%H%M%S)" 2>/dev/null
     
+    # 预生成 DNS 模板文件
+    if [ "$HAS_IPV6" = true ] && [ "$HAS_IPV4" = true ]; then
+        cat > "$RESOLV_TEMPLATE" << EOF
+nameserver 127.0.0.1
+nameserver ::1
+EOF
+        cat > "$RESOLV_FALLBACK" << EOF
+nameserver 1.1.1.1
+nameserver 8.8.8.8
+nameserver 2606:4700:4700::1111
+nameserver 2001:4860:4860::8888
+EOF
+    elif [ "$HAS_IPV6" = true ]; then
+        cat > "$RESOLV_TEMPLATE" << EOF
+nameserver ::1
+EOF
+        cat > "$RESOLV_FALLBACK" << EOF
+nameserver 2606:4700:4700::1111
+nameserver 2001:4860:4860::8888
+EOF
+    else
+        cat > "$RESOLV_TEMPLATE" << EOF
+nameserver 127.0.0.1
+EOF
+        cat > "$RESOLV_FALLBACK" << EOF
+nameserver 1.1.1.1
+nameserver 8.8.8.8
+EOF
+    fi
+    log_ok "DNS 模板已生成: $RESOLV_TEMPLATE"
+    
+    # 端口选择
     PORT=53
     if port_in_use 53; then
         log_warn "端口 53 被占用"
@@ -363,8 +344,9 @@ module_config() {
         log_ok "端口 53 可用"
     fi
     
+    # SmartDNS 配置
     cat > /etc/smartdns/smartdns.conf << EOF
-# SmartDNS 配置 v6.3.5
+# SmartDNS 配置 v6.4.1
 # 环境: $OS_TYPE $OS_VER | $VIRT_TYPE | $NET_STACK
 # 版本: $SMARTDNS_VER | 来源: $SMARTDNS_SOURCE
 # 策略: $TAKEOVER_STRATEGY | 时间: $(date '+%Y-%m-%d %H:%M:%S')
@@ -403,21 +385,18 @@ EOF
         log_info "配置 upstream-group (加密组 + UDP兜底组)"
         cat >> /etc/smartdns/smartdns.conf << 'EOF'
 
-#=== 上游组: 仅 Google + Cloudflare ===
 upstream-group secure
 server-https https://dns.google/dns-query -group secure
 server-https https://cloudflare-dns.com/dns-query -group secure
 server-tls 8.8.8.8:853 -host-name dns.google -no-check-certificate -group secure
 server-tls 1.1.1.1:853 -host-name cloudflare-dns.com -no-check-certificate -group secure
 EOF
-        if [ "$HAS_IPV6" = true ]; then
-            cat >> /etc/smartdns/smartdns.conf << 'EOF'
+        [ "$HAS_IPV6" = true ] && cat >> /etc/smartdns/smartdns.conf << 'EOF'
 server-https https://[2001:4860:4860::8888]/dns-query -group secure
 server-https https://[2606:4700:4700::1111]/dns-query -group secure
 server-tls 2001:4860:4860::8844:853 -host-name dns.google -no-check-certificate -group secure
 server-tls 2606:4700:4700::1001:853 -host-name cloudflare-dns.com -no-check-certificate -group secure
 EOF
-        fi
         cat >> /etc/smartdns/smartdns.conf << 'EOF'
 
 upstream-group fallback
@@ -436,18 +415,14 @@ check-interval 600
 EOF
     else
         log_warn "旧版降级: 仅 UDP 上游"
-        if [ "$HAS_IPV4" = true ]; then
-            cat >> /etc/smartdns/smartdns.conf << EOF
+        [ "$HAS_IPV4" = true ] && cat >> /etc/smartdns/smartdns.conf << EOF
 server 8.8.8.8
 server 1.1.1.1
 EOF
-        fi
-        if [ "$HAS_IPV6" = true ]; then
-            cat >> /etc/smartdns/smartdns.conf << EOF
+        [ "$HAS_IPV6" = true ] && cat >> /etc/smartdns/smartdns.conf << EOF
 server 2001:4860:4860::8888
 server 2606:4700:4700::1111
 EOF
-        fi
     fi
     
     log_ok "配置已生成: /etc/smartdns/smartdns.conf"
@@ -470,16 +445,14 @@ module_dns_takeover() {
         cp /etc/resolv.conf "/etc/resolv.conf.bak.$(date +%Y%m%d-%H%M%S)" 2>/dev/null
     fi
     
-    DETECT_KEYWORD=$(get_detect_keyword)
-    
-    # --- 策略B: resolved ---
+    # 策略B: resolved
     if [ "$TAKEOVER_STRATEGY" = "resolved" ]; then
         log_info "执行策略: 停用 systemd-resolved"
         systemctl stop systemd-resolved 2>/dev/null
         systemctl disable systemd-resolved 2>/dev/null
         systemctl mask systemd-resolved 2>/dev/null
         rm -f /etc/resolv.conf
-        write_resolv_conf /etc/resolv.conf
+        cp "$RESOLV_TEMPLATE" /etc/resolv.conf
         if [ "$TMPFILES_HAS_RESOLV" = true ]; then
             mkdir -p /etc/tmpfiles.d
             printf "# SmartDNS 已接管\n" > /etc/tmpfiles.d/systemd-resolved.conf
@@ -492,7 +465,7 @@ module_dns_takeover() {
         fi
     fi
     
-    # --- 策略C: cloudinit ---
+    # 策略C: cloudinit
     if [ "$TAKEOVER_STRATEGY" = "cloudinit" ]; then
         log_info "执行策略: 禁用 cloud-init DNS 管理"
         mkdir -p /etc/cloud/cloud.cfg.d
@@ -500,72 +473,35 @@ module_dns_takeover() {
         log_ok "cloud-init DNS 管理已禁用"
     fi
     
-    # --- 通用: 直接写入 DNS 配置（不经过变量） ---
+    # 通用: 复制模板
     if [ "$TAKEOVER_STRATEGY" != "resolved" ]; then
-        write_resolv_conf /etc/resolv.conf
+        cp "$RESOLV_TEMPLATE" /etc/resolv.conf
     fi
     
-    write_resolv_conf /etc/resolv.conf.smartdns.bak
-    chmod 644 /etc/resolv.conf.smartdns.bak 2>/dev/null
+    cp "$RESOLV_TEMPLATE" "$RESOLV_BACKUP"
+    chmod 644 "$RESOLV_BACKUP" 2>/dev/null
     
-    # --- 启动覆盖脚本 ---
+    # 启动覆盖脚本
     if [ "$INIT_TYPE" = "openrc" ]; then
         log_info "创建 Alpine 启动覆盖脚本"
         mkdir -p /etc/local.d
-        
-        # 用 cat heredoc + 直接调用函数，换行符完整保留
-        if [ "$HAS_IPV6" = true ] && [ "$HAS_IPV4" = true ]; then
-            cat > /etc/local.d/smartdns-dns.start << 'LSTART'
+        cat > /etc/local.d/smartdns-dns.start << LSTART
 #!/bin/sh
 sleep 5
 for i in 1 2 3 4 5; do
-    if grep -q "nameserver 127.0.0.1" /etc/resolv.conf 2>/dev/null; then
+    if cmp -s ${RESOLV_TEMPLATE} /etc/resolv.conf 2>/dev/null; then
         exit 0
     fi
     sleep 1
 done
-cat > /etc/resolv.conf << 'INNER'
-nameserver 127.0.0.1
-nameserver ::1
-INNER
+cp ${RESOLV_TEMPLATE} /etc/resolv.conf
 LSTART
-        elif [ "$HAS_IPV6" = true ]; then
-            cat > /etc/local.d/smartdns-dns.start << 'LSTART'
-#!/bin/sh
-sleep 5
-for i in 1 2 3 4 5; do
-    if grep -q "nameserver ::1" /etc/resolv.conf 2>/dev/null; then
-        exit 0
-    fi
-    sleep 1
-done
-cat > /etc/resolv.conf << 'INNER'
-nameserver ::1
-INNER
-LSTART
-        else
-            cat > /etc/local.d/smartdns-dns.start << 'LSTART'
-#!/bin/sh
-sleep 5
-for i in 1 2 3 4 5; do
-    if grep -q "nameserver 127.0.0.1" /etc/resolv.conf 2>/dev/null; then
-        exit 0
-    fi
-    sleep 1
-done
-cat > /etc/resolv.conf << 'INNER'
-nameserver 127.0.0.1
-INNER
-LSTART
-        fi
         chmod +x /etc/local.d/smartdns-dns.start
         safe_rc_add local default
         log_ok "local.d 启动脚本已创建"
         
     elif [ "$INIT_TYPE" = "systemd" ]; then
         log_info "创建 systemd oneshot 启动覆盖"
-        RESOLV_CONTENT=$(get_resolv_content_for_systemd)
-        ESCAPED_CONTENT=$(printf "%s" "$RESOLV_CONTENT" | sed 's/\$/$$/g')
         cat > /etc/systemd/system/smartdns-dns-fix.service << SSTART
 [Unit]
 Description=SmartDNS DNS Fix
@@ -574,7 +510,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/bin/sh -c 'sleep 5; for i in 1 2 3 4 5; do grep -q "${DETECT_KEYWORD}" /etc/resolv.conf 2>/dev/null && exit 0; sleep 1; done; printf "%s" "${ESCAPED_CONTENT}" > /etc/resolv.conf'
+ExecStart=/bin/sh -c 'sleep 5; for i in 1 2 3 4 5; do cmp -s ${RESOLV_TEMPLATE} /etc/resolv.conf 2>/dev/null && exit 0; sleep 1; done; cp ${RESOLV_TEMPLATE} /etc/resolv.conf'
 
 [Install]
 WantedBy=multi-user.target
@@ -584,35 +520,34 @@ SSTART
         log_ok "systemd oneshot 服务已创建"
     fi
     
-    # --- 部署 DNS 守护脚本 ---
+    # DNS 守护脚本
     log_info "部署 DNS 文件守护"
-    cat > "$GUARD_SCRIPT" << 'GUARD'
+    cat > "$GUARD_SCRIPT" << GUARD
 #!/bin/sh
-# SmartDNS DNS 文件守护 v6.3.5
+# SmartDNS DNS 文件守护 v6.4.1
 TARGET="/etc/resolv.conf"
-BACKUP="/etc/resolv.conf.smartdns.bak"
-PID_FILE="/var/run/smartdns-dns-guard.pid"
+TEMPLATE="${RESOLV_TEMPLATE}"
+PID_FILE="${PID_FILE}"
 
-# 子进程运行守护逻辑，父进程立即退出（兼容 systemd Type=forking）
 (
-    echo $$ > "$PID_FILE"
+    echo \$\$ > "\$PID_FILE"
     
     cleanup() {
-        rm -f "$PID_FILE"
-        pkill -P $$ 2>/dev/null
+        rm -f "\$PID_FILE"
+        pkill -P \$\$ 2>/dev/null
         exit 0
     }
     trap cleanup INT TERM
     
     restore_dns() {
-        if [ -f "$BACKUP" ] && ! cmp -s "$BACKUP" "$TARGET" 2>/dev/null; then
-            cp "$BACKUP" "$TARGET" 2>/dev/null
+        if [ -f "\$TEMPLATE" ] && ! cmp -s "\$TEMPLATE" "\$TARGET" 2>/dev/null; then
+            cp "\$TEMPLATE" "\$TARGET" 2>/dev/null
         fi
     }
     
     if command -v inotifywait >/dev/null 2>&1; then
         while true; do
-            inotifywait -m -e modify,close_write "$TARGET" 2>/dev/null | while read -r path event file; do
+            inotifywait -m -e modify,close_write "\$TARGET" 2>/dev/null | while read -r path event file; do
                 sleep 0.5
                 restore_dns
             done
@@ -620,8 +555,8 @@ PID_FILE="/var/run/smartdns-dns-guard.pid"
         done
     elif command -v inotifyd >/dev/null 2>&1; then
         while true; do
-            inotifyd - "$TARGET" 2>/dev/null | while read -r event file; do
-                case "$event" in w|m|c) sleep 0.5; restore_dns ;; esac
+            inotifyd - "\$TARGET" 2>/dev/null | while read -r event file; do
+                case "\$event" in w|m|c) sleep 0.5; restore_dns ;; esac
             done
             sleep 1
         done
@@ -637,6 +572,7 @@ exit 0
 GUARD
     chmod 700 "$GUARD_SCRIPT"
     
+    # 停止旧守护
     if [ -f "$PID_FILE" ]; then
         OLD_PID=$(cat "$PID_FILE" 2>/dev/null)
         [ -n "$OLD_PID" ] && kill "$OLD_PID" 2>/dev/null
@@ -645,6 +581,7 @@ GUARD
     pkill -f "^/usr/local/bin/smartdns-dns-guard\.sh" 2>/dev/null
     sleep 0.5
     
+    # 启动守护
     if [ "$INIT_TYPE" = "systemd" ]; then
         cat > /etc/systemd/system/smartdns-dns-guard.service << 'GSTART'
 [Unit]
@@ -679,7 +616,7 @@ OGSTART
     fi
     
     log_ok "DNS 守护已部署 (工具: ${INOTIFY_CMD:-轮询})"
-    log_ok "系统 DNS → ${DETECT_KEYWORD}"
+    log_ok "系统 DNS → $(head -1 "$RESOLV_TEMPLATE")"
 }
 
 #==================================================
@@ -726,10 +663,7 @@ command="/usr/bin/smartdns"
 command_args="-c /etc/smartdns/smartdns.conf"
 command_background=true
 pidfile="/run/smartdns.pid"
-depend() {
-    need net
-    after firewall
-}
+depend() { need net; after firewall; }
 OSVC
                 chmod +x /etc/init.d/smartdns
             fi
@@ -764,11 +698,7 @@ module_verify() {
     if [ "$HAS_IPV4" = true ]; then
         log_info "DNS 解析测试 (IPv4)..."
         for domain in google.com cloudflare.com; do
-            if [ "$PORT" = "53" ]; then
-                RESULT=$(safe_nslookup "$domain" 127.0.0.1)
-            else
-                RESULT=$(nslookup -timeout=5 -port="$PORT" "$domain" 127.0.0.1 2>&1 || nslookup -port="$PORT" "$domain" 127.0.0.1 2>&1)
-            fi
+            RESULT=$(dns_query "$domain" 127.0.0.1)
             if echo "$RESULT" | grep -q "Address"; then
                 IP=$(echo "$RESULT" | grep "Address" | tail -1 | awk '{print $NF}')
                 log_ok "$domain → $IP"
@@ -783,11 +713,7 @@ module_verify() {
     
     if [ "$HAS_IPV6" = true ]; then
         log_info "DNS 解析测试 (IPv6)..."
-        if [ "$PORT" = "53" ]; then
-            RESULT=$(safe_nslookup "ipv6.google.com" "::1")
-        else
-            RESULT=$(nslookup -timeout=5 -port="$PORT" "ipv6.google.com" "::1" 2>&1 || nslookup -port="$PORT" "ipv6.google.com" "::1" 2>&1)
-        fi
+        RESULT=$(dns_query "ipv6.google.com" "::1")
         if echo "$RESULT" | grep -q "Address"; then
             IP=$(echo "$RESULT" | grep "Address" | tail -1 | awk '{print $NF}')
             log_ok "ipv6.google.com → $IP"
@@ -827,24 +753,20 @@ module_verify() {
         if [ "$HAS_IPV4" = true ]; then
             for item in "Google|8.8.8.8|853" "Cloudflare|1.1.1.1|853"; do
                 NAME="${item%%|*}"; REST="${item#*|}"; IP="${REST%%|*}"; DPORT="${REST##*|}"
-                if command -v nc >/dev/null 2>&1; then
-                    if nc -z -w 3 "$IP" "$DPORT" 2>/dev/null; then
-                        log_ok "$NAME DoT (IPv4) 端口可达"
-                    else
-                        log_warn "$NAME DoT (IPv4) 端口不可达"
-                    fi
+                if command -v nc >/dev/null 2>&1 && nc -z -w 3 "$IP" "$DPORT" 2>/dev/null; then
+                    log_ok "$NAME DoT (IPv4) 端口可达"
+                else
+                    log_warn "$NAME DoT (IPv4) 端口不可达"
                 fi
             done
         fi
         if [ "$HAS_IPV6" = true ]; then
             for item in "Google|2001:4860:4860::8844|853" "Cloudflare|2606:4700:4700::1001|853"; do
                 NAME="${item%%|*}"; REST="${item#*|}"; IP="${REST%%|*}"; DPORT="${REST##*|}"
-                if command -v nc >/dev/null 2>&1; then
-                    if nc -z -w 3 "$IP" "$DPORT" 2>/dev/null; then
-                        log_ok "$NAME DoT (IPv6) 端口可达"
-                    else
-                        log_warn "$NAME DoT (IPv6) 端口不可达"
-                    fi
+                if command -v nc >/dev/null 2>&1 && nc -z -w 3 "$IP" "$DPORT" 2>/dev/null; then
+                    log_ok "$NAME DoT (IPv6) 端口可达"
+                else
+                    log_warn "$NAME DoT (IPv6) 端口不可达"
                 fi
             done
         fi
@@ -854,14 +776,10 @@ module_verify() {
         echo ""
         echo "===== SmartDNS 部署日志 ====="
         echo "时间: $(date '+%Y-%m-%d %H:%M:%S')"
-        echo "系统: $OS_TYPE $OS_VER"
-        echo "Init: $INIT_TYPE"
-        echo "虚拟化: $VIRT_TYPE"
-        echo "网络栈: $NET_STACK"
-        echo "接管策略: $TAKEOVER_STRATEGY"
-        echo "SmartDNS版本: $SMARTDNS_VER (来源: $SMARTDNS_SOURCE)"
-        echo "端口: $PORT"
-        echo "上游: Google + Cloudflare (DoH+DoT+UDP)"
+        echo "系统: $OS_TYPE $OS_VER | Init: $INIT_TYPE | 虚拟化: $VIRT_TYPE"
+        echo "网络栈: $NET_STACK | 接管策略: $TAKEOVER_STRATEGY"
+        echo "版本: $SMARTDNS_VER ($SMARTDNS_SOURCE) | 端口: $PORT"
+        echo "模板: $RESOLV_TEMPLATE"
         echo "守护: inotify=${INOTIFY_CMD:-轮询}"
         echo "=============================="
     } >> "$DEPLOY_LOG"
@@ -878,20 +796,13 @@ module_verify() {
     echo -e "${BOLD}部署摘要:${NC}"
     echo -e "  系统: ${CYAN}$OS_TYPE $OS_VER ($VIRT_TYPE)${NC}"
     echo -e "  策略: ${CYAN}$TAKEOVER_STRATEGY${NC}"
-    echo -e "  版本: ${CYAN}$SMARTDNS_VER ($SMARTDNS_SOURCE)${NC}"
-    echo -e "  端口: ${CYAN}127.0.0.1:${PORT}${NC}"
-    echo -e "  上游: ${GREEN}Google + Cloudflare (DoH + DoT + UDP自动降级)${NC}"
+    echo -e "  版本: ${CYAN}$SMARTDNS_VER${NC}"
+    echo -e "  上游: ${GREEN}Google + Cloudflare (DoH/DoT + UDP自动降级)${NC}"
     echo -e "  守护: ${GREEN}${INOTIFY_CMD:-轮询} + 启动覆盖${NC}"
-    echo -e "  配置: ${CYAN}/etc/smartdns/smartdns.conf${NC}"
-    echo -e "  日志: ${CYAN}/var/log/smartdns.log${NC}"
+    echo -e "  模板: ${CYAN}$RESOLV_TEMPLATE${NC}"
     echo ""
-    echo -e "${BOLD}测试命令:${NC}"
-    if [ "$HAS_IPV4" = true ]; then
-        echo -e "  nslookup google.com 127.0.0.1"
-    fi
-    if [ "$HAS_IPV6" = true ]; then
-        echo -e "  nslookup google.com ::1"
-    fi
+    if [ "$HAS_IPV4" = true ]; then echo -e "  nslookup google.com 127.0.0.1"; fi
+    if [ "$HAS_IPV6" = true ]; then echo -e "  nslookup google.com ::1"; fi
     echo -e "  tail -f /var/log/smartdns.log"
 }
 
@@ -918,11 +829,8 @@ module_uninstall() {
         systemd)
             systemctl stop smartdns.service smartdns-dns-guard.service smartdns-dns-fix.service 2>/dev/null
             systemctl disable smartdns.service smartdns-dns-guard.service smartdns-dns-fix.service 2>/dev/null
-            rm -f /etc/systemd/system/smartdns.service
-            rm -f /etc/systemd/system/smartdns-dns-guard.service
-            rm -f /etc/systemd/system/smartdns-dns-fix.service
+            rm -f /etc/systemd/system/smartdns.service /etc/systemd/system/smartdns-dns-guard.service /etc/systemd/system/smartdns-dns-fix.service
             systemctl daemon-reload 2>/dev/null
-            
             if systemctl is-enabled systemd-resolved 2>/dev/null | grep -q "masked"; then
                 systemctl unmask systemd-resolved 2>/dev/null
             fi
@@ -935,38 +843,33 @@ module_uninstall() {
             rc-service smartdns stop 2>/dev/null
             rc-update del smartdns 2>/dev/null
             rm -f /etc/init.d/smartdns
-            rm -f /etc/local.d/smartdns-dns.start
-            rm -f /etc/local.d/smartdns-guard.start
+            rm -f /etc/local.d/smartdns-dns.start /etc/local.d/smartdns-guard.start
             ;;
     esac
     
     pkill smartdns 2>/dev/null
     sleep 1
     
-    rm -f "$GUARD_SCRIPT"
-    rm -f /etc/resolv.conf.smartdns.bak
+    rm -f "$GUARD_SCRIPT" "$RESOLV_BACKUP"
     rm -f /etc/cloud/cloud.cfg.d/99-smartdns-dns.cfg
     
-    if [ -f /etc/tmpfiles.d/systemd-resolved.conf ]; then
-        if grep -q "SmartDNS" /etc/tmpfiles.d/systemd-resolved.conf 2>/dev/null; then
-            rm -f /etc/tmpfiles.d/systemd-resolved.conf
-            log_info "已删除 SmartDNS tmpfiles.d 覆盖"
-        fi
+    if [ -f /etc/tmpfiles.d/systemd-resolved.conf ] && grep -q "SmartDNS" /etc/tmpfiles.d/systemd-resolved.conf 2>/dev/null; then
+        rm -f /etc/tmpfiles.d/systemd-resolved.conf
     fi
     
     if crontab -l 2>/dev/null | grep -q "resolv-check\|smartdns"; then
         crontab -l 2>/dev/null | grep -v "resolv-check\|smartdns" | crontab - 2>/dev/null
-        log_info "已清理旧版 cron 残留"
     fi
     
     BAK=$(ls -t /etc/resolv.conf.bak.* 2>/dev/null | head -1)
     if [ -n "$BAK" ]; then
         cp "$BAK" /etc/resolv.conf
-        log_ok "恢复 DNS: $(head -1 /etc/resolv.conf)"
+    elif [ -f "$RESOLV_FALLBACK" ]; then
+        cp "$RESOLV_FALLBACK" /etc/resolv.conf
     else
-        write_fallback_dns
-        log_ok "恢复 DNS（${NET_STACK}）"
+        printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\n" > /etc/resolv.conf
     fi
+    log_ok "DNS 已恢复"
     
     rm -f /usr/bin/smartdns /usr/sbin/smartdns /usr/local/bin/smartdns
     rm -rf /etc/smartdns
@@ -977,9 +880,6 @@ module_uninstall() {
     log_ok "卸载完成"
 }
 
-#==================================================
-# 主入口
-#==================================================
 main() {
     if [ "${1:-}" = "--uninstall" ] || [ "${1:-}" = "-u" ]; then
         module_uninstall
@@ -987,7 +887,7 @@ main() {
     fi
     
     echo ""
-    echo -e "${BOLD}SmartDNS 智能部署 v6.3.5${NC}"
+    echo -e "${BOLD}SmartDNS 智能部署 v6.4.1${NC}"
     echo -e "上游: Google + Cloudflare (DoH/DoT/UDP)"
     echo -e "环境: Alpine/Debian (LXC/KVM/Podman)"
     echo ""
