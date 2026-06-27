@@ -1,7 +1,7 @@
 #!/bin/sh
 #==========================================================================
-# SmartDNS 智能部署脚本 v6.4.6
-# 修复: main() 遍历参数支持管道卸载 + 卸载命令提示修正
+# SmartDNS 智能部署脚本 v6.4.8
+# 优化: apt-get update 去重 + wget 重试去嵌套
 #==========================================================================
 set +e
 
@@ -34,10 +34,45 @@ RESOLV_TEMPLATE="/etc/smartdns/resolv.smartdns"
 RESOLV_BACKUP="/etc/resolv.conf.smartdns.bak"
 RESOLV_FALLBACK="/etc/smartdns/resolv.fallback"
 
-download_file() {
-    local url="$1" output="$2"
-    wget -q --timeout=30 --tries=2 -O "$output" "$url" 2>/dev/null && return 0
-    curl -sL --max-time 30 -o "$output" "$url" 2>/dev/null && return 0
+# apt update 缓存标志（避免重复 update）
+APT_UPDATED=false
+
+#==================================================
+# 通用安装函数
+#==================================================
+pkg_install() {
+    local pkg="$1" max_retry="${2:-3}" attempt=1
+    
+    while [ "$attempt" -le "$max_retry" ]; do
+        case "$PKG_MGR" in
+            apk)
+                apk add --no-cache "$pkg" 2>/dev/null && return 0
+                ;;
+            apt)
+                for i in $(seq 1 30); do
+                    fuser /var/lib/dpkg/lock-frontend 2>/dev/null && sleep 1 || break
+                done
+                if ! $APT_UPDATED; then
+                    apt-get update -qq 2>/dev/null && APT_UPDATED=true
+                fi
+                apt-get install -y -qq "$pkg" 2>/dev/null && return 0
+                ;;
+        esac
+        attempt=$((attempt + 1))
+        [ "$attempt" -le "$max_retry" ] && sleep 2
+    done
+    return 1
+}
+
+github_download() {
+    local url="$1" output="$2" attempt=1
+    
+    while [ "$attempt" -le 3 ]; do
+        wget -q --timeout=30 --tries=1 -O "$output" "$url" 2>/dev/null && [ -s "$output" ] && return 0
+        curl -sL --max-time 30 -o "$output" "$url" 2>/dev/null && [ -s "$output" ] && return 0
+        attempt=$((attempt + 1))
+        [ "$attempt" -le 3 ] && sleep 3
+    done
     return 1
 }
 
@@ -69,7 +104,7 @@ port_in_use() {
 
 ensure_tools() {
     local tools_missing=""
-    if ! command -v wget >/dev/null 2>&1 && ! command -v curl >/dev/null 2>&1; then tools_missing="$tools_missing wget"; fi
+    if ! command -v wget >/dev/null 2>&1 && ! command -v curl >/dev/null 2>&1; then tools_missing="wget"; fi
     if ! command -v ss >/dev/null 2>&1 && ! command -v netstat >/dev/null 2>&1; then tools_missing="$tools_missing iproute2"; fi
     if ! command -v nslookup >/dev/null 2>&1; then
         case "$PKG_MGR" in apk) tools_missing="$tools_missing bind-tools" ;; apt) tools_missing="$tools_missing dnsutils" ;; esac
@@ -78,11 +113,10 @@ ensure_tools() {
         case "$PKG_MGR" in apk) tools_missing="$tools_missing netcat-openbsd" ;; apt) tools_missing="$tools_missing netcat-openbsd" ;; esac
     fi
     if [ -n "$tools_missing" ]; then
-        log_info "安装缺失工具:$tools_missing"
-        case "$PKG_MGR" in
-            apk) apk add --no-cache $tools_missing 2>/dev/null ;;
-            apt) apt-get update -qq && apt-get install -y -qq $tools_missing 2>/dev/null ;;
-        esac
+        log_info "安装缺失工具: $tools_missing"
+        for pkg in $tools_missing; do
+            pkg_install "$pkg" || log_warn "$pkg 安装失败"
+        done
     fi
 }
 
@@ -117,17 +151,14 @@ detect_inotify() {
         INOTIFY_ARGS="-"
         return 0
     fi
-    case "$PKG_MGR" in
-        apk)
-            apk add --no-cache inotify-tools 2>/dev/null && {
-                INOTIFY_CMD="inotifywait"; INOTIFY_ARGS="-m -e modify,close_write"; return 0
-            } ;;
-        apt)
-            apt-get update -qq 2>/dev/null
-            apt-get install -y -qq inotify-tools 2>/dev/null && {
-                INOTIFY_CMD="inotifywait"; INOTIFY_ARGS="-m -e modify,close_write"; return 0
-            } ;;
-    esac
+    
+    if pkg_install inotify-tools 3; then
+        INOTIFY_CMD="inotifywait"
+        INOTIFY_ARGS="-m -e modify,close_write"
+        return 0
+    fi
+    
+    log_warn "inotify-tools 安装失败，将使用轻量级轮询"
     return 1
 }
 
@@ -244,7 +275,7 @@ module_install() {
     TEMP_BIN="/tmp/smartdns-$$"
     
     log_info "尝试 GitHub 最新版..."
-    if download_file "$GITHUB_URL" "$TEMP_BIN" && [ -s "$TEMP_BIN" ]; then
+    if github_download "$GITHUB_URL" "$TEMP_BIN"; then
         chmod +x "$TEMP_BIN"
         mv "$TEMP_BIN" /usr/bin/smartdns
         SMARTDNS_BIN="/usr/bin/smartdns"
@@ -255,31 +286,18 @@ module_install() {
     
     if [ -z "$SMARTDNS_BIN" ]; then
         log_warn "GitHub 下载失败，尝试包管理器..."
-        case "$PKG_MGR" in
-            apk)
-                apk update --quiet 2>/dev/null
-                apk add --no-cache smartdns 2>/dev/null
-                SMARTDNS_BIN="/usr/sbin/smartdns"
-                [ -x "$SMARTDNS_BIN" ] || SMARTDNS_BIN="/usr/bin/smartdns"
-                [ -x "$SMARTDNS_BIN" ] || SMARTDNS_BIN=$(which smartdns 2>/dev/null)
-                [ -x "$SMARTDNS_BIN" ] || SMARTDNS_BIN=""
-                [ -n "$SMARTDNS_BIN" ] && SMARTDNS_SOURCE="apk"
-                ;;
-            apt)
-                apt-get update -qq 2>/dev/null
-                apt-get install -y -qq smartdns 2>/dev/null
-                SMARTDNS_BIN="/usr/sbin/smartdns"
-                [ -x "$SMARTDNS_BIN" ] || SMARTDNS_BIN="/usr/bin/smartdns"
-                [ -x "$SMARTDNS_BIN" ] || SMARTDNS_BIN=$(which smartdns 2>/dev/null)
-                [ -x "$SMARTDNS_BIN" ] || SMARTDNS_BIN=""
-                [ -n "$SMARTDNS_BIN" ] && SMARTDNS_SOURCE="apt"
-                ;;
-        esac
-        [ -n "$SMARTDNS_BIN" ] && log_ok "包管理器安装成功"
+        if pkg_install smartdns 3; then
+            SMARTDNS_BIN="/usr/sbin/smartdns"
+            [ -x "$SMARTDNS_BIN" ] || SMARTDNS_BIN="/usr/bin/smartdns"
+            [ -x "$SMARTDNS_BIN" ] || SMARTDNS_BIN=$(which smartdns 2>/dev/null)
+            [ -n "$SMARTDNS_BIN" ] && SMARTDNS_SOURCE="$PKG_MGR" && log_ok "包管理器安装成功"
+        fi
     fi
     
     if [ -z "$SMARTDNS_BIN" ] || [ ! -x "$SMARTDNS_BIN" ]; then
-        log_err "所有安装方式均失败"; exit 1
+        log_err "所有安装方式均失败"
+        echo "手动安装: wget $GITHUB_URL -O /usr/bin/smartdns && chmod +x /usr/bin/smartdns"
+        exit 1
     fi
     
     SMARTDNS_VER=$("$SMARTDNS_BIN" -v 2>&1 | head -1)
@@ -332,7 +350,6 @@ EOF
     fi
     log_ok "DNS 模板已生成: $RESOLV_TEMPLATE"
     
-    # 如果 resolved 占着 53，先停掉再检测端口（幂等操作）
     [ "$TAKEOVER_STRATEGY" = "resolved" ] && systemctl stop systemd-resolved 2>/dev/null
     
     PORT=53
@@ -346,7 +363,7 @@ EOF
     fi
     
     cat > /etc/smartdns/smartdns.conf << EOF
-# SmartDNS 配置 v6.4.6
+# SmartDNS 配置 v6.4.8
 # 环境: $OS_TYPE $OS_VER | $VIRT_TYPE | $NET_STACK
 # 版本: $SMARTDNS_VER | 来源: $SMARTDNS_SOURCE
 # 策略: $TAKEOVER_STRATEGY | 时间: $(date '+%Y-%m-%d %H:%M:%S')
@@ -435,11 +452,7 @@ module_dns_takeover() {
     log_step "模块3: 接管系统 DNS (策略: $TAKEOVER_STRATEGY)"
     
     detect_inotify
-    if [ -z "$INOTIFY_CMD" ]; then
-        log_warn "inotify 工具不可用，将使用轻量级轮询 (5秒间隔)"
-    else
-        log_info "inotify 工具: $INOTIFY_CMD"
-    fi
+    [ -z "$INOTIFY_CMD" ] && log_warn "inotify 工具不可用，将使用轻量级轮询 (5秒间隔)" || log_info "inotify 工具: $INOTIFY_CMD"
     
     if [ -f /etc/resolv.conf ] && [ ! -L /etc/resolv.conf ]; then
         cp /etc/resolv.conf "/etc/resolv.conf.bak.$(date +%Y%m%d-%H%M%S)" 2>/dev/null
@@ -519,7 +532,7 @@ SSTART
     log_info "部署 DNS 文件守护"
     cat > "$GUARD_SCRIPT" << GUARD
 #!/bin/sh
-# SmartDNS DNS 文件守护 v6.4.6
+# SmartDNS DNS 文件守护 v6.4.8
 TARGET="/etc/resolv.conf"
 TEMPLATE="${RESOLV_TEMPLATE}"
 PID_FILE="${PID_FILE}"
@@ -885,7 +898,7 @@ main() {
     done
     
     echo ""
-    echo -e "${BOLD}SmartDNS 智能部署 v6.4.6${NC}"
+    echo -e "${BOLD}SmartDNS 智能部署 v6.4.8${NC}"
     echo -e "上游: Google + Cloudflare (DoH/DoT/UDP)"
     echo -e "环境: Alpine/Debian (LXC/KVM/Podman)"
     echo ""
