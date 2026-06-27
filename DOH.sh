@@ -470,7 +470,11 @@ module_dns_takeover() {
         mkdir -p /etc/local.d
         cat > /etc/local.d/smartdns-dns.start << 'LSTART'
 #!/bin/sh
-sleep 3
+for i in $(seq 1 30); do
+    grep -q "nameserver 127.0.0.1" /etc/resolv.conf 2>/dev/null && exit 0
+    sleep 1
+done
+chattr -i /etc/resolv.conf 2>/dev/null
 cp /etc/resolv.conf.smartdns.bak /etc/resolv.conf 2>/dev/null
 LSTART
         chmod +x /etc/local.d/smartdns-dns.start
