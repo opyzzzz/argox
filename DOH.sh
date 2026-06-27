@@ -1,7 +1,7 @@
 #!/bin/sh
 #==========================================================================
-# SmartDNS 智能部署脚本 v6.4.3
-# 修复: resolved 策略优先级 + resolv.conf 添加 edns0 trust-ad
+# SmartDNS 智能部署脚本 v6.4.5
+# 优化: 一行解决端口检测时机问题，撤销模块拆分
 #==========================================================================
 set +e
 
@@ -219,7 +219,6 @@ module_detect() {
         log_warn "tmpfiles.d 管理 resolv.conf"
     fi
     
-    # 策略优先级: resolved > podman > cloudinit > standard
     if $SYSTEMD_RESOLVED_RUNNING; then
         TAKEOVER_STRATEGY="resolved"
     elif $VIRT_IS_CONTAINER && $RESOLV_IS_TMPFS; then
@@ -300,7 +299,7 @@ module_config() {
     [ -f /etc/smartdns/smartdns.conf ] && \
         cp /etc/smartdns/smartdns.conf "/etc/smartdns/smartdns.conf.bak.$(date +%Y%m%d-%H%M%S)" 2>/dev/null
     
-    # 预生成 DNS 模板（含 edns0 trust-ad）
+    # DNS 模板
     if [ "$HAS_IPV6" = true ] && [ "$HAS_IPV4" = true ]; then
         cat > "$RESOLV_TEMPLATE" << EOF
 nameserver 127.0.0.1
@@ -334,6 +333,10 @@ EOF
     fi
     log_ok "DNS 模板已生成: $RESOLV_TEMPLATE"
     
+    # 如果 resolved 占着 53，先停掉再检测端口（幂等操作）
+    [ "$TAKEOVER_STRATEGY" = "resolved" ] && systemctl stop systemd-resolved 2>/dev/null
+    
+    # 端口选择
     PORT=53
     if port_in_use 53; then
         log_warn "端口 53 被占用"
@@ -344,8 +347,9 @@ EOF
         log_ok "端口 53 可用"
     fi
     
+    # SmartDNS 配置
     cat > /etc/smartdns/smartdns.conf << EOF
-# SmartDNS 配置 v6.4.3
+# SmartDNS 配置 v6.4.5
 # 环境: $OS_TYPE $OS_VER | $VIRT_TYPE | $NET_STACK
 # 版本: $SMARTDNS_VER | 来源: $SMARTDNS_SOURCE
 # 策略: $TAKEOVER_STRATEGY | 时间: $(date '+%Y-%m-%d %H:%M:%S')
@@ -444,7 +448,6 @@ module_dns_takeover() {
         cp /etc/resolv.conf "/etc/resolv.conf.bak.$(date +%Y%m%d-%H%M%S)" 2>/dev/null
     fi
     
-    # 策略: resolved（优先级最高）
     if [ "$TAKEOVER_STRATEGY" = "resolved" ]; then
         log_info "执行策略: 停用 systemd-resolved"
         systemctl stop systemd-resolved 2>/dev/null
@@ -464,7 +467,6 @@ module_dns_takeover() {
         fi
     fi
     
-    # 策略: cloudinit
     if [ "$TAKEOVER_STRATEGY" = "cloudinit" ]; then
         log_info "执行策略: 禁用 cloud-init DNS 管理"
         mkdir -p /etc/cloud/cloud.cfg.d
@@ -472,7 +474,6 @@ module_dns_takeover() {
         log_ok "cloud-init DNS 管理已禁用"
     fi
     
-    # 通用: 写入 DNS
     if [ "$TAKEOVER_STRATEGY" != "resolved" ]; then
         write_resolv
     fi
@@ -480,7 +481,6 @@ module_dns_takeover() {
     cat "$RESOLV_TEMPLATE" > "$RESOLV_BACKUP"
     chmod 644 "$RESOLV_BACKUP" 2>/dev/null
     
-    # 启动覆盖脚本
     if [ "$INIT_TYPE" = "openrc" ]; then
         log_info "创建 Alpine 启动覆盖脚本"
         mkdir -p /etc/local.d
@@ -519,11 +519,10 @@ SSTART
         log_ok "systemd oneshot 服务已创建"
     fi
     
-    # DNS 守护脚本
     log_info "部署 DNS 文件守护"
     cat > "$GUARD_SCRIPT" << GUARD
 #!/bin/sh
-# SmartDNS DNS 文件守护 v6.4.3
+# SmartDNS DNS 文件守护 v6.4.5
 TARGET="/etc/resolv.conf"
 TEMPLATE="${RESOLV_TEMPLATE}"
 PID_FILE="${PID_FILE}"
@@ -794,6 +793,7 @@ module_verify() {
     echo -e "  系统: ${CYAN}$OS_TYPE $OS_VER ($VIRT_TYPE)${NC}"
     echo -e "  策略: ${CYAN}$TAKEOVER_STRATEGY${NC}"
     echo -e "  版本: ${CYAN}$SMARTDNS_VER${NC}"
+    echo -e "  端口: ${CYAN}127.0.0.1:${PORT}${NC}"
     echo -e "  上游: ${GREEN}Google + Cloudflare (DoH/DoT + UDP自动降级)${NC}"
     echo -e "  守护: ${GREEN}${INOTIFY_CMD:-轮询} + 启动覆盖${NC}"
     echo -e "  模板: ${CYAN}$RESOLV_TEMPLATE${NC}"
@@ -884,7 +884,7 @@ main() {
     fi
     
     echo ""
-    echo -e "${BOLD}SmartDNS 智能部署 v6.4.3${NC}"
+    echo -e "${BOLD}SmartDNS 智能部署 v6.4.5${NC}"
     echo -e "上游: Google + Cloudflare (DoH/DoT/UDP)"
     echo -e "环境: Alpine/Debian (LXC/KVM/Podman)"
     echo ""
