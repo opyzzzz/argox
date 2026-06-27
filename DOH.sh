@@ -1,7 +1,7 @@
 #!/bin/sh
 #==========================================================================
-# SmartDNS 智能部署脚本 v6.4.1
-# 优化: dns_query 封装 + 守护模板存在检查
+# SmartDNS 智能部署脚本 v6.4.2
+# 修复: tmpfs 上 cp 失败 → 统一用 cat > 写入
 #==========================================================================
 set +e
 
@@ -86,7 +86,6 @@ ensure_tools() {
     fi
 }
 
-# 统一 DNS 查询封装
 dns_query() {
     local domain="$1" server="$2"
     if [ "$PORT" = "53" ]; then
@@ -121,19 +120,13 @@ detect_inotify() {
     case "$PKG_MGR" in
         apk)
             apk add --no-cache inotify-tools 2>/dev/null && {
-                INOTIFY_CMD="inotifywait"
-                INOTIFY_ARGS="-m -e modify,close_write"
-                return 0
-            }
-            ;;
+                INOTIFY_CMD="inotifywait"; INOTIFY_ARGS="-m -e modify,close_write"; return 0
+            } ;;
         apt)
             apt-get update -qq 2>/dev/null
             apt-get install -y -qq inotify-tools 2>/dev/null && {
-                INOTIFY_CMD="inotifywait"
-                INOTIFY_ARGS="-m -e modify,close_write"
-                return 0
-            }
-            ;;
+                INOTIFY_CMD="inotifywait"; INOTIFY_ARGS="-m -e modify,close_write"; return 0
+            } ;;
     esac
     return 1
 }
@@ -143,6 +136,11 @@ safe_rc_add() {
     if ! rc-update show 2>/dev/null | grep -q "$service.*$runlevel"; then
         rc-update add "$service" "$runlevel" 2>/dev/null
     fi
+}
+
+# 写入 resolv.conf（统一用 cat > 绕过 tmpfs 的 cp 限制）
+write_resolv() {
+    cat "$RESOLV_TEMPLATE" > /etc/resolv.conf
 }
 
 #==================================================
@@ -302,7 +300,6 @@ module_config() {
     [ -f /etc/smartdns/smartdns.conf ] && \
         cp /etc/smartdns/smartdns.conf "/etc/smartdns/smartdns.conf.bak.$(date +%Y%m%d-%H%M%S)" 2>/dev/null
     
-    # 预生成 DNS 模板文件
     if [ "$HAS_IPV6" = true ] && [ "$HAS_IPV4" = true ]; then
         cat > "$RESOLV_TEMPLATE" << EOF
 nameserver 127.0.0.1
@@ -333,7 +330,6 @@ EOF
     fi
     log_ok "DNS 模板已生成: $RESOLV_TEMPLATE"
     
-    # 端口选择
     PORT=53
     if port_in_use 53; then
         log_warn "端口 53 被占用"
@@ -344,9 +340,8 @@ EOF
         log_ok "端口 53 可用"
     fi
     
-    # SmartDNS 配置
     cat > /etc/smartdns/smartdns.conf << EOF
-# SmartDNS 配置 v6.4.1
+# SmartDNS 配置 v6.4.2
 # 环境: $OS_TYPE $OS_VER | $VIRT_TYPE | $NET_STACK
 # 版本: $SMARTDNS_VER | 来源: $SMARTDNS_SOURCE
 # 策略: $TAKEOVER_STRATEGY | 时间: $(date '+%Y-%m-%d %H:%M:%S')
@@ -452,7 +447,7 @@ module_dns_takeover() {
         systemctl disable systemd-resolved 2>/dev/null
         systemctl mask systemd-resolved 2>/dev/null
         rm -f /etc/resolv.conf
-        cp "$RESOLV_TEMPLATE" /etc/resolv.conf
+        write_resolv
         if [ "$TMPFILES_HAS_RESOLV" = true ]; then
             mkdir -p /etc/tmpfiles.d
             printf "# SmartDNS 已接管\n" > /etc/tmpfiles.d/systemd-resolved.conf
@@ -473,12 +468,12 @@ module_dns_takeover() {
         log_ok "cloud-init DNS 管理已禁用"
     fi
     
-    # 通用: 复制模板
+    # 通用: 写入 DNS（用 cat > 绕过 tmpfs 的 cp 限制）
     if [ "$TAKEOVER_STRATEGY" != "resolved" ]; then
-        cp "$RESOLV_TEMPLATE" /etc/resolv.conf
+        write_resolv
     fi
     
-    cp "$RESOLV_TEMPLATE" "$RESOLV_BACKUP"
+    cat "$RESOLV_TEMPLATE" > "$RESOLV_BACKUP"
     chmod 644 "$RESOLV_BACKUP" 2>/dev/null
     
     # 启动覆盖脚本
@@ -494,7 +489,7 @@ for i in 1 2 3 4 5; do
     fi
     sleep 1
 done
-cp ${RESOLV_TEMPLATE} /etc/resolv.conf
+cat ${RESOLV_TEMPLATE} > /etc/resolv.conf
 LSTART
         chmod +x /etc/local.d/smartdns-dns.start
         safe_rc_add local default
@@ -510,7 +505,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/bin/sh -c 'sleep 5; for i in 1 2 3 4 5; do cmp -s ${RESOLV_TEMPLATE} /etc/resolv.conf 2>/dev/null && exit 0; sleep 1; done; cp ${RESOLV_TEMPLATE} /etc/resolv.conf'
+ExecStart=/bin/sh -c 'sleep 5; for i in 1 2 3 4 5; do cmp -s ${RESOLV_TEMPLATE} /etc/resolv.conf 2>/dev/null && exit 0; sleep 1; done; cat ${RESOLV_TEMPLATE} > /etc/resolv.conf'
 
 [Install]
 WantedBy=multi-user.target
@@ -520,11 +515,11 @@ SSTART
         log_ok "systemd oneshot 服务已创建"
     fi
     
-    # DNS 守护脚本
+    # DNS 守护脚本（restore_dns 也用 cat >）
     log_info "部署 DNS 文件守护"
     cat > "$GUARD_SCRIPT" << GUARD
 #!/bin/sh
-# SmartDNS DNS 文件守护 v6.4.1
+# SmartDNS DNS 文件守护 v6.4.2
 TARGET="/etc/resolv.conf"
 TEMPLATE="${RESOLV_TEMPLATE}"
 PID_FILE="${PID_FILE}"
@@ -541,7 +536,7 @@ PID_FILE="${PID_FILE}"
     
     restore_dns() {
         if [ -f "\$TEMPLATE" ] && ! cmp -s "\$TEMPLATE" "\$TARGET" 2>/dev/null; then
-            cp "\$TEMPLATE" "\$TARGET" 2>/dev/null
+            cat "\$TEMPLATE" > "\$TARGET" 2>/dev/null
         fi
     }
     
@@ -572,7 +567,6 @@ exit 0
 GUARD
     chmod 700 "$GUARD_SCRIPT"
     
-    # 停止旧守护
     if [ -f "$PID_FILE" ]; then
         OLD_PID=$(cat "$PID_FILE" 2>/dev/null)
         [ -n "$OLD_PID" ] && kill "$OLD_PID" 2>/dev/null
@@ -581,7 +575,6 @@ GUARD
     pkill -f "^/usr/local/bin/smartdns-dns-guard\.sh" 2>/dev/null
     sleep 0.5
     
-    # 启动守护
     if [ "$INIT_TYPE" = "systemd" ]; then
         cat > /etc/systemd/system/smartdns-dns-guard.service << 'GSTART'
 [Unit]
@@ -865,7 +858,7 @@ module_uninstall() {
     if [ -n "$BAK" ]; then
         cp "$BAK" /etc/resolv.conf
     elif [ -f "$RESOLV_FALLBACK" ]; then
-        cp "$RESOLV_FALLBACK" /etc/resolv.conf
+        cat "$RESOLV_FALLBACK" > /etc/resolv.conf
     else
         printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\n" > /etc/resolv.conf
     fi
@@ -887,7 +880,7 @@ main() {
     fi
     
     echo ""
-    echo -e "${BOLD}SmartDNS 智能部署 v6.4.1${NC}"
+    echo -e "${BOLD}SmartDNS 智能部署 v6.4.2${NC}"
     echo -e "上游: Google + Cloudflare (DoH/DoT/UDP)"
     echo -e "环境: Alpine/Debian (LXC/KVM/Podman)"
     echo ""
