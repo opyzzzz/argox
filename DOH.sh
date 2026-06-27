@@ -1,7 +1,7 @@
 #!/bin/sh
 #==========================================================================
-# SmartDNS 智能部署脚本 v6.4.8
-# 优化: apt-get update 去重 + wget 重试去嵌套
+# SmartDNS 智能部署脚本 v6.4.9
+# 修复: ensure_tools 合并安装，减少 apt 调用次数
 #==========================================================================
 set +e
 
@@ -34,19 +34,15 @@ RESOLV_TEMPLATE="/etc/smartdns/resolv.smartdns"
 RESOLV_BACKUP="/etc/resolv.conf.smartdns.bak"
 RESOLV_FALLBACK="/etc/smartdns/resolv.fallback"
 
-# apt update 缓存标志（避免重复 update）
 APT_UPDATED=false
 
-#==================================================
-# 通用安装函数
-#==================================================
 pkg_install() {
-    local pkg="$1" max_retry="${2:-3}" attempt=1
+    local pkgs="$1" max_retry="${2:-3}" attempt=1
     
     while [ "$attempt" -le "$max_retry" ]; do
         case "$PKG_MGR" in
             apk)
-                apk add --no-cache "$pkg" 2>/dev/null && return 0
+                apk add --no-cache $pkgs 2>/dev/null && return 0
                 ;;
             apt)
                 for i in $(seq 1 30); do
@@ -55,7 +51,7 @@ pkg_install() {
                 if ! $APT_UPDATED; then
                     apt-get update -qq 2>/dev/null && APT_UPDATED=true
                 fi
-                apt-get install -y -qq "$pkg" 2>/dev/null && return 0
+                apt-get install -y -qq $pkgs 2>/dev/null && return 0
                 ;;
         esac
         attempt=$((attempt + 1))
@@ -104,7 +100,7 @@ port_in_use() {
 
 ensure_tools() {
     local tools_missing=""
-    if ! command -v wget >/dev/null 2>&1 && ! command -v curl >/dev/null 2>&1; then tools_missing="wget"; fi
+    if ! command -v wget >/dev/null 2>&1 && ! command -v curl >/dev/null 2>&1; then tools_missing="$tools_missing wget"; fi
     if ! command -v ss >/dev/null 2>&1 && ! command -v netstat >/dev/null 2>&1; then tools_missing="$tools_missing iproute2"; fi
     if ! command -v nslookup >/dev/null 2>&1; then
         case "$PKG_MGR" in apk) tools_missing="$tools_missing bind-tools" ;; apt) tools_missing="$tools_missing dnsutils" ;; esac
@@ -114,9 +110,7 @@ ensure_tools() {
     fi
     if [ -n "$tools_missing" ]; then
         log_info "安装缺失工具: $tools_missing"
-        for pkg in $tools_missing; do
-            pkg_install "$pkg" || log_warn "$pkg 安装失败"
-        done
+        pkg_install "$tools_missing" || log_warn "部分工具安装失败"
     fi
 }
 
@@ -363,7 +357,7 @@ EOF
     fi
     
     cat > /etc/smartdns/smartdns.conf << EOF
-# SmartDNS 配置 v6.4.8
+# SmartDNS 配置 v6.4.9
 # 环境: $OS_TYPE $OS_VER | $VIRT_TYPE | $NET_STACK
 # 版本: $SMARTDNS_VER | 来源: $SMARTDNS_SOURCE
 # 策略: $TAKEOVER_STRATEGY | 时间: $(date '+%Y-%m-%d %H:%M:%S')
@@ -532,7 +526,7 @@ SSTART
     log_info "部署 DNS 文件守护"
     cat > "$GUARD_SCRIPT" << GUARD
 #!/bin/sh
-# SmartDNS DNS 文件守护 v6.4.8
+# SmartDNS DNS 文件守护 v6.4.9
 TARGET="/etc/resolv.conf"
 TEMPLATE="${RESOLV_TEMPLATE}"
 PID_FILE="${PID_FILE}"
@@ -898,7 +892,7 @@ main() {
     done
     
     echo ""
-    echo -e "${BOLD}SmartDNS 智能部署 v6.4.8${NC}"
+    echo -e "${BOLD}SmartDNS 智能部署 v6.4.9${NC}"
     echo -e "上游: Google + Cloudflare (DoH/DoT/UDP)"
     echo -e "环境: Alpine/Debian (LXC/KVM/Podman)"
     echo ""
