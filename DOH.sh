@@ -1,7 +1,7 @@
 #!/bin/sh
 #==========================================================================
-# SmartDNS 智能部署脚本 v6.4.5
-# 优化: 一行解决端口检测时机问题，撤销模块拆分
+# SmartDNS 智能部署脚本 v6.4.6
+# 修复: main() 遍历参数支持管道卸载 + 卸载命令提示修正
 #==========================================================================
 set +e
 
@@ -299,7 +299,6 @@ module_config() {
     [ -f /etc/smartdns/smartdns.conf ] && \
         cp /etc/smartdns/smartdns.conf "/etc/smartdns/smartdns.conf.bak.$(date +%Y%m%d-%H%M%S)" 2>/dev/null
     
-    # DNS 模板
     if [ "$HAS_IPV6" = true ] && [ "$HAS_IPV4" = true ]; then
         cat > "$RESOLV_TEMPLATE" << EOF
 nameserver 127.0.0.1
@@ -336,7 +335,6 @@ EOF
     # 如果 resolved 占着 53，先停掉再检测端口（幂等操作）
     [ "$TAKEOVER_STRATEGY" = "resolved" ] && systemctl stop systemd-resolved 2>/dev/null
     
-    # 端口选择
     PORT=53
     if port_in_use 53; then
         log_warn "端口 53 被占用"
@@ -347,9 +345,8 @@ EOF
         log_ok "端口 53 可用"
     fi
     
-    # SmartDNS 配置
     cat > /etc/smartdns/smartdns.conf << EOF
-# SmartDNS 配置 v6.4.5
+# SmartDNS 配置 v6.4.6
 # 环境: $OS_TYPE $OS_VER | $VIRT_TYPE | $NET_STACK
 # 版本: $SMARTDNS_VER | 来源: $SMARTDNS_SOURCE
 # 策略: $TAKEOVER_STRATEGY | 时间: $(date '+%Y-%m-%d %H:%M:%S')
@@ -522,7 +519,7 @@ SSTART
     log_info "部署 DNS 文件守护"
     cat > "$GUARD_SCRIPT" << GUARD
 #!/bin/sh
-# SmartDNS DNS 文件守护 v6.4.5
+# SmartDNS DNS 文件守护 v6.4.6
 TARGET="/etc/resolv.conf"
 TEMPLATE="${RESOLV_TEMPLATE}"
 PID_FILE="${PID_FILE}"
@@ -878,13 +875,17 @@ module_uninstall() {
 }
 
 main() {
-    if [ "${1:-}" = "--uninstall" ] || [ "${1:-}" = "-u" ]; then
-        module_uninstall
-        exit 0
-    fi
+    for arg in "$@"; do
+        case "$arg" in
+            --uninstall|-u)
+                module_uninstall
+                exit 0
+                ;;
+        esac
+    done
     
     echo ""
-    echo -e "${BOLD}SmartDNS 智能部署 v6.4.5${NC}"
+    echo -e "${BOLD}SmartDNS 智能部署 v6.4.6${NC}"
     echo -e "上游: Google + Cloudflare (DoH/DoT/UDP)"
     echo -e "环境: Alpine/Debian (LXC/KVM/Podman)"
     echo ""
@@ -897,7 +898,7 @@ main() {
     module_verify
     
     echo ""
-    echo -e "卸载命令: ${GREEN}$0 --uninstall${NC}"
+    echo -e "卸载命令: ${GREEN}wget -qO- URL | bash -s -- --uninstall${NC}"
 }
 
 main "$@"
