@@ -1,6 +1,7 @@
 #!/bin/sh
 #==========================================================================
 # SmartDNS 智能部署脚本 v7.0.0
+# 重构: 交互菜单 (滚屏+自适应+功能函数纯输出)
 #==========================================================================
 set +e
 
@@ -144,7 +145,6 @@ module_detect() {
     case "$VIRT_TYPE" in podman|docker|lxc) VIRT_IS_CONTAINER=true ;; *) VIRT_IS_CONTAINER=false ;; esac
     log_info "虚拟化: $VIRT_TYPE (容器: $VIRT_IS_CONTAINER)"
     
-    # 先装工具，确保 nslookup 可用
     ARCH=$(get_arch); ensure_tools
     
     HAS_IPV4=true; ip route get 1.1.1.1 >/dev/null 2>&1 || HAS_IPV4=false
@@ -243,7 +243,7 @@ EOF
     else log_ok "端口 53 可用"; fi
     
     cat > /etc/smartdns/smartdns.conf << EOF
-# SmartDNS 配置 v6.6.2
+# SmartDNS 配置 v7.0.0
 # 环境: $OS_TYPE $OS_VER | $VIRT_TYPE | $NET_STACK
 # 版本: $SMARTDNS_VER | 来源: $SMARTDNS_SOURCE
 # 策略: $TAKEOVER_STRATEGY | 时间: $(date '+%Y-%m-%d %H:%M:%S')
@@ -383,18 +383,9 @@ GUARD
     
     if [ "$INIT_TYPE" = "systemd" ]; then
         cat > /etc/systemd/system/smartdns-dns-guard.service << 'GSTART'
-[Unit]
-Description=SmartDNS DNS Guard
-After=smartdns.service smartdns-dns-fix.service
-Requires=smartdns.service
-[Service]
-Type=forking
-ExecStart=/usr/local/bin/smartdns-dns-guard.sh
-PIDFile=/var/run/smartdns-dns-guard.pid
-Restart=always
-RestartSec=3
-[Install]
-WantedBy=multi-user.target
+[Unit] Description=SmartDNS DNS Guard; After=smartdns.service smartdns-dns-fix.service; Requires=smartdns.service
+[Service] Type=forking; ExecStart=/usr/local/bin/smartdns-dns-guard.sh; PIDFile=/var/run/smartdns-dns-guard.pid; Restart=always; RestartSec=3
+[Install] WantedBy=multi-user.target
 GSTART
         systemctl daemon-reload 2>/dev/null; systemctl enable smartdns-dns-guard.service 2>/dev/null; systemctl start smartdns-dns-guard.service 2>/dev/null
     elif [ "$INIT_TYPE" = "openrc" ]; then
@@ -405,8 +396,7 @@ OGSTART
         chmod +x /etc/local.d/smartdns-guard.start; "$GUARD_SCRIPT"; safe_rc_add local default
     else "$GUARD_SCRIPT"; fi
     
-    log_ok "DNS 守护已部署 (工具: ${INOTIFY_CMD:-轮询})"
-    log_ok "系统 DNS → $(head -1 "$RESOLV_TEMPLATE")"
+    log_ok "DNS 守护已部署 (工具: ${INOTIFY_CMD:-轮询})"; log_ok "系统 DNS → $(head -1 "$RESOLV_TEMPLATE")"
 }
 
 #==================================================
@@ -418,31 +408,16 @@ module_service() {
     case "$INIT_TYPE" in
         systemd)
             cat > /etc/systemd/system/smartdns.service << 'SVC'
-[Unit]
-Description=SmartDNS (DoH+DoT+UDP)
-After=network-online.target
-Wants=network-online.target
-[Service]
-Type=forking
-ExecStart=/usr/bin/smartdns -c /etc/smartdns/smartdns.conf
-PIDFile=/run/smartdns.pid
-ExecReload=/bin/kill -HUP $MAINPID
-Restart=on-failure
-RestartSec=3
-WatchdogSec=30
-[Install]
-WantedBy=multi-user.target
+[Unit] Description=SmartDNS (DoH+DoT+UDP); After=network-online.target; Wants=network-online.target
+[Service] Type=forking; ExecStart=/usr/bin/smartdns -c /etc/smartdns/smartdns.conf; PIDFile=/run/smartdns.pid; ExecReload=/bin/kill -HUP $MAINPID; Restart=on-failure; RestartSec=3; WatchdogSec=30
+[Install] WantedBy=multi-user.target
 SVC
             systemctl daemon-reload; systemctl enable smartdns.service 2>/dev/null; systemctl restart smartdns.service; sleep 2 ;;
         openrc)
             if [ ! -f /etc/init.d/smartdns ]; then
                 cat > /etc/init.d/smartdns << OSVC
 #!/sbin/openrc-run
-name="SmartDNS"
-command="/usr/bin/smartdns"
-command_args="-c /etc/smartdns/smartdns.conf"
-command_background=true
-pidfile="/run/smartdns.pid"
+name="SmartDNS"; command="/usr/bin/smartdns"; command_args="-c /etc/smartdns/smartdns.conf"; command_background=true; pidfile="/run/smartdns.pid"
 depend() { need net; after firewall; }
 OSVC
                 chmod +x /etc/init.d/smartdns
@@ -544,22 +519,18 @@ EOF
 #==================================================
 # 模块7: 交互菜单 (v7.0.0 重构)
 #==================================================
+install_shortcut() {
+    local script_path=$(readlink -f "$0" 2>/dev/null || echo "$0")
+    [ "$script_path" != "$SDNS_CMD" ] && { cp "$script_path" "$SDNS_CMD" 2>/dev/null; chmod +x "$SDNS_CMD" 2>/dev/null; }
+}
 
-# 终端宽度适配
 TERM_WIDE=false
 [ "$(tput cols 2>/dev/null || echo 0)" -ge 80 ] && TERM_WIDE=true
 
-# 画线
 hr() { printf "%70s\n" | tr ' ' '─'; }
 
-# 滚屏（兼容非交互终端）
-scroll() {
-    if [ -t 1 ]; then
-        i=0; while [ $i -lt 30 ]; do echo ""; i=$((i+1)); done
-    fi
-}
+scroll() { if [ -t 1 ]; then i=0; while [ $i -lt 30 ]; do echo ""; i=$((i+1)); done; fi; }
 
-# 只显示横幅，不循环
 show_banner() {
     scroll
     if $TERM_WIDE; then
@@ -578,21 +549,16 @@ show_banner() {
         echo "└──────────────────────────────────────┘"
         printf "%b" "${NC}"
     else
-        # 窄终端简化版
-        echo ""; echo -e "${BOLD}SmartDNS 管理${NC}"
-        hr; echo "s状态 l日志 t测试 c配置 e编辑 r重启 f清缓存 u卸载 q退出"; hr
+        echo ""; echo -e "${BOLD}SmartDNS 管理${NC}"; hr
+        echo "s状态 l日志 t测试 c配置 e编辑 r重启 f清缓存 u卸载 q退出"; hr
     fi
 }
 
-# ===== 功能函数（只输出内容，不交互） =====
-
 do_status() {
     echo ""; echo -e "${BOLD}── 状态 ──${NC}"
-    if pgrep smartdns >/dev/null 2>&1; then
-        echo -e "  SmartDNS:  ${GREEN}运行中${NC} ($(pgrep smartdns | wc -l) 进程)"
+    if pgrep smartdns >/dev/null 2>&1; then echo -e "  SmartDNS:  ${GREEN}运行中${NC} ($(pgrep smartdns | wc -l) 进程)"
     else echo -e "  SmartDNS:  ${RED}未运行${NC}"; fi
-    if pgrep -f smartdns-dns-guard >/dev/null 2>&1; then
-        echo -e "  DNS守护:   ${GREEN}运行中${NC}"
+    if pgrep -f smartdns-dns-guard >/dev/null 2>&1; then echo -e "  DNS守护:   ${GREEN}运行中${NC}"
     else echo -e "  DNS守护:   ${RED}未运行${NC}"; fi
     echo -e "  DNS配置:   $(head -1 /etc/resolv.conf 2>/dev/null || echo '无')"
     echo ""; echo -e "${BOLD}── 上游 ──${NC}"
@@ -615,79 +581,61 @@ do_test() {
         printf "  %-25s" "$domain"
         if [ -n "$BB" ]; then RESULT=$($BB nslookup "$domain" 127.0.0.1 2>&1)
         else RESULT=$(nslookup "$domain" 127.0.0.1 2>&1); fi
-        if echo "$RESULT" | grep -q "Address"; then
-            echo -e "${GREEN}✓${NC} $(echo "$RESULT" | grep "Address" | tail -1 | awk '{print $NF}')"
+        if echo "$RESULT" | grep -q "Address"; then echo -e "${GREEN}✓${NC} $(echo "$RESULT" | grep "Address" | tail -1 | awk '{print $NF}')"
         else echo -e "${RED}✗${NC}"; fi
     done
 }
 
-do_config() {
-    echo ""; echo -e "${BOLD}── 配置 ──${NC}"
-    [ -f /etc/smartdns/smartdns.conf ] && grep -v "^#\|^$" /etc/smartdns/smartdns.conf | head -30 || echo "  配置文件不存在"
-}
+do_config() { echo ""; echo -e "${BOLD}── 配置 ──${NC}"; [ -f /etc/smartdns/smartdns.conf ] && grep -v "^#\|^$" /etc/smartdns/smartdns.conf | head -30 || echo "  配置文件不存在"; }
 
-do_edit() {
-    local editor="vi"; command -v nano >/dev/null 2>&1 && editor="nano"
-    "$editor" /etc/smartdns/smartdns.conf
-    echo -e "${YELLOW}  配置已修改，执行 sdns r 重启生效${NC}"
-}
+do_edit() { local editor="vi"; command -v nano >/dev/null 2>&1 && editor="nano"; "$editor" /etc/smartdns/smartdns.conf; echo -e "${YELLOW}  配置已修改，执行 sdns r 重启生效${NC}"; }
 
 do_restart() {
     printf "  重启中... "
-    case "$INIT_TYPE" in
-        systemd) systemctl restart smartdns 2>/dev/null ;;
-        openrc)  rc-service smartdns restart 2>/dev/null ;;
-        *)       pkill smartdns 2>/dev/null; sleep 1; smartdns -c /etc/smartdns/smartdns.conf & ;;
-    esac
-    sleep 2
-    pgrep smartdns >/dev/null 2>&1 && echo -e "${GREEN}✓ 已重启${NC}" || echo -e "${RED}✗ 失败${NC}"
+    case "$INIT_TYPE" in systemd) systemctl restart smartdns 2>/dev/null ;; openrc) rc-service smartdns restart 2>/dev/null ;; *) pkill smartdns 2>/dev/null; sleep 1; smartdns -c /etc/smartdns/smartdns.conf & ;; esac
+    sleep 2; pgrep smartdns >/dev/null 2>&1 && echo -e "${GREEN}✓ 已重启${NC}" || echo -e "${RED}✗ 失败${NC}"
 }
 
-do_flush() {
-    if pkill -HUP smartdns 2>/dev/null; then echo -e "${GREEN}✓ 缓存已清除${NC}"
-    else echo -e "${RED}✗ SmartDNS 未运行${NC}"; fi
-}
-
-# ===== 菜单入口 =====
+do_flush() { pkill -HUP smartdns 2>/dev/null && echo -e "${GREEN}✓ 缓存已清除${NC}" || echo -e "${RED}✗ SmartDNS 未运行${NC}"; }
 
 module_menu() {
     install_shortcut
     
-    # 有参数直接执行，不进入循环
     if [ $# -gt 0 ]; then
         case "$1" in
-            s|status)   do_status; return ;;
-            l|log)      do_log; return ;;
-            t|test)     do_test; return ;;
-            c|config)   do_config; return ;;
-            e|edit)     do_edit; return ;;
-            r|restart)  do_restart; return ;;
-            f|flush)    do_flush; return ;;
-            u|uninstall) module_uninstall; return ;;
-            *)          echo "用法: sdns [s|l|t|c|e|r|f|u]"; return ;;
+            s|status)   do_status; return ;;  l|log)      do_log; return ;;
+            t|test)     do_test; return ;;    c|config)   do_config; return ;;
+            e|edit)     do_edit; return ;;    r|restart)  do_restart; return ;;
+            f|flush)    do_flush; return ;;   u|uninstall) module_uninstall; return ;;
+            *) echo "用法: sdns [s|l|t|c|e|r|f|u]"; return ;;
         esac
     fi
     
-    # 无参数 → 交互循环
     while true; do
         show_banner
         printf "请选择: "
-        read -r choice 2>/dev/null || { echo ""; break; }  # EOF 保护
-        
+        read -r choice 2>/dev/null || { echo ""; break; }
         case "$choice" in
-            s|S) do_status ;;
-            l|L) do_log ;;
-            t|T) do_test ;;
-            c|C) do_config ;;
-            e|E) do_edit ;;
-            r|R) do_restart ;;
-            f|F) do_flush ;;
-            u|U) module_uninstall; break ;;
+            s|S) do_status ;; l|L) do_log ;; t|T) do_test ;; c|C) do_config ;;
+            e|E) do_edit ;; r|R) do_restart ;; f|F) do_flush ;; u|U) module_uninstall; break ;;
             q|Q) echo ""; break ;;
         esac
-        
         [ "$choice" != "q" ] && [ "$choice" != "Q" ] && { echo ""; printf "按回车继续..."; read -r _ 2>/dev/null || break; }
     done
+}
+
+main() {
+    if [ "$(readlink -f "$0" 2>/dev/null || echo "$0")" = "$SDNS_CMD" ]; then
+        [ -f /etc/smartdns/smartdns.conf ] && PORT=$(grep "^bind" /etc/smartdns/smartdns.conf | grep -o '[0-9]*$' | head -1); [ -z "$PORT" ] && PORT=53
+        [ -f /etc/alpine-release ] && OS_TYPE="alpine"; [ -d /run/systemd/system ] && INIT_TYPE="systemd"
+        detect_busybox; detect_inotify; module_menu "$@"; exit 0
+    fi
+    for arg in "$@"; do case "$arg" in --uninstall|-u) module_uninstall; exit 0 ;; esac; done
+    
+    echo ""; echo -e "${BOLD}SmartDNS 智能部署 v7.0.0${NC}"; echo -e "上游: Google + Cloudflare (DoH/DoT/UDP)"; echo -e "环境: Alpine/Debian (LXC/KVM/Podman)"; echo ""
+    module_detect; module_install; module_config; module_dns_takeover; module_service; module_verify
+    echo ""; echo -e "管理命令: ${GREEN}sdns${NC}"; echo -e "  sdns s  状态  sdns l  日志  sdns t  测试"; echo -e "  sdns r  重启  sdns e  编辑  sdns    菜单"
+    module_menu
 }
 
 main "$@"
