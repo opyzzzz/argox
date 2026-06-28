@@ -244,7 +244,7 @@ EOF
     else log_ok "端口 53 可用"; fi
     
     cat > /etc/smartdns/smartdns.conf << EOF
-# SmartDNS 配置 v7.2.0
+# SmartDNS 配置 v7.2.1
 # 环境: $OS_TYPE $OS_VER | $VIRT_TYPE | $NET_STACK
 # 版本: $SMARTDNS_VER | 来源: $SMARTDNS_SOURCE
 # 策略: $TAKEOVER_STRATEGY | 时间: $(date '+%Y-%m-%d %H:%M:%S')
@@ -542,7 +542,7 @@ EOF
 }
 
 #==================================================
-# 模块7: 竖排菜单 + 一键更新 (v7.2.0)
+# 模块7: 竖排菜单 + 一键更新 (v7.2.1)
 #==================================================
 install_shortcut() {
     local script_path=$(readlink -f "$0" 2>/dev/null || echo "$0")
@@ -671,7 +671,7 @@ main() {
     fi
     for arg in "$@"; do case "$arg" in --uninstall|-u) module_uninstall; exit 0 ;; esac; done
     
-    echo ""; echo -e "${BOLD}SmartDNS 智能部署 v7.2.0${NC}"; echo -e "上游: Google + Cloudflare (DoH/DoT/UDP)"; echo -e "环境: Alpine/Debian (LXC/KVM/Podman)"; echo ""
+    echo ""; echo -e "${BOLD}SmartDNS 智能部署 v7.2.1${NC}"; echo -e "上游: Google + Cloudflare (DoH/DoT/UDP)"; echo -e "环境: Alpine/Debian (LXC/KVM/Podman)"; echo ""
     module_detect; module_install; module_config; module_dns_takeover; module_service; module_verify
     echo ""; echo -e "管理命令: ${GREEN}sdns${NC}"; echo -e "  sdns s  状态  sdns l  日志  sdns t  测试  sdns u  更新"; echo -e "  sdns    菜单"
     module_menu
