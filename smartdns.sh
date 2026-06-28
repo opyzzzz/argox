@@ -1,6 +1,6 @@
 #!/bin/sh
 #==========================================================================
-# SmartDNS 智能部署脚本 v7.5.8
+# SmartDNS 智能部署脚本 v7.5.9
 # PID 文件路径 /var/run → /run (systemd 兼容)
 #==========================================================================
 set +e
@@ -178,7 +178,7 @@ module_detect() {
 }
 
 #==================================================
-# 模块1: 安装 SmartDNS (v7.5.8)
+# 模块1: 安装 SmartDNS (v7.5.9)
 #==================================================
 module_install() {
     log_step "模块1: 安装 SmartDNS"
@@ -259,7 +259,7 @@ EOF
     else log_ok "端口 53 可用"; fi
     
     cat > /etc/smartdns/smartdns.conf << EOF
-# SmartDNS 配置 v7.5.8
+# SmartDNS 配置 v7.5.9
 # 环境: $OS_TYPE $OS_VER | $VIRT_TYPE | $NET_STACK
 # 版本: $SMARTDNS_VER | 来源: $SMARTDNS_SOURCE
 # 策略: $TAKEOVER_STRATEGY | 时间: $(date '+%Y-%m-%d %H:%M:%S')
@@ -336,7 +336,7 @@ EOF
 }
 
 #==================================================
-# 模块3: 接管系统 DNS (v7.5.8)
+# 模块3: 接管系统 DNS (v7.5.9)
 #==================================================
 module_dns_takeover() {
     log_step "模块3: 接管系统 DNS (策略: $TAKEOVER_STRATEGY)"
@@ -445,7 +445,7 @@ OGSTART
 }
 
 #==================================================
-# 模块4: 服务与守护 (v7.5.8)
+# 模块4: 服务与守护 (v7.5.9)
 #==================================================
 module_service() {
     log_step "模块4: 部署 SmartDNS 服务"
@@ -538,7 +538,7 @@ module_verify() {
 }
 
 #==================================================
-# 模块6: 卸载 (v7.5.8)
+# 模块6: 卸载 (v7.5.9)
 #==================================================
 module_uninstall() {
     echo ""; echo -e "${YELLOW}══════════════════════════════════════${NC}"
@@ -604,7 +604,7 @@ EOF
     echo ""; echo -e "${GREEN}  卸载完成${NC}"
 }
 #==================================================
-# 模块7: 竖排菜单 (v7.5.8)
+# 模块7: 竖排菜单 (v7.5.9)
 #==================================================
 install_shortcut() {
     local script_path=$(readlink -f "$0" 2>/dev/null || echo "$0")
@@ -675,7 +675,7 @@ do_update() {
     clear 2>/dev/null || echo ""; echo -e "${BOLD}── 版本管理 ──${NC}"
     if ! command -v curl >/dev/null 2>&1; then echo -e "${RED}  需要 curl${NC}"; return; fi
     
-    CURRENT_TAG=$("$SMARTDNS_BIN" -v 2>&1 | grep -o 'Release[0-9.]*' | head -1)
+    CURRENT_TAG=$("$SMARTDNS_BIN" -v 2>&1 | grep 'Release' | head -1 | sed 's/.*\(Release[0-9.]*\).*/\1/')
     echo -e "  当前版本: ${GREEN}${CURRENT_TAG:-未知}${NC}"
     
     LATEST_JSON=$(curl -sL --max-time 10 https://api.github.com/repos/pymumu/smartdns/releases/latest 2>/dev/null)
@@ -743,7 +743,7 @@ main() {
     fi
     for arg in "$@"; do case "$arg" in --uninstall|-u) module_uninstall; exit 0 ;; esac; done
     
-    echo ""; echo -e "${BOLD}SmartDNS 智能部署 v7.5.8${NC}"; echo -e "上游: Google + Cloudflare (DoH/DoT/UDP)"; echo -e "环境: Alpine/Debian (LXC/KVM/Podman)"; echo ""
+    echo ""; echo -e "${BOLD}SmartDNS 智能部署 v7.5.9${NC}"; echo -e "上游: Google + Cloudflare (DoH/DoT/UDP)"; echo -e "环境: Alpine/Debian (LXC/KVM/Podman)"; echo ""
     module_detect; module_install; module_config; module_dns_takeover; module_service; module_verify
     echo ""; echo -e "管理命令: ${GREEN}sdns${NC}"; echo -e "  sdns t  测试  sdns l  日志  sdns c  配置  sdns u  版本管理"; echo -e "  sdns    菜单"
     module_menu
