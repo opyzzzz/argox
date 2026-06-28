@@ -1,7 +1,7 @@
 #!/bin/sh
 #==================================================
-# DNS 检测脚本 v5.1 - Alpine/Debian 精简版
-# 功能: 检测当前系统DNS的IPv4/IPv6/DoH/DoT可用性
+# DNS 检测脚本 v5.2 - Alpine/Debian 精简修复版
+# 修复: DoH重复执行、IPv6提取不完整、输出对齐
 # 兼容: Alpine 3.x / Debian 10+
 # 用法: wget -qO- https://.../dns-check.sh | sh
 #==================================================
@@ -9,7 +9,7 @@
 set +e
 
 #==================================================
-# 颜色 (Alpine/Debian兼容)
+# 颜色
 #==================================================
 if [ -t 1 ] && command -v tput >/dev/null 2>&1 && [ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]; then
     RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -23,20 +23,12 @@ fi
 #==================================================
 PASS=0; FAIL=0; WARN=0; SKIP=0; TOTAL=0
 
-# 图标
 ICON_OK="${GREEN}✓${NC}"; ICON_FAIL="${RED}✗${NC}"
 ICON_WARN="${YELLOW}⚠${NC}"; ICON_INFO="${CYAN}ℹ${NC}"; ICON_SKIP="${DIM}⊘${NC}"
 
-# DoH/DoT 服务器列表
-DOH_SERVERS="
-    Cloudflare|https://cloudflare-dns.com/dns-query
-    Google|https://dns.google/resolve
-"
-
-DOT_SERVERS="
-    Cloudflare|1.1.1.1
-    Google|8.8.8.8
-"
+# DoH/DoT 服务器 (名称|URL 或 名称|IP)
+DOH_SERVERS="Cloudflare|https://cloudflare-dns.com/dns-query Google|https://dns.google/resolve"
+DOT_SERVERS="Cloudflare|1.1.1.1 Google|8.8.8.8"
 
 #==================================================
 # 工具函数
@@ -44,26 +36,20 @@ DOT_SERVERS="
 print_header() {
     echo ""
     echo -e "${BOLD}${BLUE}═══════════════════════════════════════════════════════════${NC}"
-    echo -e "${BOLD}${BLUE}  DNS 可用性检测 v5.1 (Alpine/Debian)${NC}"
+    echo -e "${BOLD}${BLUE}  DNS 可用性检测 v5.2 (Alpine/Debian)${NC}"
     echo -e "${BOLD}${BLUE}  时间: $(date '+%Y-%m-%d %H:%M:%S')${NC}"
     echo -e "${BOLD}${BLUE}═══════════════════════════════════════════════════════════${NC}"
     echo ""
 }
 
-print_section() {
-    echo ""
-    echo -e "${BOLD}${BLUE}── $1 ──${NC}"
-}
+print_section() { echo -e "\n${BOLD}${BLUE}── $1 ──${NC}"; }
+print_sub()    { echo -e "  ${CYAN}▸${NC} ${BOLD}$1${NC}"; }
 
-print_sub() {
-    echo -e "  ${CYAN}▸${NC} ${BOLD}$1${NC}"
-}
-
-check_pass() { echo -e "    ${ICON_OK} $1"; PASS=$((PASS + 1)); TOTAL=$((TOTAL + 1)); }
-check_fail() { echo -e "    ${ICON_FAIL} $1"; [ -n "$2" ] && echo -e "      ${DIM}修复: $2${NC}"; FAIL=$((FAIL + 1)); TOTAL=$((TOTAL + 1)); }
-check_warn() { echo -e "    ${ICON_WARN} $1"; [ -n "$2" ] && echo -e "      ${DIM}建议: $2${NC}"; WARN=$((WARN + 1)); TOTAL=$((TOTAL + 1)); }
-check_info() { echo -e "    ${ICON_INFO} $1: ${CYAN}$2${NC}"; }
-check_skip() { echo -e "    ${ICON_SKIP} $1"; SKIP=$((SKIP + 1)); TOTAL=$((TOTAL + 1)); }
+check_pass()   { echo -e "    ${ICON_OK} $1"; PASS=$((PASS + 1)); TOTAL=$((TOTAL + 1)); }
+check_fail()   { echo -e "    ${ICON_FAIL} $1"; [ -n "$2" ] && echo -e "      ${DIM}修复: $2${NC}"; FAIL=$((FAIL + 1)); TOTAL=$((TOTAL + 1)); }
+check_warn()   { echo -e "    ${ICON_WARN} $1"; [ -n "$2" ] && echo -e "      ${DIM}建议: $2${NC}"; WARN=$((WARN + 1)); TOTAL=$((TOTAL + 1)); }
+check_info()   { echo -e "    ${ICON_INFO} $1: ${CYAN}$2${NC}"; }
+check_skip()   { echo -e "    ${ICON_SKIP} $1"; SKIP=$((SKIP + 1)); TOTAL=$((TOTAL + 1)); }
 
 #==================================================
 # 依赖检测和安装
@@ -73,11 +59,7 @@ check_deps() {
     for tool in nslookup curl ping; do
         command -v "$tool" >/dev/null 2>&1 || MISSING="$MISSING $tool"
     done
-    
-    # nc 是可选的 (用于DoT)
-    if ! command -v nc >/dev/null 2>&1; then
-        MISSING="$MISSING nc(可选)"
-    fi
+    command -v nc >/dev/null 2>&1 || MISSING="$MISSING nc(DoT需要)"
     
     [ -z "$MISSING" ] && return 0
     
@@ -85,44 +67,50 @@ check_deps() {
     echo -e "  ${ICON_WARN} 缺少工具:${MISSING}"
     
     if [ -f /etc/alpine-release ]; then
-        echo -e "  ${ICON_INFO} 安装: ${CYAN}apk add bind-tools curl iputils netcat-openbsd${NC}"
+        echo -e "  ${ICON_INFO} Alpine安装: ${CYAN}apk add bind-tools curl iputils netcat-openbsd${NC}"
     elif [ -f /etc/debian_version ]; then
-        echo -e "  ${ICON_INFO} 安装: ${CYAN}apt-get install -y dnsutils curl iputils-ping netcat-openbsd${NC}"
+        echo -e "  ${ICON_INFO} Debian安装: ${CYAN}apt-get install -y dnsutils curl iputils-ping netcat-openbsd${NC}"
     fi
     
-    # 自动安装 (如有root权限)
+    # 自动安装 (root)
     if [ "$(id -u 2>/dev/null)" = "0" ]; then
         echo -e "  ${ICON_INFO} 正在自动安装..."
         if [ -f /etc/alpine-release ]; then
-            apk add bind-tools curl iputils netcat-openbsd 2>/dev/null && echo -e "  ${ICON_OK} 安装完成" || echo -e "  ${ICON_FAIL} 安装失败"
+            apk add bind-tools curl iputils netcat-openbsd 2>/dev/null && \
+                echo -e "  ${ICON_OK} 安装完成" || echo -e "  ${ICON_FAIL} 安装失败"
         elif [ -f /etc/debian_version ]; then
             apt-get update -qq 2>/dev/null
-            apt-get install -y dnsutils curl iputils-ping netcat-openbsd 2>/dev/null && echo -e "  ${ICON_OK} 安装完成" || echo -e "  ${ICON_FAIL} 安装失败"
+            apt-get install -y dnsutils curl iputils-ping netcat-openbsd 2>/dev/null && \
+                echo -e "  ${ICON_OK} 安装完成" || echo -e "  ${ICON_FAIL} 安装失败"
         fi
     fi
     echo ""
 }
 
 #==================================================
-# DNS解析 (兼容nslookup/getent)
+# DNS解析 (修复IPv6输出不完整)
 #==================================================
 dns_resolve() {
     domain="$1"; type="${2:-A}"
     
-    # 方法1: nslookup
     if command -v nslookup >/dev/null 2>&1; then
         result=$(nslookup -timeout=3 -type="$type" "$domain" 2>/dev/null)
-        echo "$result" | awk '
+        echo "$result" | awk -v t="$type" '
             /^Name:/ { in_section=1; next }
             in_section && /^Address:/ {
                 ip = $NF
                 if (ip !~ /#/) { print ip; exit }
             }
+            # 某些nslookup输出用 "has AAAA address" 格式
+            in_section && $0 ~ /has .* address/ {
+                ip = $NF
+                print ip; exit
+            }
         '
         return
     fi
     
-    # 方法2: getent (仅A记录)
+    # getent回退 (仅A记录)
     if [ "$type" = "A" ] && command -v getent >/dev/null 2>&1; then
         getent hosts "$domain" 2>/dev/null | awk '{print $1}' | head -1
         return
@@ -132,64 +120,60 @@ dns_resolve() {
 }
 
 #==================================================
-# IPv4提取 (过滤DNS服务器IP)
+# IPv4提取
 #==================================================
 extract_ipv4() {
     result="$1"
-    # 获取所有nameserver用于过滤
     ns_filter="127\.0\.0\.1"
-    for ns in $(grep '^nameserver' /etc/resolv.conf 2>/dev/null | awk '{print $2}'); do
-        case "$ns" in
-            *:*) continue ;;
-            *) ns_filter="${ns_filter}|$(echo "$ns" | sed 's/\./\\./g')" ;;
-        esac
+    for ns in $(grep '^nameserver' /etc/resolv.conf 2>/dev/null | awk '{print $2}' | grep -v ':'); do
+        ns_filter="${ns_filter}|$(echo "$ns" | sed 's/\./\\./g')"
     done
     echo "$result" | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | grep -vE "^(${ns_filter})$" | head -1
 }
 
 #==================================================
-# IPv6提取 (过滤特殊地址和短字符串)
+# IPv6提取 (修复地址截断)
 #==================================================
 extract_ipv6() {
     result="$1"
-    echo "$result" | grep -Eo '([0-9a-fA-F]{1,4}:){2,7}[0-9a-fA-F]{1,4}' | while IFS= read -r ip; do
+    # 完整IPv6: 最多8段，匹配压缩和非压缩格式
+    echo "$result" | grep -Eo '([0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}' | while IFS= read -r ip; do
         [ -z "$ip" ] && continue
         [ ${#ip} -lt 7 ] && continue
+        # 过滤特殊地址
         case "$ip" in
             ::1|::|fe80:*|fc00:*|fd00:*|ff00:*) continue ;;
-            *) echo "$ip"; return ;;
+            *)
+                # 补全被截断的地址: nslookup 可能输出 "2607:f8b0:4005:809"
+                # 实际应为 "2607:f8b0:4005:809::200e" 之类
+                # 如果地址段数<8且不以::结尾，尝试接受
+                echo "$ip"
+                return
+                ;;
         esac
     done | head -1
 }
 
 #==================================================
-# IPv6可用性检测
+# IPv6可用性
 #==================================================
 has_ipv6() {
-    # 检查接口
     ip -6 addr show 2>/dev/null | grep -v '::1' | grep -q 'inet6' && return 0
-    # 检查/proc
     [ -f /proc/net/if_inet6 ] && grep -v '^00000000000000000000000000000001' /proc/net/if_inet6 2>/dev/null | head -1 | grep -q . && return 0
-    # 检查路由
     ip -6 route show 2>/dev/null | grep -q 'default' && return 0
-    # 检查resolv.conf
     grep -q '^nameserver.*:' /etc/resolv.conf 2>/dev/null && return 0
     return 1
 }
 
 #==================================================
-# DoH 检测函数
+# DoH 检测
 #==================================================
 check_doh() {
-    domain="$1"
-    url="$2"
-    type_num=1
-    
+    domain="$1"; url="$2"
     response=$(curl -s --max-time 5 -H "accept: application/dns-json" \
-        "${url}?name=${domain}&type=${type_num}" 2>/dev/null)
+        "${url}?name=${domain}&type=1" 2>/dev/null)
     
     if [ -n "$response" ] && echo "$response" | grep -qE '"Status":[[:space:]]*0'; then
-        # 提取IP
         flat=$(echo "$response" | tr -d '\n')
         ip=$(echo "$flat" | grep -o '"data":"[^"]*"' | head -1 | sed 's/"data":"//;s/"$//')
         [ -n "$ip" ] && echo "$ip" || echo "ok"
@@ -199,19 +183,22 @@ check_doh() {
 }
 
 #==================================================
-# DoT 检测函数
+# DoT 检测 (兼容Alpine busybox nc)
 #==================================================
 check_dot() {
-    ip="$1"
-    port="${2:-853}"
+    ip="$1"; port="${2:-853}"
     
     if command -v nc >/dev/null 2>&1; then
-        # 使用 nc 检测 TCP 853 端口
+        # GNU netcat
         if timeout 3 nc -z -w 2 "$ip" "$port" 2>/dev/null; then
             return 0
         fi
-        # Alpine busybox nc 可能语法不同
-        if timeout 3 sh -c "echo | nc -w 2 $ip $port >/dev/null 2>&1"; then
+        # OpenBSD netcat (Alpine)
+        if timeout 3 sh -c "echo '' | nc -w 2 '$ip' '$port' >/dev/null 2>&1"; then
+            return 0
+        fi
+        # busybox nc
+        if timeout 3 sh -c "echo '' | nc '$ip' '$port' -w 2 >/dev/null 2>&1"; then
             return 0
         fi
     fi
@@ -219,14 +206,22 @@ check_dot() {
 }
 
 #==================================================
-# 检测区域
+# 解析服务器列表 (空格分隔)
 #==================================================
+parse_servers() {
+    list="$1"
+    for item in $list; do
+        [ -z "$item" ] && continue
+        echo "$item"
+    done
+}
 
-# ── 第1部分: 系统环境 ──
+#==================================================
+# 第1部分: 系统环境
+#==================================================
 check_system() {
     print_section "系统环境"
     
-    # OS
     if [ -f /etc/alpine-release ]; then
         check_info "系统" "Alpine $(cat /etc/alpine-release)"
     elif [ -f /etc/debian_version ]; then
@@ -235,7 +230,6 @@ check_system() {
     check_info "内核" "$(uname -r)"
     check_info "架构" "$(uname -m)"
     
-    # 虚拟化
     if grep -q "container=lxc" /proc/1/environ 2>/dev/null; then
         check_info "环境" "LXC 容器"
     elif grep -qE "docker|podman" /proc/1/cgroup 2>/dev/null || [ -f /.dockerenv ]; then
@@ -244,11 +238,12 @@ check_system() {
         check_info "环境" "物理机/KVM"
     fi
     
-    # 依赖
     check_deps
 }
 
-# ── 第2部分: DNS配置 ──
+#==================================================
+# 第2部分: DNS配置
+#==================================================
 check_dns_config() {
     print_section "DNS 配置"
     
@@ -256,15 +251,13 @@ check_dns_config() {
     if [ -f /etc/resolv.conf ]; then
         check_pass "配置文件存在"
         
-        # 显示nameserver
         grep '^nameserver' /etc/resolv.conf 2>/dev/null | while IFS= read -r line; do
             echo -e "      ${DIM}$line${NC}"
         done
         
-        # 统计
         ns_count=$(grep -c '^nameserver' /etc/resolv.conf 2>/dev/null || echo 0)
-        ipv4_ns=$(grep '^nameserver' /etc/resolv.conf 2>/dev/null | grep -v ':' | wc -l)
-        ipv6_ns=$(grep '^nameserver' /etc/resolv.conf 2>/dev/null | grep ':' | wc -l)
+        ipv4_ns=$(grep '^nameserver' /etc/resolv.conf 2>/dev/null | grep -c -v ':' || echo 0)
+        ipv6_ns=$(grep '^nameserver' /etc/resolv.conf 2>/dev/null | grep -c ':' || echo 0)
         check_info "统计" "总计${ns_count}个 (IPv4:${ipv4_ns} IPv6:${ipv6_ns})"
         
         [ "$ns_count" -eq 0 ] && check_fail "未配置nameserver" "编辑 /etc/resolv.conf"
@@ -272,7 +265,6 @@ check_dns_config() {
         check_fail "resolv.conf 不存在"
     fi
     
-    # nsswitch
     if [ -f /etc/nsswitch.conf ]; then
         if grep '^hosts:' /etc/nsswitch.conf 2>/dev/null | grep -q 'dns'; then
             check_pass "nsswitch.conf: DNS已启用"
@@ -282,29 +274,19 @@ check_dns_config() {
     fi
 }
 
-# ── 第3部分: IPv4 DNS检测 ──
+#==================================================
+# 第3部分: IPv4 DNS检测
+#==================================================
 check_ipv4_dns() {
     print_section "IPv4 DNS 检测"
     
-    # 测试域名 (覆盖不同区域和类型)
-    IPV4_DOMAINS="
-        google.com
-        cloudflare.com
-        github.com
-        microsoft.com
-        amazon.com
-        bbc.co.uk
-        ovh.com
-        cdn.jsdelivr.net
-    "
+    IPV4_DOMAINS="google.com cloudflare.com github.com microsoft.com amazon.com bbc.co.uk ovh.com cdn.jsdelivr.net"
     
     print_sub "A记录解析"
     ipv4_ok=0; ipv4_total=0
     
     for domain in $IPV4_DOMAINS; do
-        [ -z "$domain" ] && continue
         ipv4_total=$((ipv4_total + 1))
-        
         result=$(dns_resolve "$domain" "A")
         ip=$(extract_ipv4 "$result")
         
@@ -316,7 +298,6 @@ check_ipv4_dns() {
         fi
     done
     
-    # 总结
     echo ""
     if [ "$ipv4_ok" -eq "$ipv4_total" ]; then
         check_pass "IPv4 DNS: ${ipv4_ok}/${ipv4_total} 全部成功"
@@ -326,7 +307,6 @@ check_ipv4_dns() {
         check_fail "IPv4 DNS: ${ipv4_ok}/${ipv4_total} 大部分失败" "检查网络和DNS配置"
     fi
     
-    # 连通性: ping DNS服务器
     print_sub "DNS服务器连通性"
     for ns in $(grep '^nameserver' /etc/resolv.conf 2>/dev/null | awk '{print $2}' | grep -v ':'); do
         if ping -c 1 -W 2 "$ns" >/dev/null 2>&1; then
@@ -336,7 +316,6 @@ check_ipv4_dns() {
         fi
     done
     
-    # 连通性: ping 公共DNS
     for public_dns in 8.8.8.8 1.1.1.1; do
         if ping -c 1 -W 2 "$public_dns" >/dev/null 2>&1; then
             check_pass "公网DNS $public_dns 可达"
@@ -346,11 +325,13 @@ check_ipv4_dns() {
     done
 }
 
-# ── 第4部分: DoH/DoT 检测 (新增) ──
+#==================================================
+# 第4部分: DoH/DoT 检测 (修复重复执行)
+#==================================================
 check_encrypted_dns() {
     print_section "加密DNS检测 (DoH/DoT)"
     
-    # ── DoH 检测 ──
+    # ── DoH ──
     print_sub "DoH (DNS over HTTPS)"
     
     if ! command -v curl >/dev/null 2>&1; then
@@ -358,12 +339,16 @@ check_encrypted_dns() {
     else
         doh_ok=0; doh_total=0
         
-        echo "$DOH_SERVERS" | while IFS='|' read -r name url; do
+        # 使用 parse_servers 函数，避免重复执行
+        parsed_list=$(parse_servers "$DOH_SERVERS")
+        
+        # 使用 here-document 避免子shell
+        while IFS='|' read -r name url; do
             [ -z "$name" ] && continue
             doh_total=$((doh_total + 1))
             
             result=$(check_doh "google.com" "$url" 2>/dev/null)
-            if [ "$result" = "ok" ] || [ -n "$result" ]; then
+            if [ -n "$result" ]; then
                 doh_ok=$((doh_ok + 1))
                 if [ "$result" != "ok" ]; then
                     check_pass "$name DoH → $result"
@@ -371,38 +356,16 @@ check_encrypted_dns() {
                     check_pass "$name DoH 可用"
                 fi
             else
-                check_fail "$name DoH 不可用" "检查网络或防火墙规则"
+                check_fail "$name DoH 不可用" "检查443端口和TLS"
             fi
-        done
-        
-        # 注意: while在子shell中，计数不会传回。改用for
-        # 重新实现DoH检测（避免子shell问题）
-        doh_ok=0; doh_total=0
-        saved_ifs="$IFS"; IFS='
-'
-        for entry in $DOH_SERVERS; do
-            [ -z "$entry" ] && continue
-            name="${entry%%|*}"; url="${entry#*|}"
-            doh_total=$((doh_total + 1))
-            
-            result=$(check_doh "google.com" "$url" 2>/dev/null)
-            if [ "$result" = "ok" ] || [ -n "$result" ]; then
-                doh_ok=$((doh_ok + 1))
-                if [ "$result" != "ok" ]; then
-                    check_pass "$name DoH → $result"
-                else
-                    check_pass "$name DoH 可用"
-                fi
-            else
-                check_fail "$name DoH 不可用" "检查网络或防火墙规则"
-            fi
-        done
-        IFS="$saved_ifs"
+        done <<EOF
+$parsed_list
+EOF
         
         echo ""
         if [ "$doh_total" -gt 0 ]; then
             if [ "$doh_ok" -eq "$doh_total" ]; then
-                check_pass "DoH: 全部可用"
+                check_pass "DoH: 全部可用 (${doh_ok}/${doh_total})"
             elif [ "$doh_ok" -gt 0 ]; then
                 check_warn "DoH: 部分可用 (${doh_ok}/${doh_total})"
             else
@@ -411,19 +374,19 @@ check_encrypted_dns() {
         fi
     fi
     
-    # ── DoT 检测 ──
+    # ── DoT ──
     echo ""
     print_sub "DoT (DNS over TLS)"
     
-    if ! command -v nc >/dev/null 2>&1 && ! command -v timeout >/dev/null 2>&1; then
-        check_skip "nc/timeout未安装，跳过DoT检测"
+    if ! command -v nc >/dev/null 2>&1; then
+        check_skip "nc未安装，跳过DoT检测"
     else
         dot_ok=0; dot_total=0
-        saved_ifs="$IFS"; IFS='
-'
-        for entry in $DOT_SERVERS; do
-            [ -z "$entry" ] && continue
-            name="${entry%%|*}"; ip="${entry#*|}"
+        
+        parsed_list=$(parse_servers "$DOT_SERVERS")
+        
+        while IFS='|' read -r name ip; do
+            [ -z "$name" ] && continue
             dot_total=$((dot_total + 1))
             
             if check_dot "$ip" 853; then
@@ -432,13 +395,14 @@ check_encrypted_dns() {
             else
                 check_fail "$name DoT ($ip:853) 不可达" "检查853端口和防火墙"
             fi
-        done
-        IFS="$saved_ifs"
+        done <<EOF
+$parsed_list
+EOF
         
         echo ""
         if [ "$dot_total" -gt 0 ]; then
             if [ "$dot_ok" -eq "$dot_total" ]; then
-                check_pass "DoT: 全部可达"
+                check_pass "DoT: 全部可达 (${dot_ok}/${dot_total})"
             elif [ "$dot_ok" -gt 0 ]; then
                 check_warn "DoT: 部分可达 (${dot_ok}/${dot_total})"
             else
@@ -448,7 +412,9 @@ check_encrypted_dns() {
     fi
 }
 
-# ── 第5部分: IPv6 DNS检测 ──
+#==================================================
+# 第5部分: IPv6 DNS检测
+#==================================================
 check_ipv6_dns() {
     print_section "IPv6 DNS 检测"
     
@@ -457,14 +423,12 @@ check_ipv6_dns() {
         return
     fi
     
-    # 接口状态
     print_sub "IPv6 接口"
     check_pass "IPv6 已启用"
     
     ipv6_addr=$(ip -6 addr show 2>/dev/null | grep 'inet6' | grep -v '::1' | awk '{print $2}' | head -1)
     [ -n "$ipv6_addr" ] && check_info "地址" "$ipv6_addr"
     
-    # 网关
     ipv6_gw=$(ip -6 route show default 2>/dev/null | awk '{print $3}' | head -1)
     if [ -n "$ipv6_gw" ]; then
         check_info "网关" "$ipv6_gw"
@@ -475,23 +439,14 @@ check_ipv6_dns() {
         fi
     fi
     
-    # AAAA记录解析 (多地址)
-    IPV6_DOMAINS="
-        google.com
-        cloudflare.com
-        he.net
-        ipv6.google.com
-        facebook.com
-        ip6only.me
-    "
+    # AAAA记录
+    IPV6_DOMAINS="google.com cloudflare.com he.net ipv6.google.com facebook.com ip6only.me"
     
     print_sub "AAAA记录解析"
     ipv6_ok=0; ipv6_total=0
     
     for domain in $IPV6_DOMAINS; do
-        [ -z "$domain" ] && continue
         ipv6_total=$((ipv6_total + 1))
-        
         result=$(dns_resolve "$domain" "AAAA")
         ip=$(extract_ipv6 "$result")
         
@@ -503,7 +458,6 @@ check_ipv6_dns() {
         fi
     done
     
-    # 总结
     echo ""
     if [ "$ipv6_ok" -ge $((ipv6_total * 2 / 3)) ]; then
         check_pass "IPv6 DNS: ${ipv6_ok}/${ipv6_total} 成功"
@@ -513,8 +467,10 @@ check_ipv6_dns() {
         check_warn "IPv6 DNS: 全部失败" "IPv6 DNS解析不可用，检查IPv6网络"
     fi
     
-    # IPv6 DNS服务器连通性
-    print_sub "IPv6 DNS服务器连通性"
+    # IPv6 DNS连通性
+    print_sub "IPv6 连通性"
+    
+    # 本地IPv6 DNS
     ipv6_ns_found=0
     for ns in $(grep '^nameserver' /etc/resolv.conf 2>/dev/null | awk '{print $2}' | grep ':'); do
         ipv6_ns_found=1
@@ -527,32 +483,40 @@ check_ipv6_dns() {
     [ "$ipv6_ns_found" -eq 0 ] && check_info "IPv6 DNS" "未配置IPv6 nameserver"
     
     # 公网IPv6 DNS
+    ipv6_public_reachable=0
     for public_dns6 in 2001:4860:4860::8888 2606:4700:4700::1111; do
         if ping -6 -c 1 -W 2 "$public_dns6" >/dev/null 2>&1; then
+            ipv6_public_reachable=1
             check_pass "公网DNS $public_dns6 可达"
         else
             check_warn "公网DNS $public_dns6 不可达"
         fi
     done
     
-    # IPv6 HTTP测试
-    print_sub "IPv6 HTTP 访问"
-    if command -v curl >/dev/null 2>&1; then
-        for url in "https://ipv6.google.com" "https://cloudflare.com"; do
-            http_code=$(curl -6 -s --max-time 5 -o /dev/null -w '%{http_code}' "$url" 2>/dev/null)
-            [ -z "$http_code" ] && http_code="000"
-            if echo "$http_code" | grep -q '^[23]'; then
-                check_pass "$url → HTTP $http_code"
-            else
-                check_warn "$url → HTTP $http_code"
-            fi
-        done
+    # IPv6 HTTP (仅当公网IPv6可达时测试)
+    if [ "$ipv6_public_reachable" -eq 1 ]; then
+        print_sub "IPv6 HTTP 访问"
+        if command -v curl >/dev/null 2>&1; then
+            for url in "https://ipv6.google.com" "https://cloudflare.com"; do
+                http_code=$(curl -6 -s --max-time 5 -o /dev/null -w '%{http_code}' "$url" 2>/dev/null)
+                [ -z "$http_code" ] && http_code="000"
+                if echo "$http_code" | grep -q '^[23]'; then
+                    check_pass "$url → HTTP $http_code"
+                else
+                    check_warn "$url → HTTP $http_code"
+                fi
+            done
+        else
+            check_skip "curl未安装"
+        fi
     else
-        check_skip "curl未安装"
+        check_info "IPv6 HTTP" "跳过 (公网IPv6不可达)"
     fi
 }
 
-# ── 第6部分: 最终报告 ──
+#==================================================
+# 第6部分: 最终报告
+#==================================================
 print_report() {
     print_section "检测报告"
     
