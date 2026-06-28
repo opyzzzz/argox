@@ -1,6 +1,6 @@
 #!/bin/sh
 #==========================================================================
-# SmartDNS 智能部署脚本 v7.2.3
+# SmartDNS 智能部署脚本 v7.2.4
 # 修复systemd unit 文件格式错误
 #==========================================================================
 set +e
@@ -244,7 +244,7 @@ EOF
     else log_ok "端口 53 可用"; fi
     
     cat > /etc/smartdns/smartdns.conf << EOF
-# SmartDNS 配置 v7.2.3
+# SmartDNS 配置 v7.2.4
 # 环境: $OS_TYPE $OS_VER | $VIRT_TYPE | $NET_STACK
 # 版本: $SMARTDNS_VER | 来源: $SMARTDNS_SOURCE
 # 策略: $TAKEOVER_STRATEGY | 时间: $(date '+%Y-%m-%d %H:%M:%S')
@@ -450,7 +450,7 @@ OSVC
             safe_rc_add smartdns default; rc-service smartdns start 2>/dev/null; sleep 2 ;;
         *) /usr/bin/smartdns -c /etc/smartdns/smartdns.conf & sleep 2 ;;
     esac
-    if pgrep -x smartdns >/dev/null 2>&1; then log_ok "SmartDNS 已启动"
+    if pgrep smartdns >/dev/null 2>&1; then log_ok "SmartDNS 已启动"
     else log_err "启动失败，日志:"; tail -20 /var/log/smartdns.log 2>/dev/null; exit 1; fi
 }
 
@@ -542,7 +542,7 @@ EOF
 }
 
 #==================================================
-# 模块7: 竖排菜单 (v7.2.3 精简)
+# 模块7: 竖排菜单 (v7.2.4 精简)
 #==================================================
 install_shortcut() {
     local script_path=$(readlink -f "$0" 2>/dev/null || echo "$0")
@@ -552,7 +552,7 @@ install_shortcut() {
 hr() { printf "%${COLS}s\n" | tr ' ' '━'; }
 
 get_dots() {
-    pgrep -x smartdns >/dev/null 2>&1 && S="${GREEN}●${NC}" || S="${RED}●${NC}"
+    pgrep smartdns >/dev/null 2>&1 && S="${GREEN}●${NC}" || S="${RED}●${NC}"
     pgrep -f smartdns-dns-guard >/dev/null 2>&1 && G="${GREEN}●${NC}" || G="${RED}●${NC}"
     DNS=$(grep "^nameserver" /etc/resolv.conf 2>/dev/null | awk '{print $2}' | head -1); [ -z "$DNS" ] && DNS="未配置"
     UP=""; for ip in 8.8.8.8 1.1.1.1; do nc -z -w1 "$ip" 53 2>/dev/null && UP="$UP ${GREEN}●${NC}" || UP="$UP ${RED}●${NC}"; done
@@ -597,7 +597,7 @@ do_edit() {
 do_restart() {
     printf "  重启中... "
     case "$INIT_TYPE" in systemd) systemctl restart smartdns 2>/dev/null ;; openrc) rc-service smartdns restart 2>/dev/null ;; *) pkill -x smartdns 2>/dev/null; sleep 1; smartdns -c /etc/smartdns/smartdns.conf & ;; esac
-    sleep 2; pgrep -x smartdns >/dev/null 2>&1 && echo -e "${GREEN}✓ 已重启${NC}" || echo -e "${RED}✗ 失败${NC}"
+    sleep 2; pgrep smartdns >/dev/null 2>&1 && echo -e "${GREEN}✓ 已重启${NC}" || echo -e "${RED}✗ 失败${NC}"
 }
 
 do_flush() { pkill -HUP -x smartdns 2>/dev/null && echo -e "${GREEN}✓ 缓存已清除${NC}" || echo -e "${RED}✗ 未运行${NC}"; }
@@ -651,7 +651,7 @@ main() {
     fi
     for arg in "$@"; do case "$arg" in --uninstall|-u) module_uninstall; exit 0 ;; esac; done
     
-    echo ""; echo -e "${BOLD}SmartDNS 智能部署 v7.2.3${NC}"; echo -e "上游: Google + Cloudflare (DoH/DoT/UDP)"; echo -e "环境: Alpine/Debian (LXC/KVM/Podman)"; echo ""
+    echo ""; echo -e "${BOLD}SmartDNS 智能部署 v7.2.4${NC}"; echo -e "上游: Google + Cloudflare (DoH/DoT/UDP)"; echo -e "环境: Alpine/Debian (LXC/KVM/Podman)"; echo ""
     module_detect; module_install; module_config; module_dns_takeover; module_service; module_verify
     echo ""; echo -e "管理命令: ${GREEN}sdns${NC}"; echo -e "  sdns t  测试  sdns l  日志  sdns c  配置  sdns u  更新"; echo -e "  sdns    菜单"
     module_menu
