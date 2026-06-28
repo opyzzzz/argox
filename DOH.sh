@@ -1,7 +1,7 @@
 #!/bin/sh
 #==========================================================================
-# SmartDNS 智能部署脚本 v7.2.0
-# 竖排菜单 + 一键更新 + pkill -x 修复
+# SmartDNS 智能部署脚本 v7.2.1
+# 修复systemd unit 文件格式错误
 #==========================================================================
 set +e
 
@@ -384,9 +384,20 @@ GUARD
     
     if [ "$INIT_TYPE" = "systemd" ]; then
         cat > /etc/systemd/system/smartdns-dns-guard.service << 'GSTART'
-[Unit] Description=SmartDNS DNS Guard; After=smartdns.service smartdns-dns-fix.service; Requires=smartdns.service
-[Service] Type=forking; ExecStart=/usr/local/bin/smartdns-dns-guard.sh; PIDFile=/var/run/smartdns-dns-guard.pid; Restart=always; RestartSec=3
-[Install] WantedBy=multi-user.target
+[Unit]
+Description=SmartDNS DNS Guard
+After=smartdns.service smartdns-dns-fix.service
+Requires=smartdns.service
+
+[Service]
+Type=forking
+ExecStart=/usr/local/bin/smartdns-dns-guard.sh
+PIDFile=/var/run/smartdns-dns-guard.pid
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
 GSTART
         systemctl daemon-reload 2>/dev/null; systemctl enable smartdns-dns-guard.service 2>/dev/null; systemctl start smartdns-dns-guard.service 2>/dev/null
     elif [ "$INIT_TYPE" = "openrc" ]; then
@@ -409,9 +420,22 @@ module_service() {
     case "$INIT_TYPE" in
         systemd)
             cat > /etc/systemd/system/smartdns.service << 'SVC'
-[Unit] Description=SmartDNS (DoH+DoT+UDP); After=network-online.target; Wants=network-online.target
-[Service] Type=forking; ExecStart=/usr/bin/smartdns -c /etc/smartdns/smartdns.conf; PIDFile=/run/smartdns.pid; ExecReload=/bin/kill -HUP $MAINPID; Restart=on-failure; RestartSec=3; WatchdogSec=30
-[Install] WantedBy=multi-user.target
+[Unit]
+Description=SmartDNS (DoH+DoT+UDP)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=forking
+ExecStart=/usr/bin/smartdns -c /etc/smartdns/smartdns.conf
+PIDFile=/run/smartdns.pid
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=3
+WatchdogSec=30
+
+[Install]
+WantedBy=multi-user.target
 SVC
             systemctl daemon-reload; systemctl enable smartdns.service 2>/dev/null; systemctl restart smartdns.service; sleep 2 ;;
         openrc)
