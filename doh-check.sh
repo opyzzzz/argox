@@ -1,11 +1,11 @@
 #!/bin/sh
 #==================================================
-# DNS 全面检测脚本 v4.5 - 运行时修复版
+# DNS 全面检测脚本 v4.7 - 第五轮审计修复版
 # 支持: SmartDNS / 系统DNS / 手动指定DNS
-# 修复: nslookup输出解析、IPv6提取、CDN误报
-# 新增: 自动安装缺失依赖
+# 新增: 全面IPv6检测、CDN智能识别、污染精确检测
+# 修复: has_ipv6、CDN范围、curl回退、IPv6正则
 # 国际版 - 不含国内检测地址
-# 兼容: Alpine/Debian/Ubuntu (bash/dash/ash)
+# 兼容: Alpine/Debian/Ubuntu/RHEL/macOS
 # 更新: 2026-06-28
 #==================================================
 
@@ -16,9 +16,17 @@ set +e
 #==================================================
 export DNS_CHECK_DOMAINS="${DNS_CHECK_DOMAINS:-google.com cloudflare.com github.com}"
 export DNS_CHECK_SERVERS="${DNS_CHECK_SERVERS:-8.8.8.8 1.1.1.1 9.9.9.9}"
-export DNS_CHECK_IPV6="${DNS_CHECK_IPV6:-2001:4860:4860::8888 2606:4700:4700::1111}"
+export DNS_CHECK_IPV6_SERVERS="${DNS_CHECK_IPV6_SERVERS:-2001:4860:4860::8888 2606:4700:4700::1111 2620:fe::fe 2a01:4f8:c2c:123f::1}"
 export DNS_CHECK_DOH_SERVERS="${DNS_CHECK_DOH_SERVERS:-Cloudflare|https://cloudflare-dns.com/dns-query Google|https://dns.google/resolve Quad9|https://dns.quad9.net/dns-query}"
 export DNS_CHECK_DOT_SERVERS="${DNS_CHECK_DOT_SERVERS:-Cloudflare|1.1.1.1 Google|8.8.8.8 Quad9|9.9.9.9}"
+export DNS_CHECK_IPV6_DOMAINS="${DNS_CHECK_IPV6_DOMAINS:-google.com cloudflare.com facebook.com he.net ipv6.google.com ip6only.me}"
+
+# CDN网络范围（最后更新: 2026-06）
+GOOGLE_NETWORKS='^(142\.25[0-9]\.|142\.251\.|172\.217\.|216\.58\.|74\.125\.|173\.194\.)'
+CLOUDFLARE_NETWORKS='^(104\.(1[6-9]|2[0-9]|3[0-1])\.|172\.(6[4-9]|7[0-1])\.)'
+FASTLY_NETWORKS='^(151\.101\.|199\.232\.|146\.75\.)'
+AMAZON_CF_NETWORKS='^(13\.|52\.|54\.|205\.251\.)'
+AKAMAI_NETWORKS='^(23\.(0[0-9]|1[0-9]|2[0-3])\.|96\.(6[0-9]|7[0-9])\.|184\.(2[4-9]|3[0-1])\.|72\.2[0-9]\.)'
 
 #==================================================
 # 颜色支持检测
@@ -135,7 +143,6 @@ check_skip() {
     TOTAL=$((TOTAL + 1))
 }
 
-# 安全整数转换
 safe_int() {
     case "$1" in
         ''|*[!0-9]*) echo "0" ;;
@@ -228,10 +235,6 @@ grep_count() {
     fi
 }
 
-count_unique_lines() {
-    printf '%s' "$1" | awk '{for(i=1;i<=NF;i++) print $i}' | sort -u | wc -l | awk '{print $1}'
-}
-
 #==================================================
 # 安全的文件读取
 #==================================================
@@ -264,6 +267,18 @@ parse_server_list() {
 }
 
 #==================================================
+# PID存在检测（跨平台兼容）
+#==================================================
+pid_exists() {
+    pid="$1"
+    [ -z "$pid" ] && return 1
+    kill -0 "$pid" 2>/dev/null && return 0
+    [ -d "/proc/$pid" ] && return 0
+    ps -p "$pid" >/dev/null 2>&1 && return 0
+    return 1
+}
+
+#==================================================
 # SmartDNS进程检测
 #==================================================
 smartdns_running() {
@@ -290,7 +305,7 @@ get_resolv_target() {
 }
 
 #==================================================
-# 获取所有nameserver（用于IP过滤）
+# 获取所有nameserver
 #==================================================
 get_all_nameserver_ips() {
     if [ -f /etc/resolv.conf ]; then
@@ -299,10 +314,112 @@ get_all_nameserver_ips() {
 }
 
 #==================================================
+# IPv6可用性检测（修复grep -q .问题）
+#==================================================
+has_ipv6() {
+    # 方法1: 检查非回环IPv6接口
+    if ip -6 addr show 2>/dev/null | grep -v '::1' | grep -q 'inet6'; then
+        return 0
+    fi
+    if ip addr show 2>/dev/null | grep -q 'inet6'; then
+        return 0
+    fi
+    
+    # 方法2: 检查 /proc/net/if_inet6 (排除回环)
+    if [ -f /proc/net/if_inet6 ]; then
+        if grep -v '^00000000000000000000000000000001' /proc/net/if_inet6 2>/dev/null | head -1 | grep -q .; then
+            return 0
+        fi
+    fi
+    
+    # 方法3: 检查IPv6默认路由
+    if ip -6 route show 2>/dev/null | grep -q 'default'; then
+        return 0
+    fi
+    
+    # 方法4: 检查resolv.conf中的IPv6 nameserver
+    if grep -q '^nameserver.*:' /etc/resolv.conf 2>/dev/null; then
+        return 0
+    fi
+    
+    return 1
+}
+
+#==================================================
+# CDN网络识别函数（修复范围不完整）
+#==================================================
+is_same_cdn_provider() {
+    ip1="$1"; ip2="$2"
+    [ -z "$ip1" ] || [ -z "$ip2" ] && return 1
+    
+    # 检查已知CDN
+    if echo "$ip1" | grep -qE "$GOOGLE_NETWORKS" && echo "$ip2" | grep -qE "$GOOGLE_NETWORKS"; then
+        return 0
+    fi
+    if echo "$ip1" | grep -qE "$CLOUDFLARE_NETWORKS" && echo "$ip2" | grep -qE "$CLOUDFLARE_NETWORKS"; then
+        return 0
+    fi
+    if echo "$ip1" | grep -qE "$FASTLY_NETWORKS" && echo "$ip2" | grep -qE "$FASTLY_NETWORKS"; then
+        return 0
+    fi
+    
+    # 同/16子网
+    s1_16=$(echo "$ip1" | cut -d. -f1-2 2>/dev/null)
+    s2_16=$(echo "$ip2" | cut -d. -f1-2 2>/dev/null)
+    if [ -n "$s1_16" ] && [ -n "$s2_16" ] && [ "$s1_16" = "$s2_16" ]; then
+        return 0
+    fi
+    
+    # 同/24子网
+    s1_24=$(echo "$ip1" | cut -d. -f1-3 2>/dev/null)
+    s2_24=$(echo "$ip2" | cut -d. -f1-3 2>/dev/null)
+    if [ -n "$s1_24" ] && [ -n "$s2_24" ] && [ "$s1_24" = "$s2_24" ]; then
+        return 0
+    fi
+    
+    return 1
+}
+
+identify_cdn() {
+    ip="$1"
+    [ -z "$ip" ] && echo "unknown" && return
+    
+    if echo "$ip" | grep -qE "$GOOGLE_NETWORKS"; then echo "Google"
+    elif echo "$ip" | grep -qE "$CLOUDFLARE_NETWORKS"; then echo "Cloudflare"
+    elif echo "$ip" | grep -qE "$FASTLY_NETWORKS"; then echo "Fastly"
+    elif echo "$ip" | grep -qE "$AMAZON_CF_NETWORKS"; then echo "AWS"
+    elif echo "$ip" | grep -qE "$AKAMAI_NETWORKS"; then echo "Akamai"
+    else echo "unknown"
+    fi
+}
+
+#==================================================
+# HTTP状态码获取（修复busybox curl回退）
+#==================================================
+get_http_code() {
+    url="$1"; use_ipv6="${2:-}"
+    curl_opts="-s --max-time 5 -o /dev/null"
+    [ "$use_ipv6" = "6" ] && curl_opts="$curl_opts -6"
+    
+    # 标准curl
+    code=$(curl $curl_opts -w '%{http_code}' "$url" 2>/dev/null)
+    if [ -n "$code" ] && echo "$code" | grep -qE '^[0-9]+$'; then
+        echo "$code"
+        return
+    fi
+    
+    # busybox回退
+    if curl $curl_opts "$url" >/dev/null 2>&1; then
+        echo "200"
+    else
+        echo "000"
+    fi
+}
+
+#==================================================
 # DNS 解析核心函数
 #==================================================
 
-# 方法1: dig
 dns_dig() {
     domain="$1"; type="${2:-A}"; dns="${3:-}"
     cmd="dig +time=3 +tries=1 +short"
@@ -310,7 +427,6 @@ dns_dig() {
     run_with_timeout 5 $cmd -t "$type" "$domain" 2>/dev/null || echo ""
 }
 
-# 方法2: host（兼容Alpine busybox）
 dns_host() {
     domain="$1"; type="${2:-A}"; dns="${3:-}"
     
@@ -320,11 +436,9 @@ dns_host() {
         raw_output=$(run_with_timeout 5 host -t "$type" "$domain" 2>/dev/null)
     fi
     
-    # 兼容多种输出格式
     echo "$raw_output" | grep -E "has address|has IPv6 address|address" | awk '{print $NF}' | head -1
 }
 
-# 方法3: nslookup（修复：正确解析Address行，跳过DNS服务器行）
 dns_nslookup() {
     domain="$1"; type="${2:-A}"; dns="${3:-}"
     
@@ -334,12 +448,10 @@ dns_nslookup() {
         raw_output=$(run_with_timeout 5 nslookup -timeout=3 -type="$type" "$domain" 2>/dev/null)
     fi
     
-    # 使用awk状态机：Name: 之后才提取 Address:
-    echo "$raw_output" | awk -v dns="$dns" '
+    echo "$raw_output" | awk '
         /^Name:/ { in_section=1; next }
         in_section && /^Address:/ {
             ip = $NF
-            # 排除包含 # 的行（DNS服务器标记如 10.91.0.1#53）
             if (ip !~ /#/) {
                 print ip
                 exit
@@ -348,13 +460,11 @@ dns_nslookup() {
     '
 }
 
-# 方法4: getent
 dns_getent() {
     domain="$1"
     getent hosts "$domain" 2>/dev/null | awk '{print $1}' | head -1 || echo ""
 }
 
-# 方法5: curl DoH
 dns_doh() {
     domain="$1"; type="${2:-A}"; resolver="${3:-https://cloudflare-dns.com/dns-query}"
     type_num=1
@@ -366,16 +476,13 @@ dns_doh() {
     if [ -n "$response" ] && printf '%s' "$response" | grep -qE '"Status":[[:space:]]*0'; then
         flat_response=$(printf '%s' "$response" | tr -d '\n')
         
-        # 方法1: 从Answer数组提取
         ip=$(printf '%s' "$flat_response" | sed -n 's/.*"Answer":\[[^]]*"data":"\([^"]*\)".*/\1/p' | head -1)
-        # 方法2: 提取所有data字段的第一个
         [ -z "$ip" ] && ip=$(printf '%s' "$flat_response" | grep -o '"data":"[^"]*"' | head -1 | sed 's/"data":"//;s/"$//')
         
         echo "$ip"
     fi
 }
 
-# 智能解析
 smart_resolve() {
     domain="$1"; type="${2:-A}"; dns="${3:-}"; method="${4:-auto}"
     
@@ -401,49 +508,14 @@ smart_resolve() {
     esac
 }
 
-# 提取IPv4地址（修复：过滤所有nameserver地址）
-extract_ipv4() {
-    result="$1"; dns_server="${2:-}"
-    
-    all_ips=$(printf '%s' "$result" | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}')
-    
-    # 构建过滤列表
-    filter_list="^127\.0\.0\.1$|^0\.0\.0\.0$|^255\.255\.255\.255$"
-    [ -n "$dns_server" ] && filter_list="${filter_list}|^${dns_server}$"
-    
-    # 从resolv.conf获取所有nameserver IPv4并加入过滤
-    get_all_nameserver_ips | while IFS= read -r ns; do
-        [ -z "$ns" ] && continue
-        case "$ns" in
-            *:*) continue ;;   # 跳过IPv6
-            127.*) continue ;;
-            *)
-                escaped_ns=$(echo "$ns" | sed 's/\./\\./g')
-                filter_list="${filter_list}|^${escaped_ns}$"
-                ;;
-        esac
-    done
-    
-    # 实际的过滤需要在主进程中完成
-    # 使用临时文件传递过滤列表
-    printf '%s' "$filter_list" > "${TMPFILE}.filter.$$"
-    
-    echo "$all_ips" | grep -vE -f "${TMPFILE}.filter.$$" 2>/dev/null | head -1
-    
-    rm -f "${TMPFILE}.filter.$$" 2>/dev/null
-}
-
-# 修复后的 extract_ipv4（不使用子shell）
 extract_ipv4_fixed() {
     result="$1"; dns_server="${2:-}"
     
     all_ips=$(printf '%s' "$result" | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}')
     
-    # 构建过滤表达式
     filter="127\.0\.0\.1|0\.0\.0\.0|255\.255\.255\.255"
     [ -n "$dns_server" ] && filter="${filter}|$(echo "$dns_server" | sed 's/\./\\./g')"
     
-    # 添加所有resolv.conf中的nameserver
     for ns in $(get_all_nameserver_ips); do
         case "$ns" in
             *:*|127.*) continue ;;
@@ -454,21 +526,19 @@ extract_ipv4_fixed() {
     echo "$all_ips" | grep -vE "^(${filter})$" | head -1
 }
 
-# 提取IPv6地址（修复：过滤端口号和短字符串）
+# 提取IPv6地址（修复宽松正则和MAC地址误匹配）
 extract_ipv6() {
     result="$1"
     
-    # 第一步：提取可能的IPv6候选
-    candidates=$(printf '%s' "$result" | grep -Eo '([0-9a-fA-F]{1,4}:){2,7}[0-9a-fA-F]{1,4}' 2>/dev/null)
-    
-    # 第二步：也匹配简写格式
-    [ -z "$candidates" ] && candidates=$(printf '%s' "$result" | grep -Eo '([0-9a-fA-F:]+:+[0-9a-fA-F:]+)' 2>/dev/null)
+    # 严格正则：至少4段，最多8段
+    candidates=$(printf '%s' "$result" | grep -Eo '([0-9a-fA-F]{1,4}:){3,7}[0-9a-fA-F]{1,4}' 2>/dev/null)
+    # 也匹配 :: 简写格式
+    [ -z "$candidates" ] && candidates=$(printf '%s' "$result" | grep -Eo '([0-9a-fA-F]{0,4}:){2,6}[0-9a-fA-F]{0,4}' 2>/dev/null)
     
     printf '%s' "$candidates" | while IFS= read -r candidate; do
         [ -z "$candidate" ] && continue
-        
-        # 过滤长度过短的（可能是端口号如 1:53）
-        [ "${#candidate}" -lt 4 ] && continue
+        # 最短IPv6如 ::1 约3字符，设为7更安全（排除1:53等端口号）
+        [ "${#candidate}" -lt 7 ] && continue
         
         case "$candidate" in
             ::1|::)        continue ;;
@@ -484,24 +554,102 @@ extract_ipv6() {
     done | head -1
 }
 
-# 统一提取IP
-extract_ip() {
-    result="$1"; type="${2:-A}"; dns_server="${3:-}"
-    
-    if [ "$type" = "AAAA" ]; then
-        extract_ipv6 "$result"
+#==================================================
+# 依赖安装增强版
+#==================================================
+detect_package_manager() {
+    if [ -f /etc/alpine-release ]; then
+        echo "apk"
+    elif [ -f /etc/debian_version ]; then
+        echo "apt"
+    elif [ -f /etc/redhat-release ]; then
+        echo "yum"
+    elif [ -f /etc/fedora-release ]; then
+        echo "dnf"
+    elif [ -f /etc/arch-release ]; then
+        echo "pacman"
+    elif command -v brew >/dev/null 2>&1; then
+        echo "brew"
+    elif command -v pkg >/dev/null 2>&1; then
+        echo "pkg"  # FreeBSD
     else
-        extract_ipv4_fixed "$result" "$dns_server"
+        echo "unknown"
     fi
 }
 
-#==================================================
-# 自动安装依赖函数
-#==================================================
+get_install_command() {
+    pkg_manager="$1"
+    case "$pkg_manager" in
+        apk)
+            echo "apk add bind-tools curl netcat-openbsd iputils"
+            ;;
+        apt)
+            echo "apt-get update -qq && apt-get install -y dnsutils curl netcat-openbsd iputils-ping"
+            ;;
+        yum)
+            echo "yum install -y bind-utils curl nmap-ncat iputils"
+            ;;
+        dnf)
+            echo "dnf install -y bind-utils curl nmap-ncat iputils"
+            ;;
+        pacman)
+            echo "pacman -Sy --noconfirm bind curl openbsd-netcat iputils"
+            ;;
+        brew)
+            echo "brew install bind curl netcat"
+            ;;
+        pkg)
+            echo "pkg install -y bind-tools curl netcat"
+            ;;
+        *)
+            echo ""
+            ;;
+    esac
+}
+
+get_package_descriptions() {
+    pkg_manager="$1"
+    case "$pkg_manager" in
+        apk)
+            echo "bind-tools    提供: dig, host, nslookup"
+            echo "curl          提供: curl (DoH检测)"
+            echo "netcat-openbsd提供: nc (端口检测)"
+            echo "iputils       提供: ping (连通性检测)"
+            ;;
+        apt)
+            echo "dnsutils      提供: dig, host, nslookup"
+            echo "curl          提供: curl (DoH检测)"
+            echo "netcat-openbsd提供: nc (端口检测)"
+            echo "iputils-ping  提供: ping (连通性检测)"
+            ;;
+        yum|dnf)
+            echo "bind-utils    提供: dig, host, nslookup"
+            echo "curl          提供: curl"
+            echo "nmap-ncat     提供: nc"
+            echo "iputils       提供: ping"
+            ;;
+        pacman)
+            echo "bind          提供: dig, host, nslookup"
+            echo "curl          提供: curl"
+            echo "openbsd-netcat提供: nc"
+            echo "iputils       提供: ping"
+            ;;
+        brew)
+            echo "bind          提供: dig, host, nslookup"
+            echo "curl          提供: curl"
+            echo "netcat        提供: nc"
+            ;;
+        pkg)
+            echo "bind-tools    提供: dig, host, nslookup"
+            echo "curl          提供: curl"
+            echo "netcat        提供: nc"
+            ;;
+    esac
+}
+
 auto_install_dependencies() {
     MISSING=""
     
-    # 检查缺失的工具
     for tool in dig host nslookup getent curl nc ping awk sed; do
         if ! command -v "$tool" >/dev/null 2>&1; then
             MISSING="$MISSING $tool"
@@ -513,50 +661,40 @@ auto_install_dependencies() {
     echo ""
     echo -e "  ${ICON_WARN} 缺少工具:${MISSING}"
     
-    # 如果没有自动安装权限，仅提示
+    PKG_MANAGER=$(detect_package_manager)
+    INSTALL_CMD=$(get_install_command "$PKG_MANAGER")
+    
     if [ "$AUTO_INSTALL" != "1" ]; then
         echo ""
-        echo -e "  ${BOLD}自动安装缺失依赖:${NC}"
+        echo -e "  ${BOLD}安装缺失依赖:${NC}"
         echo ""
         
-        if [ -f /etc/alpine-release ]; then
-            echo -e "  ${CYAN}Alpine Linux 安装命令:${NC}"
-            echo -e "    ${BOLD}apk add bind-tools curl netcat-openbsd iputils${NC}"
+        case "$PKG_MANAGER" in
+            apk)     echo -e "  ${CYAN}Alpine Linux:${NC}" ;;
+            apt)     echo -e "  ${CYAN}Debian/Ubuntu:${NC}" ;;
+            yum)     echo -e "  ${CYAN}RHEL/CentOS:${NC}" ;;
+            dnf)     echo -e "  ${CYAN}Fedora:${NC}" ;;
+            pacman)  echo -e "  ${CYAN}Arch Linux:${NC}" ;;
+            brew)    echo -e "  ${CYAN}macOS Homebrew:${NC}" ;;
+            pkg)     echo -e "  ${CYAN}FreeBSD:${NC}" ;;
+            *)
+                echo -e "  ${YELLOW}未识别系统${NC}"
+                echo -e "  ${DIM}请手动安装: dig/nslookup curl nc ping${NC}"
+                echo ""
+                return 1
+                ;;
+        esac
+        
+        if [ -n "$INSTALL_CMD" ]; then
+            echo -e "    ${BOLD}${INSTALL_CMD}${NC}"
             echo ""
-            echo -e "  ${DIM}bind-tools 提供: dig, host, nslookup${NC}"
-            echo -e "  ${DIM}curl        提供: curl (用于DoH检测)${NC}"
-            echo -e "  ${DIM}netcat      提供: nc (用于端口检测)${NC}"
-            echo -e "  ${DIM}iputils     提供: ping (用于连通性检测)${NC}"
-        elif [ -f /etc/debian_version ]; then
-            echo -e "  ${CYAN}Debian/Ubuntu 安装命令:${NC}"
-            echo -e "    ${BOLD}apt-get update && apt-get install -y dnsutils curl netcat-openbsd iputils-ping${NC}"
-            echo ""
-            echo -e "  ${DIM}dnsutils    提供: dig, host, nslookup${NC}"
-            echo -e "  ${DIM}curl        提供: curl (用于DoH检测)${NC}"
-            echo -e "  ${DIM}netcat      提供: nc (用于端口检测)${NC}"
-            echo -e "  ${DIM}iputils-ping提供: ping (用于连通性检测)${NC}"
-        elif [ -f /etc/redhat-release ]; then
-            echo -e "  ${CYAN}RHEL/CentOS/Fedora 安装命令:${NC}"
-            echo -e "    ${BOLD}yum install -y bind-utils curl nmap-ncat iputils${NC}"
-            echo ""
-            echo -e "  ${DIM}bind-utils  提供: dig, host, nslookup${NC}"
-            echo -e "  ${DIM}curl        提供: curl${NC}"
-            echo -e "  ${DIM}nmap-ncat   提供: nc${NC}"
-            echo -e "  ${DIM}iputils     提供: ping${NC}"
-        elif command -v brew >/dev/null 2>&1; then
-            echo -e "  ${CYAN}macOS Homebrew 安装命令:${NC}"
-            echo -e "    ${BOLD}brew install bind curl netcat${NC}"
-        else
-            echo -e "  ${YELLOW}未识别的系统，请手动安装以下工具:${NC}"
-            echo -e "  ${DIM}dig, host, nslookup - DNS查询工具${NC}"
-            echo -e "  ${DIM}curl - HTTP客户端${NC}"
-            echo -e "  ${DIM}nc - 网络连接工具${NC}"
-            echo -e "  ${DIM}ping - 网络连通性工具${NC}"
+            get_package_descriptions "$PKG_MANAGER" | while IFS= read -r desc; do
+                echo -e "    ${DIM}$desc${NC}"
+            done
         fi
         
         echo ""
-        echo -e "  ${ICON_INFO} 提示: 设置环境变量 ${CYAN}AUTO_INSTALL=1${NC} 可自动安装"
-        echo -e "  ${ICON_INFO} 示例: ${CYAN}AUTO_INSTALL=1 $0${NC}"
+        echo -e "  ${ICON_INFO} 提示: ${CYAN}AUTO_INSTALL=1 $0${NC} 或 ${CYAN}$0 --install${NC} 自动安装"
         echo ""
         return 1
     fi
@@ -566,73 +704,22 @@ auto_install_dependencies() {
     echo -e "  ${BOLD}正在自动安装缺失依赖...${NC}"
     echo ""
     
-    if [ -f /etc/alpine-release ]; then
-        echo -e "  ${DIM}检测到 Alpine Linux${NC}"
-        
-        # 检查是否有root权限
-        if [ "$(id -u 2>/dev/null || echo 1)" -ne 0 ]; then
-            echo -e "  ${ICON_FAIL} 需要 root 权限安装依赖"
-            echo -e "  ${ICON_INFO} 请使用: ${CYAN}sudo $0${NC}"
-            return 1
-        fi
-        
-        echo -e "  ${DIM}运行: apk add bind-tools curl netcat-openbsd iputils${NC}"
-        if apk add bind-tools curl netcat-openbsd iputils 2>/dev/null; then
-            echo -e "  ${ICON_OK} 依赖安装成功"
-        else
-            echo -e "  ${ICON_FAIL} 安装失败，请手动安装"
-            return 1
-        fi
-        
-    elif [ -f /etc/debian_version ]; then
-        echo -e "  ${DIM}检测到 Debian/Ubuntu${NC}"
-        
-        if [ "$(id -u 2>/dev/null || echo 1)" -ne 0 ]; then
-            echo -e "  ${ICON_FAIL} 需要 root 权限安装依赖"
-            echo -e "  ${ICON_INFO} 请使用: ${CYAN}sudo $0${NC}"
-            return 1
-        fi
-        
-        echo -e "  ${DIM}运行: apt-get update${NC}"
-        apt-get update -qq 2>/dev/null
-        
-        echo -e "  ${DIM}运行: apt-get install -y dnsutils curl netcat-openbsd iputils-ping${NC}"
-        if apt-get install -y dnsutils curl netcat-openbsd iputils-ping 2>/dev/null; then
-            echo -e "  ${ICON_OK} 依赖安装成功"
-        else
-            echo -e "  ${ICON_FAIL} 安装失败，请手动安装"
-            return 1
-        fi
-        
-    elif [ -f /etc/redhat-release ]; then
-        echo -e "  ${DIM}检测到 RHEL/CentOS/Fedora${NC}"
-        
-        if [ "$(id -u 2>/dev/null || echo 1)" -ne 0 ]; then
-            echo -e "  ${ICON_FAIL} 需要 root 权限安装依赖"
-            echo -e "  ${ICON_INFO} 请使用: ${CYAN}sudo $0${NC}"
-            return 1
-        fi
-        
-        echo -e "  ${DIM}运行: yum install -y bind-utils curl nmap-ncat iputils${NC}"
-        if yum install -y bind-utils curl nmap-ncat iputils 2>/dev/null; then
-            echo -e "  ${ICON_OK} 依赖安装成功"
-        else
-            echo -e "  ${ICON_FAIL} 安装失败，请手动安装"
-            return 1
-        fi
-        
-    elif command -v brew >/dev/null 2>&1; then
-        echo -e "  ${DIM}检测到 macOS + Homebrew${NC}"
-        echo -e "  ${DIM}运行: brew install bind curl netcat${NC}"
-        if brew install bind curl netcat 2>/dev/null; then
-            echo -e "  ${ICON_OK} 依赖安装成功"
-        else
-            echo -e "  ${ICON_FAIL} 安装失败，请手动安装"
-            return 1
-        fi
-        
+    if [ "$(id -u 2>/dev/null || echo 1)" -ne 0 ]; then
+        echo -e "  ${ICON_FAIL} 需要 root 权限"
+        echo -e "  ${ICON_INFO} 请使用: ${CYAN}sudo $0 --install${NC}"
+        return 1
+    fi
+    
+    if [ -z "$INSTALL_CMD" ]; then
+        echo -e "  ${ICON_FAIL} 无法识别包管理器"
+        return 1
+    fi
+    
+    echo -e "  ${DIM}运行: $INSTALL_CMD${NC}"
+    if eval "$INSTALL_CMD" 2>/dev/null; then
+        echo -e "  ${ICON_OK} 依赖安装成功"
     else
-        echo -e "  ${ICON_FAIL} 未识别的系统，无法自动安装"
+        echo -e "  ${ICON_FAIL} 安装失败，请手动安装"
         return 1
     fi
     
@@ -640,9 +727,6 @@ auto_install_dependencies() {
     return 0
 }
 
-#==================================================
-# 环境依赖检查
-#==================================================
 check_dependencies() {
     MISSING_TOOLS=""
     
@@ -656,10 +740,8 @@ check_dependencies() {
         echo ""
         echo -e "  ${ICON_WARN} 缺少工具:${MISSING_TOOLS}"
         
-        # 核心工具缺失提示
         if ! command -v dig >/dev/null 2>&1 && ! command -v host >/dev/null 2>&1 && ! command -v nslookup >/dev/null 2>&1; then
             echo -e "  ${ICON_FAIL} 无DNS查询工具可用！"
-            echo -e "  ${ICON_INFO} 安装后可使用完整检测功能"
         elif ! command -v dig >/dev/null 2>&1; then
             echo -e "  ${ICON_WARN} 缺少 dig，部分高级功能不可用"
         fi
@@ -703,14 +785,22 @@ check_system_environment() {
         OS=$(grep "^PRETTY_NAME=" /etc/os-release | cut -d'"' -f2)
     elif [ -f /etc/redhat-release ]; then
         OS=$(cat /etc/redhat-release 2>/dev/null)
+    elif [ -f /etc/arch-release ]; then
+        OS="Arch Linux"
     elif command -v sw_vers >/dev/null 2>&1; then
         OS="macOS $(sw_vers -productVersion 2>/dev/null)"
+    elif [ "$(uname -s 2>/dev/null)" = "FreeBSD" ]; then
+        OS="FreeBSD $(uname -r)"
     else
         OS="Unknown"
     fi
     check_info "发行版" "$OS"
     check_info "内核" "$(uname -r)"
     check_info "架构" "$(uname -m)"
+    
+    # 包管理器
+    PKG_MANAGER=$(detect_package_manager)
+    [ "$PKG_MANAGER" != "unknown" ] && check_info "包管理器" "$PKG_MANAGER"
 
     print_sub "虚拟化环境"
     if grep -q "container=lxc" /proc/1/environ 2>/dev/null; then
@@ -731,6 +821,18 @@ check_system_environment() {
     else
         INIT="unknown"
         check_warn "未知 Init 系统"
+    fi
+    
+    print_sub "IPv6 状态"
+    if has_ipv6; then
+        check_pass "IPv6 已启用"
+        if ip -6 addr show 2>/dev/null | grep -v '::1' | grep -q 'inet6'; then
+            ip -6 addr show 2>/dev/null | grep 'inet6' | grep -v '::1' | while read -r line; do
+                print_detail "$line"
+            done
+        fi
+    else
+        check_warn "IPv6 未启用或不可用" "部分检测将跳过"
     fi
     
     check_dependencies
@@ -853,7 +955,9 @@ check_resolution_methods() {
                 
                 ip=$(extract_ipv4_fixed "$result" "$DNS_TARGET")
                 if [ -n "$ip" ] && [ "$ip" != "127.0.0.1" ]; then
-                    check_pass "$method (${elapsed}ms) → $ip"
+                    cdn=$(identify_cdn "$ip")
+                    [ "$cdn" != "unknown" ] && cdn_info=" ${DIM}($cdn)${NC}" || cdn_info=""
+                    check_pass "$method (${elapsed}ms) → $ip$cdn_info"
                 else
                     check_fail "$method (${elapsed}ms) → 解析失败"
                 fi
@@ -897,7 +1001,7 @@ check_geo_resolution() {
     done
     
     print_sub "亚太区域"
-    for domain in japan-post.jp niconico.jp rakuten.co.jp; do
+    for domain in rakuten.co.jp fastly.com cloudflare.com; do
         result=$(smart_resolve "$domain" "A" "$DNS_TARGET")
         ip=$(extract_ipv4_fixed "$result" "$DNS_TARGET")
         [ -n "$ip" ] && check_pass "$domain → $ip" || check_warn "$domain 解析失败"
@@ -925,11 +1029,25 @@ check_record_types() {
     done
     
     print_sub "AAAA 记录 (IPv6)"
-    for domain in google.com cloudflare.com ipv6.google.com; do
-        result=$(smart_resolve "$domain" "AAAA" "$DNS_TARGET")
+    ipv6_available=0
+    for domain in $DNS_CHECK_IPV6_DOMAINS; do
+        result=$(smart_resolve "$domain" "AAAA" "$DNS_TARGET" 2>/dev/null)
         ip=$(extract_ipv6 "$result")
-        [ -n "$ip" ] && check_pass "$domain → $ip" || check_warn "$domain 无AAAA记录"
+        if [ -n "$ip" ] && [ ${#ip} -gt 6 ]; then
+            ipv6_available=$((ipv6_available + 1))
+            check_pass "$domain → $ip"
+        else
+            check_warn "$domain 无AAAA记录"
+        fi
     done
+    
+    if [ "$ipv6_available" -eq 0 ]; then
+        check_warn "IPv6 DNS解析不可用" "检查IPv6网络配置或安装 bind-tools"
+    elif [ "$ipv6_available" -lt 3 ]; then
+        check_warn "IPv6 DNS解析部分可用 (${ipv6_available}/6个域名)"
+    else
+        check_info "IPv6解析" "${ipv6_available}/6个域名成功"
+    fi
     
     print_sub "CNAME 记录 (别名)"
     if command -v dig >/dev/null 2>&1; then
@@ -961,10 +1079,115 @@ check_record_types() {
 }
 
 #==================================================
-# 第6部分: 协议和端口检测
+# 第6部分: IPv6 全面检测
+#==================================================
+check_ipv6_comprehensive() {
+    print_section "第6部分: IPv6 全面检测"
+    
+    if ! has_ipv6; then
+        check_skip "IPv6 不可用，跳过所有IPv6检测"
+        return
+    fi
+    
+    # === 第1层: 接口和路由 ===
+    print_sub "IPv6 接口状态"
+    
+    IPV6_GATEWAY=""
+    if command -v ip >/dev/null 2>&1; then
+        IPV6_GATEWAY=$(ip -6 route show default 2>/dev/null | awk '{print $3}' | head -1)
+    elif command -v route >/dev/null 2>&1; then
+        IPV6_GATEWAY=$(route -6 -n 2>/dev/null | grep 'UG' | awk '{print $2}' | head -1)
+    fi
+    
+    if [ -n "$IPV6_GATEWAY" ]; then
+        check_info "IPv6 网关" "$IPV6_GATEWAY"
+        if ping -6 -c 1 -W 2 "$IPV6_GATEWAY" >/dev/null 2>&1; then
+            check_pass "IPv6 网关可达"
+        else
+            check_fail "IPv6 网关不可达" "检查IPv6路由配置"
+        fi
+    else
+        check_info "IPv6 网关" "无默认路由"
+        # 容器环境可能无默认路由，尝试直连IPv6 DNS
+        if ping -6 -c 1 -W 2 2001:4860:4860::8888 >/dev/null 2>&1; then
+            check_pass "IPv6 外部可达 (Google DNS直连)"
+        fi
+    fi
+    
+    # === 第2层: IPv6 DNS服务器连通性 ===
+    print_sub "IPv6 DNS 服务器连通性"
+    ipv6_dns_reachable=0
+    
+    for dns6 in $DNS_CHECK_IPV6_SERVERS; do
+        if ping -6 -c 1 -W 2 "$dns6" >/dev/null 2>&1; then
+            ipv6_dns_reachable=$((ipv6_dns_reachable + 1))
+            check_pass "$dns6 可达"
+            
+            # 使用该DNS进行实际解析测试
+            if command -v nslookup >/dev/null 2>&1; then
+                result=$(nslookup -type=AAAA google.com "$dns6" 2>/dev/null)
+                ipv6=$(echo "$result" | awk '/^Address:/ && !/#/ {print $2}' | grep -E ':' | head -1)
+                if [ -n "$ipv6" ]; then
+                    check_pass "  → 解析google.com AAAA: $ipv6"
+                else
+                    check_warn "  → 解析失败"
+                fi
+            elif command -v dig >/dev/null 2>&1; then
+                result=$(dig +short AAAA google.com @"$dns6" 2>/dev/null | head -1)
+                if [ -n "$result" ]; then
+                    check_pass "  → 解析google.com AAAA: $result"
+                else
+                    check_warn "  → 解析失败"
+                fi
+            fi
+        else
+            check_warn "$dns6 不可达"
+        fi
+    done
+    
+    [ "$ipv6_dns_reachable" -eq 0 ] && check_warn "所有IPv6 DNS服务器不可达" "IPv6可能无上游连接"
+    
+    # === 第3层: IPv6 HTTP访问测试 ===
+    print_sub "IPv6 HTTP 访问测试"
+    if command -v curl >/dev/null 2>&1; then
+        ipv6_http_ok=0
+        for url in "https://ipv6.google.com" "https://cloudflare.com" "https://test-ipv6.com"; do
+            http_code=$(get_http_code "$url" "6")
+            if echo "$http_code" | grep -q '^[23]'; then
+                ipv6_http_ok=$((ipv6_http_ok + 1))
+                check_pass "$url → HTTP $http_code (IPv6)"
+            else
+                check_warn "$url → IPv6 HTTP 不可达 (HTTP $http_code)"
+            fi
+        done
+        [ "$ipv6_http_ok" -eq 0 ] && check_warn "所有IPv6 HTTP测试失败" "IPv6端到端连接可能有问题"
+    else
+        check_skip "curl 未安装，跳过IPv6 HTTP测试"
+    fi
+    
+    # === 第4层: IPv4/IPv6双栈对比 ===
+    print_sub "IPv4/IPv6 双栈对比"
+    for domain in google.com cloudflare.com he.net; do
+        ipv4=$(smart_resolve "$domain" "A" "" 2>/dev/null | head -1)
+        ipv6=$(smart_resolve "$domain" "AAAA" "" 2>/dev/null | head -1)
+        
+        if [ -n "$ipv4" ] && [ -n "$ipv6" ]; then
+            check_pass "$domain → IPv4:$ipv4 IPv6:$ipv6 (双栈)"
+        elif [ -n "$ipv4" ]; then
+            check_warn "$domain → 仅IPv4:$ipv4 (无AAAA)"
+        elif [ -n "$ipv6" ]; then
+            check_warn "$domain → 仅IPv6:$ipv6 (无A记录)"
+        else
+            check_fail "$domain → 解析失败"
+        fi
+    done
+}
+
+#==================================================
+# 第7部分: 协议和端口检测
 #==================================================
 check_protocols() {
-    print_section "第6部分: 协议和端口检测"
+    print_section "第7部分: 协议和端口检测"
     
     print_sub "UDP:53 (标准DNS)"
     for dns in ${DNS_TARGET:-$DNS_CHECK_SERVERS}; do
@@ -1033,10 +1256,10 @@ check_protocols() {
 }
 
 #==================================================
-# 第7部分: 性能基准测试
+# 第8部分: 性能基准测试
 #==================================================
 check_performance() {
-    print_section "第7部分: 性能基准测试"
+    print_section "第8部分: 性能基准测试"
     
     test_domain="cloudflare.com"
     iterations=5
@@ -1100,7 +1323,7 @@ check_performance() {
     fi
     
     print_sub "并发解析能力"
-    if command -v dig >/dev/null 2>&1; then
+    if command -v dig >/dev/null 2>&1 || command -v nslookup >/dev/null 2>&1; then
         domains="google.com cloudflare.com github.com wikipedia.org redhat.com"
         pids=""
         pid_count=0
@@ -1109,7 +1332,7 @@ check_performance() {
         for domain in $domains; do
             smart_resolve "$domain" "A" "$DNS_TARGET" >/dev/null 2>&1 &
             new_pid=$!
-            if [ -n "$new_pid" ] && kill -0 "$new_pid" 2>/dev/null; then
+            if pid_exists "$new_pid"; then
                 pids="$pids $new_pid"
                 pid_count=$((pid_count + 1))
             fi
@@ -1118,10 +1341,7 @@ check_performance() {
         failed_pids=0
         for pid in $pids; do
             wait "$pid" 2>/dev/null
-            wait_exit=$?
-            if [ "$wait_exit" -ne 0 ]; then
-                failed_pids=$((failed_pids + 1))
-            fi
+            [ $? -ne 0 ] && failed_pids=$((failed_pids + 1))
         done
         
         concurrent_time=$(timer_end "$timer_id")
@@ -1129,15 +1349,15 @@ check_performance() {
         check_info "并发解析" "${pid_count}个域名, 总计${concurrent_time}ms, 平均${per_domain}ms/个"
         [ "$failed_pids" -gt 0 ] && check_warn "$failed_pids 个查询失败"
     else
-        check_skip "并发测试需要 dig 工具"
+        check_skip "并发测试需要 dig 或 nslookup"
     fi
 }
 
 #==================================================
-# 第8部分: 安全检测（修复CDN误报）
+# 第9部分: 安全检测
 #==================================================
 check_security() {
-    print_section "第8部分: 安全检测"
+    print_section "第9部分: 安全检测"
     
     print_sub "DNSSEC 支持"
     if command -v dig >/dev/null 2>&1; then
@@ -1154,7 +1374,7 @@ check_security() {
         check_skip "需要 dig 工具"
     fi
     
-    print_sub "解析一致性"
+    print_sub "解析一致性 (CDN智能识别)"
     test_domain="google.com"
     consistency_file="${TMPFILE}.consistency.$$"
     : > "$consistency_file"
@@ -1176,20 +1396,27 @@ check_security() {
         
         if [ "$unique_ips" -eq 1 ]; then
             check_pass "多源解析一致 ($sources个源)"
-        elif [ "$unique_ips" -eq 2 ]; then
-            # 检查是否同一/24子网（CDN正常行为）
-            ip1=$(awk -F': ' 'NR==1{print $2}' "$consistency_file")
-            ip2=$(awk -F': ' 'NR==2{print $2}' "$consistency_file")
-            subnet1=$(echo "$ip1" | cut -d. -f1-3)
-            subnet2=$(echo "$ip2" | cut -d. -f1-3)
-            
-            if [ "$subnet1" = "$subnet2" ]; then
-                check_pass "解析一致 (CDN同网段: ${subnet1}.x)"
-            else
-                check_warn "多源结果不同 (不同网段)" "CDN调度或DNS差异"
-            fi
         else
-            check_warn "多源结果分散 (${unique_ips}个不同IP)" "CDN多节点或DNS异常"
+            all_same_cdn=1
+            first_ip=""
+            while IFS= read -r line; do
+                ip=$(echo "$line" | awk -F': ' '{print $2}')
+                if [ -z "$first_ip" ]; then
+                    first_ip="$ip"
+                else
+                    is_same_cdn_provider "$first_ip" "$ip" || all_same_cdn=0
+                fi
+            done < "$consistency_file"
+            
+            cdn_name=$(identify_cdn "$first_ip")
+            
+            if [ "$all_same_cdn" -eq 1 ] && [ "$cdn_name" != "unknown" ]; then
+                check_pass "解析一致 (${cdn_name} CDN多节点, ${unique_ips}个IP)"
+            elif [ "$all_same_cdn" -eq 1 ]; then
+                check_pass "解析一致 (同源, ${unique_ips}个IP)"
+            else
+                check_warn "多源解析不一致" "不同CDN或DNS差异"
+            fi
         fi
         
         if [ "${QUIET:-0}" -eq 0 ] && [ "$unique_ips" -gt 1 ]; then
@@ -1205,34 +1432,51 @@ check_security() {
     
     rm -f "$consistency_file" 2>/dev/null
     
-    print_sub "DNS污染检测"
-    test_domain="www.youtube.com"
-    pollute_sources=0
-    pollute_ips=""
+    # 增强污染检测
+    print_sub "DNS污染检测 (多域名Google网络验证)"
     
-    for resolver in ${DNS_TARGET:-""} $DNS_CHECK_SERVERS; do
-        [ -z "$resolver" ] && continue
-        result=$(smart_resolve "$test_domain" "A" "$resolver" 2>/dev/null)
-        ip=$(extract_ipv4_fixed "$result" "$resolver")
+    pollution_domains="www.youtube.com:Google twitter.com:Twitter facebook.com:Meta"
+    polluted=0
+    
+    echo "$pollution_domains" | while IFS=':' read -r domain provider; do
+        [ -z "$domain" ] && continue
         
-        if [ -n "$ip" ]; then
-            pollute_sources=$((pollute_sources + 1))
-            pollute_ips="$pollute_ips $ip"
-        fi
+        system_ip=$(smart_resolve "$domain" "A" "" 2>/dev/null)
+        system_ip=$(extract_ipv4_fixed "$system_ip")
+        ref_ip=$(smart_resolve "$domain" "A" "8.8.8.8" 2>/dev/null)
+        ref_ip=$(extract_ipv4_fixed "$ref_ip" "8.8.8.8")
+        
+        case "$provider" in
+            Google)
+                if [ -z "$system_ip" ]; then
+                    check_fail "$domain 无法解析" "DNS可能被完全阻断"
+                elif echo "$system_ip" | grep -qE "$GOOGLE_NETWORKS"; then
+                    check_pass "$domain → $system_ip (Google网络)"
+                elif [ -n "$ref_ip" ] && echo "$ref_ip" | grep -qE "$GOOGLE_NETWORKS"; then
+                    check_fail "$domain 被污染!" "系统:$system_ip, 正常:$ref_ip"
+                else
+                    check_warn "$domain IP异常 ($system_ip)" "可能CDN调度"
+                fi
+                ;;
+            Twitter)
+                if [ -n "$system_ip" ]; then
+                    check_pass "$domain → $system_ip"
+                else
+                    check_warn "$domain 解析失败" "可能被限制"
+                fi
+                ;;
+            Meta)
+                if [ -n "$system_ip" ]; then
+                    check_pass "$domain → $system_ip"
+                else
+                    check_warn "$domain 解析失败" "可能被限制"
+                fi
+                ;;
+            *)
+                [ -n "$system_ip" ] && check_pass "$domain → $system_ip" || check_warn "$domain 解析失败"
+                ;;
+        esac
     done
-    
-    if [ "$pollute_sources" -ge 2 ]; then
-        unique_pollute=$(count_unique_lines "$pollute_ips")
-        if [ "$unique_pollute" -eq 1 ]; then
-            check_pass "解析一致，未检测到污染"
-        elif [ "$unique_pollute" -ge 3 ]; then
-            check_warn "解析高度不一致" "可能存在DNS污染"
-        else
-            check_warn "解析部分不一致" "CDN调度或轻微污染"
-        fi
-    else
-        check_warn "无法进行污染检测" "解析源不足"
-    fi
 }
 
 #==================================================
@@ -1244,6 +1488,13 @@ print_final_report() {
     echo ""
     echo -e "  检测模式: ${BOLD}$([ "$CHECK_MODE" = "smartdns" ] && echo "SmartDNS" || echo "系统DNS")${NC}"
     [ -n "$DNS_TARGET" ] && echo -e "  目标DNS: ${CYAN}$DNS_TARGET${NC}"
+    
+    if has_ipv6; then
+        echo -e "  IPv6状态: ${GREEN}已启用${NC}"
+    else
+        echo -e "  IPv6状态: ${DIM}未启用${NC}"
+    fi
+    
     echo -e "  ${GREEN}通过: $PASS${NC}"
     echo -e "  ${YELLOW}警告: $WARN${NC}"
     echo -e "  ${RED}失败: $FAIL${NC}"
@@ -1273,10 +1524,13 @@ print_final_report() {
     echo -e "检测完成: $(date '+%Y-%m-%d %H:%M:%S')"
     echo ""
     
-    # 如果跳过多且有自动安装提示
     if [ "$SKIP" -gt 5 ] && [ "$AUTO_INSTALL" != "1" ]; then
         echo -e "  ${ICON_INFO} 提示: ${BOLD}$SKIP 项检测因缺少工具被跳过${NC}"
-        echo -e "  ${ICON_INFO} 使用 ${CYAN}AUTO_INSTALL=1 $0${NC} 可自动安装依赖"
+        INSTALL_CMD=$(get_install_command "$(detect_package_manager)")
+        if [ -n "$INSTALL_CMD" ]; then
+            echo -e "  ${ICON_INFO} 安装命令: ${CYAN}$INSTALL_CMD${NC}"
+        fi
+        echo -e "  ${ICON_INFO} 或使用: ${CYAN}$0 --install${NC}"
         echo ""
     fi
 }
@@ -1305,11 +1559,17 @@ main() {
                 echo "  AUTO_INSTALL=1           自动安装缺失依赖"
                 echo "  DNS_CHECK_DOMAINS        测试域名列表"
                 echo "  DNS_CHECK_SERVERS        IPv4 DNS服务器列表"
-                echo "  DNS_CHECK_IPV6           IPv6 DNS服务器列表"
+                echo "  DNS_CHECK_IPV6_SERVERS   IPv6 DNS服务器列表"
+                echo "  DNS_CHECK_IPV6_DOMAINS   IPv6测试域名列表"
                 echo "  DNS_CHECK_DOH_SERVERS    DoH服务器 (名称|URL)"
                 echo "  DNS_CHECK_DOT_SERVERS    DoT服务器 (名称|IP)"
                 echo ""
-                echo "兼容: Alpine/Debian/Ubuntu/RHEL/macOS"
+                echo "v4.7 特性:"
+                echo "  - 全面IPv6检测 (接口/路由/DNS/HTTP/双栈)"
+                echo "  - CDN智能识别 (Google/Cloudflare/Fastly/AWS/Akamai)"
+                echo "  - 污染精确检测 (Google网络验证+多域名)"
+                echo "  - 多平台依赖自动安装 (Alpine/Debian/RHEL/Arch/macOS/FreeBSD)"
+                echo ""
                 exit 0
                 ;;
             *) 
@@ -1320,10 +1580,9 @@ main() {
         shift
     done
     
-    # 自动安装依赖
     if [ "$AUTO_INSTALL" = "1" ]; then
         auto_install_dependencies || {
-            echo -e "  ${ICON_FAIL} 依赖安装失败，使用现有工具继续检测..."
+            echo -e "  ${ICON_FAIL} 依赖安装失败，使用现有工具继续..."
             echo ""
         }
     fi
@@ -1334,7 +1593,7 @@ main() {
     
     echo ""
     echo -e "${BOLD}${MAGENTA}╔══════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${BOLD}${MAGENTA}║  DNS 全面检测脚本 v4.5 (运行时修复·自动安装)            ║${NC}"
+    echo -e "${BOLD}${MAGENTA}║  DNS 全面检测脚本 v4.7 (五轮审计·全平台·增强IPv6)       ║${NC}"
     echo -e "${BOLD}${MAGENTA}║  检测时间: $(date '+%Y-%m-%d %H:%M:%S')                        ║${NC}"
     echo -e "${BOLD}${MAGENTA}╚══════════════════════════════════════════════════════════╝${NC}"
     echo ""
@@ -1344,6 +1603,7 @@ main() {
     check_resolution_methods
     check_geo_resolution
     check_record_types
+    check_ipv6_comprehensive
     check_protocols
     check_performance
     check_security
