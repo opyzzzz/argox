@@ -30,7 +30,7 @@ wget -qO- https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/dns-de
 
 SmartDNS
 `````
-curl -sLo /tmp/sdns.sh https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/DOH.sh && bash /tmp/sdns.sh
+curl -sLo /tmp/sdns.sh https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/smartdns.sh && bash /tmp/sdns.sh
 `````
 
 MOSDNS
