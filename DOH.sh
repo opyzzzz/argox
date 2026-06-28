@@ -1,6 +1,6 @@
 #!/bin/sh
 #==========================================================================
-# SmartDNS 智能部署脚本 v7.5.1
+# SmartDNS 智能部署脚本 v7.5.2
 # 守护改名: resolv-guard，彻底避免 pkill 误杀
 #==========================================================================
 set +e
@@ -244,7 +244,7 @@ EOF
     else log_ok "端口 53 可用"; fi
     
     cat > /etc/smartdns/smartdns.conf << EOF
-# SmartDNS 配置 v7.5.1
+# SmartDNS 配置 v7.5.2
 # 环境: $OS_TYPE $OS_VER | $VIRT_TYPE | $NET_STACK
 # 版本: $SMARTDNS_VER | 来源: $SMARTDNS_SOURCE
 # 策略: $TAKEOVER_STRATEGY | 时间: $(date '+%Y-%m-%d %H:%M:%S')
@@ -321,7 +321,7 @@ EOF
 }
 
 #==================================================
-# 模块3: 接管系统 DNS (v7.5.1)
+# 模块3: 接管系统 DNS (v7.5.2)
 #==================================================
 module_dns_takeover() {
     log_step "模块3: 接管系统 DNS (策略: $TAKEOVER_STRATEGY)"
@@ -384,8 +384,7 @@ TARGET="/etc/resolv.conf"; TEMPLATE="${RESOLV_TEMPLATE}"; PID_FILE="${PID_FILE}"
 GUARD
     chmod 700 "$GUARD_SCRIPT"
     
-    # 清理旧守护残留（Alpine ash 兼容，不依赖 disown）
-    pkill -f "resolv-guard\.sh" 2>/dev/null
+    # 清理旧守护残留（只用 PID 文件，不依赖 pkill -f）
     [ -f "$PID_FILE" ] && { OLD_PID=$(cat "$PID_FILE" 2>/dev/null); [ -n "$OLD_PID" ] && kill "$OLD_PID" 2>/dev/null; rm -f "$PID_FILE"; }
     sleep 0.5
     
@@ -504,7 +503,7 @@ module_verify() {
 }
 
 #==================================================
-# 模块6: 卸载 (v7.5.1)
+# 模块6: 卸载 (v7.5.2)
 #==================================================
 module_uninstall() {
     echo ""; echo -e "${YELLOW}══════════════════════════════════════${NC}"
@@ -540,35 +539,30 @@ module_uninstall() {
             ;;
     esac
     
-    # 3. 用 PID 文件精确终止守护
+    # 3. 用 PID 文件精确终止守护（不用 pkill -f，避免误杀脚本自身）
     if [ -f "$PID_FILE" ]; then
         GUARD_PID=$(cat "$PID_FILE" 2>/dev/null)
         if [ -n "$GUARD_PID" ]; then
             kill "$GUARD_PID" 2>/dev/null
-            sleep 0.3
+            sleep 0.5
             kill -9 "$GUARD_PID" 2>/dev/null
         fi
         rm -f "$PID_FILE"
     fi
     
-    # 4. 模糊匹配兜底清理守护残留（兼容 Alpine ash，进程名不含完整路径）
-    pkill -f "resolv-guard\.sh" 2>/dev/null
-    sleep 0.3
-    pkill -9 -f "resolv-guard\.sh" 2>/dev/null
-    
-    # 5. 清理 smartdns
+    # 4. 清理 smartdns（精确匹配，不会误杀脚本）
     pkill -x smartdns 2>/dev/null
     sleep 0.5
     pkill -9 -x smartdns 2>/dev/null
     sleep 1
     
-    # 6. 清理文件
+    # 5. 清理文件
     rm -f "$GUARD_SCRIPT" "$RESOLV_BACKUP" "$SDNS_CMD"
     rm -f /etc/cloud/cloud.cfg.d/99-smartdns-dns.cfg
     [ -f /etc/tmpfiles.d/systemd-resolved.conf ] && grep -q "SmartDNS" /etc/tmpfiles.d/systemd-resolved.conf 2>/dev/null && rm -f /etc/tmpfiles.d/systemd-resolved.conf
     crontab -l 2>/dev/null | grep -q "resolv-check\|smartdns" && { crontab -l 2>/dev/null | grep -v "resolv-check\|smartdns" | crontab - 2>/dev/null; }
     
-    # 7. 恢复 DNS（优先用部署时备份的原始配置）
+    # 6. 恢复 DNS（优先用部署时备份的原始配置）
     if [ -f /etc/resolv.conf.smartdns.orig ]; then
         cat /etc/resolv.conf.smartdns.orig > /etc/resolv.conf
         rm -f /etc/resolv.conf.smartdns.orig
@@ -581,14 +575,14 @@ nameserver 8.8.8.8
 EOF
     fi
     
-    # 8. 清理二进制和配置目录
+    # 7. 清理二进制和配置目录
     rm -f /usr/bin/smartdns /usr/sbin/smartdns /usr/local/bin/smartdns
     rm -rf /etc/smartdns
     rm -f /var/log/smartdns.log* "$DEPLOY_LOG"
     apt-get remove -y smartdns 2>/dev/null
     apk del smartdns 2>/dev/null
     
-    # 9. 残留检测
+    # 8. 残留检测
     echo ""
     echo -e "${BOLD}  清理报告:${NC}"
     local clean=true
@@ -606,7 +600,7 @@ EOF
 }
 
 #==================================================
-# 模块7: 竖排菜单 (v7.5.1)
+# 模块7: 竖排菜单 (v7.5.2)
 #==================================================
 install_shortcut() {
     local script_path=$(readlink -f "$0" 2>/dev/null || echo "$0")
@@ -715,7 +709,7 @@ main() {
     fi
     for arg in "$@"; do case "$arg" in --uninstall|-u) module_uninstall; exit 0 ;; esac; done
     
-    echo ""; echo -e "${BOLD}SmartDNS 智能部署 v7.5.1${NC}"; echo -e "上游: Google + Cloudflare (DoH/DoT/UDP)"; echo -e "环境: Alpine/Debian (LXC/KVM/Podman)"; echo ""
+    echo ""; echo -e "${BOLD}SmartDNS 智能部署 v7.5.2${NC}"; echo -e "上游: Google + Cloudflare (DoH/DoT/UDP)"; echo -e "环境: Alpine/Debian (LXC/KVM/Podman)"; echo ""
     module_detect; module_install; module_config; module_dns_takeover; module_service; module_verify
     echo ""; echo -e "管理命令: ${GREEN}sdns${NC}"; echo -e "  sdns t  测试  sdns l  日志  sdns c  配置  sdns u  更新"; echo -e "  sdns    菜单"
     module_menu
