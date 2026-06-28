@@ -1,6 +1,6 @@
 #!/bin/sh
 #==========================================================================
-# SmartDNS 智能部署脚本 v7.5.4
+# SmartDNS 智能部署脚本 v7.5.6
 # PID 文件路径 /var/run → /run (systemd 兼容)
 #==========================================================================
 set +e
@@ -178,7 +178,7 @@ module_detect() {
 }
 
 #==================================================
-# 模块1: 安装 SmartDNS (v7.5.4)
+# 模块1: 安装 SmartDNS (v7.5.6)
 #==================================================
 module_install() {
     log_step "模块1: 安装 SmartDNS"
@@ -259,7 +259,7 @@ EOF
     else log_ok "端口 53 可用"; fi
     
     cat > /etc/smartdns/smartdns.conf << EOF
-# SmartDNS 配置 v7.5.4
+# SmartDNS 配置 v7.5.6
 # 环境: $OS_TYPE $OS_VER | $VIRT_TYPE | $NET_STACK
 # 版本: $SMARTDNS_VER | 来源: $SMARTDNS_SOURCE
 # 策略: $TAKEOVER_STRATEGY | 时间: $(date '+%Y-%m-%d %H:%M:%S')
@@ -336,7 +336,7 @@ EOF
 }
 
 #==================================================
-# 模块3: 接管系统 DNS (v7.5.4)
+# 模块3: 接管系统 DNS (v7.5.6)
 #==================================================
 module_dns_takeover() {
     log_step "模块3: 接管系统 DNS (策略: $TAKEOVER_STRATEGY)"
@@ -385,8 +385,21 @@ SSTART
         systemctl daemon-reload 2>/dev/null; systemctl enable resolv-fix.service 2>/dev/null; log_ok "systemd oneshot 服务已创建"
     fi
     
+    # 生成守护脚本
     log_info "部署 DNS 文件守护"
-    cat > "$GUARD_SCRIPT" << GUARD
+    if [ "$INIT_TYPE" = "systemd" ]; then
+        # systemd: 前台运行，Type=simple
+        cat > "$GUARD_SCRIPT" << GUARD
+#!/bin/sh
+TARGET="/etc/resolv.conf"; TEMPLATE="${RESOLV_TEMPLATE}"
+restore_dns() { [ -f "\$TEMPLATE" ] && ! cmp -s "\$TEMPLATE" "\$TARGET" 2>/dev/null && cat "\$TEMPLATE" > "\$TARGET" 2>/dev/null; }
+if command -v inotifywait >/dev/null 2>&1; then while true; do inotifywait -m -e modify,close_write "\$TARGET" 2>/dev/null | while read -r path event file; do sleep 0.5; restore_dns; done; sleep 1; done
+elif command -v inotifyd >/dev/null 2>&1; then while true; do inotifyd - "\$TARGET" 2>/dev/null | while read -r event file; do case "\$event" in w|m|c) sleep 0.5; restore_dns ;; esac; done; sleep 1; done
+else while true; do sleep 5; restore_dns; done; fi
+GUARD
+    else
+        # Alpine/OpenRC: fork 模式
+        cat > "$GUARD_SCRIPT" << GUARD
 #!/bin/sh
 TARGET="/etc/resolv.conf"; TEMPLATE="${RESOLV_TEMPLATE}"; PID_FILE="${PID_FILE}"
 ( echo \$\$ > "\$PID_FILE"
@@ -397,9 +410,10 @@ TARGET="/etc/resolv.conf"; TEMPLATE="${RESOLV_TEMPLATE}"; PID_FILE="${PID_FILE}"
   else while true; do sleep 5; restore_dns; done; fi
 ) & exit 0
 GUARD
+    fi
     chmod 700 "$GUARD_SCRIPT"
     
-    # 清理旧守护残留（只用 PID 文件）
+    # 清理旧守护残留
     [ -f "$PID_FILE" ] && { OLD_PID=$(cat "$PID_FILE" 2>/dev/null); [ -n "$OLD_PID" ] && kill "$OLD_PID" 2>/dev/null; rm -f "$PID_FILE"; }
     sleep 0.5
     
@@ -410,9 +424,8 @@ Description=DNS Resolv Guard
 After=smartdns.service resolv-fix.service
 Requires=smartdns.service
 [Service]
-Type=forking
+Type=simple
 ExecStart=/usr/local/bin/resolv-guard.sh
-PIDFile=/run/resolv-guard.pid
 Restart=always
 RestartSec=3
 [Install]
@@ -431,7 +444,7 @@ OGSTART
 }
 
 #==================================================
-# 模块4: 服务与守护 (v7.5.4)
+# 模块4: 服务与守护 (v7.5.6)
 #==================================================
 module_service() {
     log_step "模块4: 部署 SmartDNS 服务"
@@ -520,7 +533,7 @@ module_verify() {
 }
 
 #==================================================
-# 模块6: 卸载 (v7.5.4)
+# 模块6: 卸载 (v7.5.6)
 #==================================================
 module_uninstall() {
     echo ""; echo -e "${YELLOW}══════════════════════════════════════${NC}"
@@ -586,7 +599,7 @@ EOF
     echo ""; echo -e "${GREEN}  卸载完成${NC}"
 }
 #==================================================
-# 模块7: 竖排菜单 (v7.5.4)
+# 模块7: 竖排菜单 (v7.5.6)
 #==================================================
 install_shortcut() {
     local script_path=$(readlink -f "$0" 2>/dev/null || echo "$0")
@@ -718,7 +731,7 @@ main() {
     fi
     for arg in "$@"; do case "$arg" in --uninstall|-u) module_uninstall; exit 0 ;; esac; done
     
-    echo ""; echo -e "${BOLD}SmartDNS 智能部署 v7.5.4${NC}"; echo -e "上游: Google + Cloudflare (DoH/DoT/UDP)"; echo -e "环境: Alpine/Debian (LXC/KVM/Podman)"; echo ""
+    echo ""; echo -e "${BOLD}SmartDNS 智能部署 v7.5.6${NC}"; echo -e "上游: Google + Cloudflare (DoH/DoT/UDP)"; echo -e "环境: Alpine/Debian (LXC/KVM/Podman)"; echo ""
     module_detect; module_install; module_config; module_dns_takeover; module_service; module_verify
     echo ""; echo -e "管理命令: ${GREEN}sdns${NC}"; echo -e "  sdns t  测试  sdns l  日志  sdns c  配置  sdns u  版本管理"; echo -e "  sdns    菜单"
     module_menu
