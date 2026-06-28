@@ -1,6 +1,6 @@
 #!/bin/sh
 #==========================================================================
-# SmartDNS 智能部署脚本 v7.5.9
+# SmartDNS 智能部署脚本 v7.6.1
 # PID 文件路径 /var/run → /run (systemd 兼容)
 #==========================================================================
 set +e
@@ -178,7 +178,7 @@ module_detect() {
 }
 
 #==================================================
-# 模块1: 安装 SmartDNS (v7.5.9)
+# 模块1: 安装 SmartDNS (v7.6.1)
 #==================================================
 module_install() {
     log_step "模块1: 安装 SmartDNS"
@@ -259,7 +259,7 @@ EOF
     else log_ok "端口 53 可用"; fi
     
     cat > /etc/smartdns/smartdns.conf << EOF
-# SmartDNS 配置 v7.5.9
+# SmartDNS 配置 v7.6.1
 # 环境: $OS_TYPE $OS_VER | $VIRT_TYPE | $NET_STACK
 # 版本: $SMARTDNS_VER | 来源: $SMARTDNS_SOURCE
 # 策略: $TAKEOVER_STRATEGY | 时间: $(date '+%Y-%m-%d %H:%M:%S')
@@ -336,7 +336,7 @@ EOF
 }
 
 #==================================================
-# 模块3: 接管系统 DNS (v7.5.9)
+# 模块3: 接管系统 DNS (v7.6.1)
 #==================================================
 module_dns_takeover() {
     log_step "模块3: 接管系统 DNS (策略: $TAKEOVER_STRATEGY)"
@@ -445,7 +445,7 @@ OGSTART
 }
 
 #==================================================
-# 模块4: 服务与守护 (v7.5.9)
+# 模块4: 服务与守护 (v7.6.1)
 #==================================================
 module_service() {
     log_step "模块4: 部署 SmartDNS 服务"
@@ -538,7 +538,7 @@ module_verify() {
 }
 
 #==================================================
-# 模块6: 卸载 (v7.5.9)
+# 模块6: 卸载 (v7.6.1)
 #==================================================
 module_uninstall() {
     echo ""; echo -e "${YELLOW}══════════════════════════════════════${NC}"
@@ -603,21 +603,50 @@ EOF
     $clean && echo -e "    ${GREEN}✓ 清理完成，无残留${NC}"
     echo ""; echo -e "${GREEN}  卸载完成${NC}"
 }
+
 #==================================================
-# 模块7: 竖排菜单 (v7.5.9)
+# 模块7: 双面板菜单 (v7.6.1) - 缓存优化 + DoT 逻辑修复
 #==================================================
 install_shortcut() {
     local script_path=$(readlink -f "$0" 2>/dev/null || echo "$0")
     [ "$script_path" != "$SDNS_CMD" ] && { cp "$script_path" "$SDNS_CMD" 2>/dev/null; chmod +x "$SDNS_CMD" 2>/dev/null; }
 }
 
-hr() { printf "%${COLS}s\n" | tr ' ' '━'; }
+# 缓存变量（30秒内不重复检测）
+CACHE_TIME=0
+CACHE_S_DOT=""; CACHE_G_DOT=""; CACHE_SYS_DNS=""; CACHE_SDNS_DNS=""; CACHE_UP=""
+CACHE_DOH_G=""; CACHE_DOH_C=""; CACHE_DOT_G=""; CACHE_DOT_C=""
 
-get_dots() {
-    pgrep smartdns >/dev/null 2>&1 && S="${GREEN}●${NC}" || S="${RED}●${NC}"
-    pgrep -f resolv-guard >/dev/null 2>&1 && G="${GREEN}●${NC}" || G="${RED}●${NC}"
-    DNS=$(grep "^nameserver" /etc/resolv.conf 2>/dev/null | awk '{print $2}' | head -1); [ -z "$DNS" ] && DNS="未配置"
-    UP=""
+get_metrics() {
+    local now=$(date +%s)
+    # 缓存30秒有效
+    if [ -n "$CACHE_S_DOT" ] && [ $((now - CACHE_TIME)) -lt 30 ]; then
+        S_DOT="$CACHE_S_DOT"; G_DOT="$CACHE_G_DOT"; SYS_DNS="$CACHE_SYS_DNS"
+        SDNS_DNS="$CACHE_SDNS_DNS"; UP="$CACHE_UP"
+        DOH_G="$CACHE_DOH_G"; DOH_C="$CACHE_DOH_C"; DOT_G="$CACHE_DOT_G"; DOT_C="$CACHE_DOT_C"
+        return
+    fi
+    
+    # ── 本地检测（无网络请求）──
+    pgrep smartdns >/dev/null 2>&1 && S_DOT="${GREEN}●${NC}" || S_DOT="${RED}●${NC}"
+    pgrep -f resolv-guard >/dev/null 2>&1 && G_DOT="${GREEN}●${NC}" || G_DOT="${RED}●${NC}"
+    SYS_DNS=$(grep "^nameserver" /etc/resolv.conf 2>/dev/null | awk '{print $2}' | tr '\n' ' ' | sed 's/ $//')
+    [ -z "$SYS_DNS" ] && SYS_DNS="未配置"
+    
+    # SmartDNS 上游
+    SDNS_DNS=$(grep "^server " /etc/smartdns/smartdns.conf 2>/dev/null | awk '{print $2}' | tr '\n' ',' | sed 's/,$//')
+    [ -z "$SDNS_DNS" ] && SDNS_DNS="未配置"
+    
+    # ── 网络检测（仅首次或缓存过期时）──
+    UP=""; DOH_G="${YELLOW}●${NC}"; DOH_C="${YELLOW}●${NC}"; DOT_G="${YELLOW}●${NC}"; DOT_C="${YELLOW}●${NC}"
+    
+    if command -v curl >/dev/null 2>&1; then
+        # DoH（并行思路：实际顺序执行但加超时）
+        curl -s --max-time 2 "https://dns.google/dns-query?name=google.com" 2>/dev/null | grep -q "Status" && DOH_G="${GREEN}●${NC}" || DOH_G="${RED}●${NC}"
+        curl -s --max-time 2 "https://cloudflare-dns.com/dns-query?name=google.com" 2>/dev/null | grep -q "Status" && DOH_C="${GREEN}●${NC}" || DOH_C="${RED}●${NC}"
+    fi
+    
+    # 上游 UDP DNS 查询
     for ip in 8.8.8.8 1.1.1.1; do
         if [ -n "$BB" ]; then
             $BB nslookup google.com "$ip" >/dev/null 2>&1 && UP="$UP ${GREEN}●${NC}" || UP="$UP ${RED}●${NC}"
@@ -625,62 +654,83 @@ get_dots() {
             nslookup -timeout=2 google.com "$ip" >/dev/null 2>&1 && UP="$UP ${GREEN}●${NC}" || UP="$UP ${RED}●${NC}"
         fi
     done
+    
+    # DoT（只测 853 端口，先 busybox 后系统 nc）
+    if [ -n "$BB" ] && $BB nc -z -w2 8.8.8.8 853 2>/dev/null; then DOT_G="${GREEN}●${NC}"; else DOT_G="${RED}●${NC}"; fi
+    if [ -n "$BB" ] && $BB nc -z -w2 1.1.1.1 853 2>/dev/null; then DOT_C="${GREEN}●${NC}"; else DOT_C="${RED}●${NC}"; fi
+    if command -v nc >/dev/null 2>&1 && [ -z "$BB" ]; then
+        nc -z -w2 8.8.8.8 853 2>/dev/null && DOT_G="${GREEN}●${NC}" || DOT_G="${RED}●${NC}"
+        nc -z -w2 1.1.1.1 853 2>/dev/null && DOT_C="${GREEN}●${NC}" || DOT_C="${RED}●${NC}"
+    fi
+    
+    # 写入缓存
+    CACHE_TIME=$now; CACHE_S_DOT="$S_DOT"; CACHE_G_DOT="$G_DOT"
+    CACHE_SYS_DNS="$SYS_DNS"; CACHE_SDNS_DNS="$SDNS_DNS"; CACHE_UP="$UP"
+    CACHE_DOH_G="$DOH_G"; CACHE_DOH_C="$DOH_C"; CACHE_DOT_G="$DOT_G"; CACHE_DOT_C="$DOT_C"
 }
 
 show_menu() {
-    get_dots
+    get_metrics
     clear 2>/dev/null || echo ""
-    echo -e "${BOLD}  SmartDNS 管理${NC}"; hr
-    echo -e "  DNS:${S} 守护:${G}  ${DNS}"
-    echo -e "  上游:${UP}"; hr
-    echo "  1. DNS 测试      2. 查看日志"
-    echo "  3. 查看配置      4. 编辑配置"
-    echo "  5. 重启服务      6. 清除缓存"
-    echo "  7. 版本管理      8. 卸载"
-    echo "  0. 退出"
-    hr
+    printf "%b\n" "${BOLD}┌────────── 系统状态 ──────────┐${NC}"
+    printf "  %b SmartDNS:  %s\n" "$S_DOT" "$SYS_DNS"
+    printf "  %b 守护进程:  %s\n" "$G_DOT" "$SDNS_DNS"
+    printf "  %b 上游连通: %b\n" " " "$UP"
+    printf "%b\n" "${BOLD}├────────── 加密连通 ──────────┤${NC}"
+    printf "  DoH Google:     %b\n" "$DOH_G"
+    printf "  DoH Cloudflare: %b\n" "$DOH_C"
+    printf "  DoT Google:     %b\n" "$DOT_G"
+    printf "  DoT Cloudflare: %b\n" "$DOT_C"
+    printf "%b\n" "${BOLD}├──────────────────────────────┤${NC}"
+    printf "  1.DNS测试 2.日志 3.配置 4.编辑\n"
+    printf "  5.重启   6.清缓存 7.版本 8.卸载\n"
+    printf "  0.退出\n"
+    printf "%b\n" "${BOLD}└──────────────────────────────┘${NC}"
 }
 
-do_log() { clear 2>/dev/null || echo ""; echo -e "${BOLD}── 日志 ──${NC}"; [ -f /var/log/smartdns.log ] && tail -20 /var/log/smartdns.log || echo "  日志文件不存在"; }
+do_log() { clear 2>/dev/null || echo ""; printf "%b\n" "${BOLD}── 日志 ──${NC}"; [ -f /var/log/smartdns.log ] && tail -20 /var/log/smartdns.log || echo "  日志文件不存在"; }
 
 do_test() {
     clear 2>/dev/null || echo ""
-    echo -e "${BOLD}── DNS 测试 ──${NC}"
+    printf "%b\n" "${BOLD}── DNS 测试 ──${NC}"
     for domain in google.com cloudflare.com github.com; do
         printf "  %-20s" "$domain"
         if [ -n "$BB" ]; then RESULT=$($BB nslookup "$domain" 127.0.0.1 2>&1)
         else RESULT=$(nslookup "$domain" 127.0.0.1 2>&1); fi
-        echo "$RESULT" | grep -q "Address" && echo -e "${GREEN}✓${NC}" || echo -e "${RED}✗${NC}"
+        printf "%s" "$RESULT" | grep -q "Address" && printf "%b\n" "${GREEN}✓${NC}" || printf "%b\n" "${RED}✗${NC}"
     done
 }
 
-do_config() { clear 2>/dev/null || echo ""; echo -e "${BOLD}── 配置 ──${NC}"; [ -f /etc/smartdns/smartdns.conf ] && grep -v "^#\|^$" /etc/smartdns/smartdns.conf | head -25 || echo "  配置文件不存在"; }
+do_config() { clear 2>/dev/null || echo ""; printf "%b\n" "${BOLD}── 配置 ──${NC}"; [ -f /etc/smartdns/smartdns.conf ] && grep -v "^#\|^$" /etc/smartdns/smartdns.conf | head -25 || echo "  配置文件不存在"; }
 
 do_edit() {
     if ! command -v nano >/dev/null 2>&1; then pkg_install nano 2 >/dev/null 2>&1; fi
     if command -v nano >/dev/null 2>&1; then nano /etc/smartdns/smartdns.conf
     else vi /etc/smartdns/smartdns.conf; fi
-    echo -e "${YELLOW}  配置已修改，选 5 重启生效${NC}"
+    printf "%b\n" "${YELLOW}  配置已修改，选 5 重启生效${NC}"
 }
 
 do_restart() {
     printf "  重启中... "
     case "$INIT_TYPE" in systemd) systemctl restart smartdns 2>/dev/null ;; openrc) rc-service smartdns restart 2>/dev/null ;; *) pkill -x smartdns 2>/dev/null; sleep 1; smartdns -c /etc/smartdns/smartdns.conf & ;; esac
-    sleep 2; pgrep smartdns >/dev/null 2>&1 && echo -e "${GREEN}✓ 已重启${NC}" || echo -e "${RED}✗ 失败${NC}"
+    sleep 2; pgrep smartdns >/dev/null 2>&1 && printf "%b\n" "${GREEN}✓ 已重启${NC}" || printf "%b\n" "${RED}✗ 失败${NC}"
+    CACHE_TIME=0  # 重启后清缓存
 }
 
-do_flush() { pkill -HUP -x smartdns 2>/dev/null && echo -e "${GREEN}✓ 缓存已清除${NC}" || echo -e "${RED}✗ 未运行${NC}"; }
+do_flush() {
+    pkill -HUP -x smartdns 2>/dev/null && printf "%b\n" "${GREEN}✓ 缓存已清除${NC}" || printf "%b\n" "${RED}✗ 未运行${NC}"
+}
 
 do_update() {
-    clear 2>/dev/null || echo ""; echo -e "${BOLD}── 版本管理 ──${NC}"
-    if ! command -v curl >/dev/null 2>&1; then echo -e "${RED}  需要 curl${NC}"; return; fi
+    clear 2>/dev/null || echo ""; printf "%b\n" "${BOLD}── 版本管理 ──${NC}"
+    if ! command -v curl >/dev/null 2>&1; then printf "%b\n" "${RED}  需要 curl${NC}"; return; fi
     
     CURRENT_TAG=$("$SMARTDNS_BIN" -v 2>&1 | grep 'Release' | head -1 | sed 's/.*\(Release[0-9.]*\).*/\1/')
-    echo -e "  当前版本: ${GREEN}${CURRENT_TAG:-未知}${NC}"
+    printf "  当前版本: %b\n" "${GREEN}${CURRENT_TAG:-未知}${NC}"
     
     LATEST_JSON=$(curl -sL --max-time 10 https://api.github.com/repos/pymumu/smartdns/releases/latest 2>/dev/null)
-    LATEST_TAG=$(echo "$LATEST_JSON" | grep '"tag_name"' | head -1 | sed 's/.*": "//;s/"//')
-    echo -e "  最新版本: ${CYAN}${LATEST_TAG:-获取失败}${NC}"
+    LATEST_TAG=$(printf "%s" "$LATEST_JSON" | grep '"tag_name"' | head -1 | sed 's/.*": "//;s/"//')
+    printf "  最新版本: %b\n" "${CYAN}${LATEST_TAG:-获取失败}${NC}"
     echo ""
     echo "  1. 升级到最新版"
     echo "  2. 回滚到备份版本"
@@ -693,8 +743,8 @@ do_update() {
         1) TARGET_TAG="$LATEST_TAG" ;;
         2) if [ -f /usr/bin/smartdns.bak ]; then
                cp /usr/bin/smartdns.bak /usr/bin/smartdns; chmod +x /usr/bin/smartdns
-               do_restart; echo -e "${GREEN}✓ 已回滚${NC}"; return
-           else echo -e "${RED}  无备份文件${NC}"; return; fi ;;
+               do_restart; printf "%b\n" "${GREEN}✓ 已回滚${NC}"; return
+           else printf "%b\n" "${RED}  无备份文件${NC}"; return; fi ;;
         3) printf "  版本号(如 Release48.1): "; read -r TARGET_TAG ;;
         0) return ;;
         *) echo "  无效选择"; return ;;
@@ -708,15 +758,15 @@ do_update() {
         cp /usr/bin/smartdns /usr/bin/smartdns.bak 2>/dev/null
         mv /tmp/smartdns-new /usr/bin/smartdns; chmod +x /usr/bin/smartdns
         SMARTDNS_BIN="/usr/bin/smartdns"; do_restart
-        echo -e "${GREEN}✓ 切换完成${NC}"
-    else echo -e "${RED}✗ 下载失败${NC}"; fi
+        printf "%b\n" "${GREEN}✓ 切换完成${NC}"
+    else printf "%b\n" "${RED}✗ 下载失败${NC}"; fi
 }
 
 module_menu() {
     install_shortcut
     if [ $# -gt 0 ]; then
         case "$1" in
-            s|status) get_dots; echo -e "DNS:${S} 守护:${G}  ${DNS}\n上游:${UP}"; return ;;
+            s|status) get_metrics; printf "DNS:%b 守护:%b\n上游:%b\n" "$S_DOT" "$G_DOT" "$UP"; return ;;
             l|log) do_log; return ;; t|test) do_test; return ;;
             c|config) do_config; return ;; e|edit) do_edit; return ;; r|restart) do_restart; return ;;
             f|flush) do_flush; return ;; u|update) do_update; return ;; uninstall) module_uninstall; return ;;
@@ -743,9 +793,9 @@ main() {
     fi
     for arg in "$@"; do case "$arg" in --uninstall|-u) module_uninstall; exit 0 ;; esac; done
     
-    echo ""; echo -e "${BOLD}SmartDNS 智能部署 v7.5.9${NC}"; echo -e "上游: Google + Cloudflare (DoH/DoT/UDP)"; echo -e "环境: Alpine/Debian (LXC/KVM/Podman)"; echo ""
+    echo ""; printf "%b\n" "${BOLD}SmartDNS 智能部署 v7.6.1${NC}"; echo "上游: Google + Cloudflare (DoH/DoT/UDP)"; echo "环境: Alpine/Debian (LXC/KVM/Podman)"; echo ""
     module_detect; module_install; module_config; module_dns_takeover; module_service; module_verify
-    echo ""; echo -e "管理命令: ${GREEN}sdns${NC}"; echo -e "  sdns t  测试  sdns l  日志  sdns c  配置  sdns u  版本管理"; echo -e "  sdns    菜单"
+    echo ""; printf "%b\n" "管理命令: ${GREEN}sdns${NC}"; echo "  sdns t  测试  sdns l  日志  sdns c  配置  sdns u  版本管理"; echo "  sdns    菜单"
     module_menu
 }
 
