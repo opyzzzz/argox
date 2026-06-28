@@ -805,4 +805,4 @@ main() {
     module_menu
 }
 
-main "$@""
+main "$@"
