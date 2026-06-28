@@ -1,7 +1,7 @@
 #!/bin/sh
 #==================================================
-# DNS 检测脚本 v5.2 - Alpine/Debian 精简修复版
-# 修复: DoH重复执行、IPv6提取不完整、输出对齐
+# DNS 检测脚本 v5.4 - Alpine/Debian 源管理增强版
+# 修复: 解析重试、IPv6分级评估、包管理换源+安装
 # 兼容: Alpine 3.x / Debian 10+
 # 用法: wget -qO- https://.../dns-check.sh | sh
 #==================================================
@@ -22,11 +22,12 @@ fi
 # 统计
 #==================================================
 PASS=0; FAIL=0; WARN=0; SKIP=0; TOTAL=0
+RETRY_COUNT=0
 
 ICON_OK="${GREEN}✓${NC}"; ICON_FAIL="${RED}✗${NC}"
 ICON_WARN="${YELLOW}⚠${NC}"; ICON_INFO="${CYAN}ℹ${NC}"; ICON_SKIP="${DIM}⊘${NC}"
 
-# DoH/DoT 服务器 (名称|URL 或 名称|IP)
+# 服务器列表
 DOH_SERVERS="Cloudflare|https://cloudflare-dns.com/dns-query Google|https://dns.google/resolve"
 DOT_SERVERS="Cloudflare|1.1.1.1 Google|8.8.8.8"
 
@@ -36,7 +37,7 @@ DOT_SERVERS="Cloudflare|1.1.1.1 Google|8.8.8.8"
 print_header() {
     echo ""
     echo -e "${BOLD}${BLUE}═══════════════════════════════════════════════════════════${NC}"
-    echo -e "${BOLD}${BLUE}  DNS 可用性检测 v5.2 (Alpine/Debian)${NC}"
+    echo -e "${BOLD}${BLUE}  DNS 可用性检测 v5.4 (Alpine/Debian)${NC}"
     echo -e "${BOLD}${BLUE}  时间: $(date '+%Y-%m-%d %H:%M:%S')${NC}"
     echo -e "${BOLD}${BLUE}═══════════════════════════════════════════════════════════${NC}"
     echo ""
@@ -52,43 +53,351 @@ check_info()   { echo -e "    ${ICON_INFO} $1: ${CYAN}$2${NC}"; }
 check_skip()   { echo -e "    ${ICON_SKIP} $1"; SKIP=$((SKIP + 1)); TOTAL=$((TOTAL + 1)); }
 
 #==================================================
-# 依赖检测和安装
+# 系统检测
 #==================================================
-check_deps() {
-    MISSING=""
-    for tool in nslookup curl ping; do
-        command -v "$tool" >/dev/null 2>&1 || MISSING="$MISSING $tool"
-    done
-    command -v nc >/dev/null 2>&1 || MISSING="$MISSING nc(DoT需要)"
-    
-    [ -z "$MISSING" ] && return 0
-    
-    echo ""
-    echo -e "  ${ICON_WARN} 缺少工具:${MISSING}"
-    
+detect_os() {
     if [ -f /etc/alpine-release ]; then
-        echo -e "  ${ICON_INFO} Alpine安装: ${CYAN}apk add bind-tools curl iputils netcat-openbsd${NC}"
+        echo "alpine"
     elif [ -f /etc/debian_version ]; then
-        echo -e "  ${ICON_INFO} Debian安装: ${CYAN}apt-get install -y dnsutils curl iputils-ping netcat-openbsd${NC}"
+        echo "debian"
+    else
+        echo "unknown"
     fi
-    
-    # 自动安装 (root)
-    if [ "$(id -u 2>/dev/null)" = "0" ]; then
-        echo -e "  ${ICON_INFO} 正在自动安装..."
-        if [ -f /etc/alpine-release ]; then
-            apk add bind-tools curl iputils netcat-openbsd 2>/dev/null && \
-                echo -e "  ${ICON_OK} 安装完成" || echo -e "  ${ICON_FAIL} 安装失败"
-        elif [ -f /etc/debian_version ]; then
-            apt-get update -qq 2>/dev/null
-            apt-get install -y dnsutils curl iputils-ping netcat-openbsd 2>/dev/null && \
-                echo -e "  ${ICON_OK} 安装完成" || echo -e "  ${ICON_FAIL} 安装失败"
-        fi
-    fi
-    echo ""
+}
+
+# 检查root权限
+is_root() {
+    [ "$(id -u 2>/dev/null)" = "0" ]
 }
 
 #==================================================
-# DNS解析 (修复IPv6输出不完整)
+# Alpine 源管理
+#==================================================
+alpine_backup_repos() {
+    if [ -f /etc/apk/repositories ] && [ ! -f /etc/apk/repositories.bak ]; then
+        cp /etc/apk/repositories /etc/apk/repositories.bak 2>/dev/null
+    fi
+}
+
+alpine_restore_repos() {
+    if [ -f /etc/apk/repositories.bak ]; then
+        mv /etc/apk/repositories.bak /etc/apk/repositories 2>/dev/null
+    fi
+}
+
+alpine_set_mirror() {
+    mirror="$1"
+    case "$mirror" in
+        default)
+            alpine_backup_repos
+            cat > /etc/apk/repositories <<'EOF'
+https://dl-cdn.alpinelinux.org/alpine/latest-stable/main
+https://dl-cdn.alpinelinux.org/alpine/latest-stable/community
+EOF
+            ;;
+        edge)
+            alpine_backup_repos
+            cat > /etc/apk/repositories <<'EOF'
+https://dl-cdn.alpinelinux.org/alpine/edge/main
+https://dl-cdn.alpinelinux.org/alpine/edge/community
+EOF
+            ;;
+        ustc)
+            alpine_backup_repos
+            cat > /etc/apk/repositories <<'EOF'
+https://mirrors.ustc.edu.cn/alpine/latest-stable/main
+https://mirrors.ustc.edu.cn/alpine/latest-stable/community
+EOF
+            ;;
+        tuna)
+            alpine_backup_repos
+            cat > /etc/apk/repositories <<'EOF'
+https://mirrors.tuna.tsinghua.edu.cn/alpine/latest-stable/main
+https://mirrors.tuna.tsinghua.edu.cn/alpine/latest-stable/community
+EOF
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+    return 0
+}
+
+alpine_install_tools() {
+    echo -e "    ${DIM}Alpine: 更新源并安装工具...${NC}"
+    
+    # 先尝试默认源
+    if apk update 2>/dev/null && apk add --no-cache bind-tools curl iputils netcat-openbsd 2>/dev/null; then
+        return 0
+    fi
+    
+    echo -e "    ${ICON_WARN} 默认源失败，尝试切换镜像源..."
+    
+    # 尝试中科大源
+    if alpine_set_mirror "ustc" && apk update 2>/dev/null && apk add --no-cache bind-tools curl iputils netcat-openbsd 2>/dev/null; then
+        echo -e "    ${ICON_OK} 中科大源安装成功"
+        return 0
+    fi
+    
+    # 尝试清华源
+    if alpine_set_mirror "tuna" && apk update 2>/dev/null && apk add --no-cache bind-tools curl iputils netcat-openbsd 2>/dev/null; then
+        echo -e "    ${ICON_OK} 清华源安装成功"
+        return 0
+    fi
+    
+    # 尝试edge源
+    if alpine_set_mirror "edge" && apk update 2>/dev/null && apk add --no-cache bind-tools curl iputils netcat-openbsd 2>/dev/null; then
+        echo -e "    ${ICON_OK} Edge源安装成功"
+        return 0
+    fi
+    
+    # 恢复默认源
+    alpine_set_mirror "default"
+    return 1
+}
+
+#==================================================
+# Debian 源管理
+#==================================================
+debian_backup_sources() {
+    if [ -f /etc/apt/sources.list ] && [ ! -f /etc/apt/sources.list.bak ]; then
+        cp /etc/apt/sources.list /etc/apt/sources.list.bak 2>/dev/null
+    fi
+}
+
+debian_restore_sources() {
+    if [ -f /etc/apt/sources.list.bak ]; then
+        mv /etc/apt/sources.list.bak /etc/apt/sources.list 2>/dev/null
+    fi
+}
+
+debian_set_mirror() {
+    mirror="$1"
+    # 检测Debian版本
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release 2>/dev/null
+        CODENAME="${VERSION_CODENAME:-bookworm}"
+    else
+        CODENAME="bookworm"
+    fi
+    
+    case "$mirror" in
+        default)
+            debian_backup_sources
+            cat > /etc/apt/sources.list <<EOF
+deb https://deb.debian.org/debian ${CODENAME} main contrib non-free non-free-firmware
+deb https://deb.debian.org/debian ${CODENAME}-updates main contrib non-free non-free-firmware
+deb https://security.debian.org/debian-security ${CODENAME}-security main contrib non-free non-free-firmware
+EOF
+            ;;
+        ustc)
+            debian_backup_sources
+            cat > /etc/apt/sources.list <<EOF
+deb https://mirrors.ustc.edu.cn/debian ${CODENAME} main contrib non-free non-free-firmware
+deb https://mirrors.ustc.edu.cn/debian ${CODENAME}-updates main contrib non-free non-free-firmware
+deb https://mirrors.ustc.edu.cn/debian-security ${CODENAME}-security main contrib non-free non-free-firmware
+EOF
+            ;;
+        tuna)
+            debian_backup_sources
+            cat > /etc/apt/sources.list <<EOF
+deb https://mirrors.tuna.tsinghua.edu.cn/debian ${CODENAME} main contrib non-free non-free-firmware
+deb https://mirrors.tuna.tsinghua.edu.cn/debian ${CODENAME}-updates main contrib non-free non-free-firmware
+deb https://mirrors.tuna.tsinghua.edu.cn/debian-security ${CODENAME}-security main contrib non-free non-free-firmware
+EOF
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+    return 0
+}
+
+debian_install_tools() {
+    echo -e "    ${DIM}Debian: 更新源并安装工具...${NC}"
+    
+    # 先尝试默认源
+    if apt-get update -qq 2>/dev/null && apt-get install -y dnsutils curl iputils-ping netcat-openbsd 2>/dev/null; then
+        return 0
+    fi
+    
+    echo -e "    ${ICON_WARN} 默认源失败，尝试切换镜像源..."
+    
+    # 尝试中科大源
+    if debian_set_mirror "ustc" && apt-get update -qq 2>/dev/null && apt-get install -y dnsutils curl iputils-ping netcat-openbsd 2>/dev/null; then
+        echo -e "    ${ICON_OK} 中科大源安装成功"
+        return 0
+    fi
+    
+    # 尝试清华源
+    if debian_set_mirror "tuna" && apt-get update -qq 2>/dev/null && apt-get install -y dnsutils curl iputils-ping netcat-openbsd 2>/dev/null; then
+        echo -e "    ${ICON_OK} 清华源安装成功"
+        return 0
+    fi
+    
+    # 恢复默认源
+    debian_set_mirror "default"
+    return 1
+}
+
+#==================================================
+# 依赖安装主函数
+#==================================================
+install_dependencies() {
+    OS_TYPE=$(detect_os)
+    MISSING_TOOLS=""
+    
+    # 必需工具
+    for tool in nslookup curl ping; do
+        command -v "$tool" >/dev/null 2>&1 || MISSING_TOOLS="$MISSING_TOOLS $tool"
+    done
+    
+    # 可选工具
+    OPTIONAL_MISSING=""
+    for tool in nc dig host; do
+        command -v "$tool" >/dev/null 2>&1 || OPTIONAL_MISSING="$OPTIONAL_MISSING $tool"
+    done
+    
+    # 没有缺失
+    if [ -z "$MISSING_TOOLS" ] && [ -z "$OPTIONAL_MISSING" ]; then
+        check_pass "所有依赖已就绪"
+        return 0
+    fi
+    
+    echo ""
+    echo -e "  ${BOLD}依赖检查和安装${NC}"
+    
+    # 显示缺失
+    [ -n "$MISSING_TOOLS" ] && check_warn "缺少必需工具:${MISSING_TOOLS}"
+    [ -n "$OPTIONAL_MISSING" ] && check_info "缺少可选工具" "${OPTIONAL_MISSING}"
+    
+    # 检查root权限
+    if ! is_root; then
+        echo ""
+        echo -e "    ${ICON_WARN} 非root用户，无法安装依赖"
+        case "$OS_TYPE" in
+            alpine)
+                echo -e "    ${ICON_INFO} 请手动执行: ${CYAN}sudo apk add bind-tools curl iputils netcat-openbsd${NC}"
+                ;;
+            debian)
+                echo -e "    ${ICON_INFO} 请手动执行: ${CYAN}sudo apt-get install -y dnsutils curl iputils-ping netcat-openbsd${NC}"
+                ;;
+        esac
+        echo -e "    ${ICON_INFO} 换源方法: ${CYAN}sudo $0 --fix-source${NC}"
+        echo ""
+        return 1
+    fi
+    
+    echo ""
+    echo -e "  ${BOLD}包管理器安装 (支持自动换源)${NC}"
+    
+    case "$OS_TYPE" in
+        alpine)
+            if alpine_install_tools; then
+                echo -e "    ${ICON_OK} 依赖安装完成"
+            else
+                echo -e "    ${ICON_FAIL} 所有源安装失败"
+                echo -e "    ${ICON_INFO} 手动安装: ${CYAN}apk add bind-tools curl iputils netcat-openbsd${NC}"
+                return 1
+            fi
+            ;;
+        debian)
+            if debian_install_tools; then
+                echo -e "    ${ICON_OK} 依赖安装完成"
+            else
+                echo -e "    ${ICON_FAIL} 所有源安装失败"
+                echo -e "    ${ICON_INFO} 手动安装: ${CYAN}apt-get install -y dnsutils curl iputils-ping netcat-openbsd${NC}"
+                return 1
+            fi
+            ;;
+        *)
+            echo -e "    ${ICON_FAIL} 未知系统，无法自动安装"
+            return 1
+            ;;
+    esac
+    
+    # 验证安装
+    STILL_MISSING=""
+    for tool in nslookup curl ping; do
+        command -v "$tool" >/dev/null 2>&1 || STILL_MISSING="$STILL_MISSING $tool"
+    done
+    
+    if [ -z "$STILL_MISSING" ]; then
+        check_pass "所有必需依赖已就绪"
+    else
+        check_warn "仍有工具缺失:${STILL_MISSING}"
+    fi
+    
+    echo ""
+    return 0
+}
+
+#==================================================
+# 仅修复源 (--fix-source)
+#==================================================
+fix_source() {
+    OS_TYPE=$(detect_os)
+    
+    echo ""
+    echo -e "  ${BOLD}修复软件源${NC}"
+    
+    if ! is_root; then
+        echo -e "    ${ICON_FAIL} 需要root权限"
+        echo -e "    ${ICON_INFO} 请使用: ${CYAN}sudo $0 --fix-source${NC}"
+        return 1
+    fi
+    
+    case "$OS_TYPE" in
+        alpine)
+            echo -e "    ${DIM}尝试切换 Alpine 镜像源...${NC}"
+            
+            # 备份
+            alpine_backup_repos
+            
+            # 测试各镜像源
+            for mirror in default ustc tuna edge; do
+                alpine_set_mirror "$mirror"
+                echo -e "    ${DIM}测试: $mirror 源...${NC}"
+                if apk update 2>/dev/null; then
+                    echo -e "    ${ICON_OK} $mirror 源可用，已设置"
+                    return 0
+                fi
+            done
+            
+            # 恢复
+            alpine_restore_repos
+            echo -e "    ${ICON_FAIL} 所有源均不可用"
+            ;;
+        debian)
+            echo -e "    ${DIM}尝试切换 Debian 镜像源...${NC}"
+            
+            # 备份
+            debian_backup_sources
+            
+            # 测试各镜像源
+            for mirror in default ustc tuna; do
+                debian_set_mirror "$mirror"
+                echo -e "    ${DIM}测试: $mirror 源...${NC}"
+                if apt-get update -qq 2>/dev/null; then
+                    echo -e "    ${ICON_OK} $mirror 源可用，已设置"
+                    return 0
+                fi
+            done
+            
+            # 恢复
+            debian_restore_sources
+            echo -e "    ${ICON_FAIL} 所有源均不可用"
+            ;;
+        *)
+            echo -e "    ${ICON_FAIL} 未知系统"
+            ;;
+    esac
+    
+    return 1
+}
+
+#==================================================
+# DNS解析 (带重试)
 #==================================================
 dns_resolve() {
     domain="$1"; type="${2:-A}"
@@ -101,7 +410,6 @@ dns_resolve() {
                 ip = $NF
                 if (ip !~ /#/) { print ip; exit }
             }
-            # 某些nslookup输出用 "has AAAA address" 格式
             in_section && $0 ~ /has .* address/ {
                 ip = $NF
                 print ip; exit
@@ -110,7 +418,6 @@ dns_resolve() {
         return
     fi
     
-    # getent回退 (仅A记录)
     if [ "$type" = "A" ] && command -v getent >/dev/null 2>&1; then
         getent hosts "$domain" 2>/dev/null | awk '{print $1}' | head -1
         return
@@ -119,8 +426,23 @@ dns_resolve() {
     echo ""
 }
 
+dns_resolve_with_retry() {
+    domain="$1"; type="${2:-A}"; max_retries=2
+    
+    for i in $(seq 1 $max_retries); do
+        result=$(dns_resolve "$domain" "$type")
+        if [ -n "$result" ]; then
+            [ "$i" -gt 1 ] && RETRY_COUNT=$((RETRY_COUNT + 1))
+            echo "$result"
+            return 0
+        fi
+        [ "$i" -lt "$max_retries" ] && sleep 1
+    done
+    echo ""
+}
+
 #==================================================
-# IPv4提取
+# IP提取
 #==================================================
 extract_ipv4() {
     result="$1"
@@ -131,25 +453,14 @@ extract_ipv4() {
     echo "$result" | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | grep -vE "^(${ns_filter})$" | head -1
 }
 
-#==================================================
-# IPv6提取 (修复地址截断)
-#==================================================
 extract_ipv6() {
     result="$1"
-    # 完整IPv6: 最多8段，匹配压缩和非压缩格式
     echo "$result" | grep -Eo '([0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}' | while IFS= read -r ip; do
         [ -z "$ip" ] && continue
         [ ${#ip} -lt 7 ] && continue
-        # 过滤特殊地址
         case "$ip" in
             ::1|::|fe80:*|fc00:*|fd00:*|ff00:*) continue ;;
-            *)
-                # 补全被截断的地址: nslookup 可能输出 "2607:f8b0:4005:809"
-                # 实际应为 "2607:f8b0:4005:809::200e" 之类
-                # 如果地址段数<8且不以::结尾，尝试接受
-                echo "$ip"
-                return
-                ;;
+            *) echo "$ip"; return ;;
         esac
     done | head -1
 }
@@ -165,8 +476,15 @@ has_ipv6() {
     return 1
 }
 
+has_ipv6_internet() {
+    for dns in 2001:4860:4860::8888 2606:4700:4700::1111; do
+        ping -6 -c 1 -W 2 "$dns" >/dev/null 2>&1 && return 0
+    done
+    return 1
+}
+
 #==================================================
-# DoH 检测
+# DoH/DoT
 #==================================================
 check_doh() {
     domain="$1"; url="$2"
@@ -182,32 +500,17 @@ check_doh() {
     return 1
 }
 
-#==================================================
-# DoT 检测 (兼容Alpine busybox nc)
-#==================================================
 check_dot() {
     ip="$1"; port="${2:-853}"
     
     if command -v nc >/dev/null 2>&1; then
-        # GNU netcat
-        if timeout 3 nc -z -w 2 "$ip" "$port" 2>/dev/null; then
-            return 0
-        fi
-        # OpenBSD netcat (Alpine)
-        if timeout 3 sh -c "echo '' | nc -w 2 '$ip' '$port' >/dev/null 2>&1"; then
-            return 0
-        fi
-        # busybox nc
-        if timeout 3 sh -c "echo '' | nc '$ip' '$port' -w 2 >/dev/null 2>&1"; then
-            return 0
-        fi
+        timeout 3 nc -z -w 2 "$ip" "$port" 2>/dev/null && return 0
+        timeout 3 sh -c "echo '' | nc -w 2 '$ip' '$port' >/dev/null 2>&1" && return 0
+        timeout 3 sh -c "echo '' | nc '$ip' '$port' -w 2 >/dev/null 2>&1" && return 0
     fi
     return 1
 }
 
-#==================================================
-# 解析服务器列表 (空格分隔)
-#==================================================
 parse_servers() {
     list="$1"
     for item in $list; do
@@ -217,15 +520,19 @@ parse_servers() {
 }
 
 #==================================================
-# 第1部分: 系统环境
+# 检测模块
 #==================================================
+
 check_system() {
     print_section "系统环境"
     
-    if [ -f /etc/alpine-release ]; then
-        check_info "系统" "Alpine $(cat /etc/alpine-release)"
-    elif [ -f /etc/debian_version ]; then
-        check_info "系统" "Debian $(cat /etc/debian_version) ($(grep PRETTY_NAME /etc/os-release 2>/dev/null | cut -d'"' -f2))"
+    OS_TYPE=$(detect_os)
+    if [ "$OS_TYPE" = "alpine" ]; then
+        check_info "系统" "Alpine $(cat /etc/alpine-release 2>/dev/null)"
+    elif [ "$OS_TYPE" = "debian" ]; then
+        check_info "系统" "Debian $(cat /etc/debian_version 2>/dev/null) ($(grep PRETTY_NAME /etc/os-release 2>/dev/null | cut -d'"' -f2))"
+    else
+        check_info "系统" "$(uname -s) $(uname -r)"
     fi
     check_info "内核" "$(uname -r)"
     check_info "架构" "$(uname -m)"
@@ -238,12 +545,9 @@ check_system() {
         check_info "环境" "物理机/KVM"
     fi
     
-    check_deps
+    install_dependencies
 }
 
-#==================================================
-# 第2部分: DNS配置
-#==================================================
 check_dns_config() {
     print_section "DNS 配置"
     
@@ -274,9 +578,6 @@ check_dns_config() {
     fi
 }
 
-#==================================================
-# 第3部分: IPv4 DNS检测
-#==================================================
 check_ipv4_dns() {
     print_section "IPv4 DNS 检测"
     
@@ -287,20 +588,22 @@ check_ipv4_dns() {
     
     for domain in $IPV4_DOMAINS; do
         ipv4_total=$((ipv4_total + 1))
-        result=$(dns_resolve "$domain" "A")
+        result=$(dns_resolve_with_retry "$domain" "A")
         ip=$(extract_ipv4 "$result")
         
         if [ -n "$ip" ] && [ "$ip" != "127.0.0.1" ]; then
             ipv4_ok=$((ipv4_ok + 1))
             check_pass "$domain → $ip"
         else
-            check_fail "$domain 解析失败"
+            check_fail "$domain 解析失败" "检查DNS配置"
         fi
     done
     
     echo ""
     if [ "$ipv4_ok" -eq "$ipv4_total" ]; then
         check_pass "IPv4 DNS: ${ipv4_ok}/${ipv4_total} 全部成功"
+    elif [ "$ipv4_ok" -ge $((ipv4_total * 7 / 8)) ]; then
+        check_warn "IPv4 DNS: ${ipv4_ok}/${ipv4_total} (偶发失败)"
     elif [ "$ipv4_ok" -ge $((ipv4_total / 2)) ]; then
         check_warn "IPv4 DNS: ${ipv4_ok}/${ipv4_total} 部分成功"
     else
@@ -325,24 +628,17 @@ check_ipv4_dns() {
     done
 }
 
-#==================================================
-# 第4部分: DoH/DoT 检测 (修复重复执行)
-#==================================================
 check_encrypted_dns() {
     print_section "加密DNS检测 (DoH/DoT)"
     
-    # ── DoH ──
     print_sub "DoH (DNS over HTTPS)"
     
     if ! command -v curl >/dev/null 2>&1; then
         check_skip "curl未安装，跳过DoH检测"
     else
         doh_ok=0; doh_total=0
-        
-        # 使用 parse_servers 函数，避免重复执行
         parsed_list=$(parse_servers "$DOH_SERVERS")
         
-        # 使用 here-document 避免子shell
         while IFS='|' read -r name url; do
             [ -z "$name" ] && continue
             doh_total=$((doh_total + 1))
@@ -374,7 +670,6 @@ EOF
         fi
     fi
     
-    # ── DoT ──
     echo ""
     print_sub "DoT (DNS over TLS)"
     
@@ -382,7 +677,6 @@ EOF
         check_skip "nc未安装，跳过DoT检测"
     else
         dot_ok=0; dot_total=0
-        
         parsed_list=$(parse_servers "$DOT_SERVERS")
         
         while IFS='|' read -r name ip; do
@@ -412,9 +706,6 @@ EOF
     fi
 }
 
-#==================================================
-# 第5部分: IPv6 DNS检测
-#==================================================
 check_ipv6_dns() {
     print_section "IPv6 DNS 检测"
     
@@ -439,7 +730,6 @@ check_ipv6_dns() {
         fi
     fi
     
-    # AAAA记录
     IPV6_DOMAINS="google.com cloudflare.com he.net ipv6.google.com facebook.com ip6only.me"
     
     print_sub "AAAA记录解析"
@@ -447,7 +737,7 @@ check_ipv6_dns() {
     
     for domain in $IPV6_DOMAINS; do
         ipv6_total=$((ipv6_total + 1))
-        result=$(dns_resolve "$domain" "AAAA")
+        result=$(dns_resolve_with_retry "$domain" "AAAA")
         ip=$(extract_ipv6 "$result")
         
         if [ -n "$ip" ] && [ ${#ip} -gt 6 ]; then
@@ -459,18 +749,18 @@ check_ipv6_dns() {
     done
     
     echo ""
-    if [ "$ipv6_ok" -ge $((ipv6_total * 2 / 3)) ]; then
-        check_pass "IPv6 DNS: ${ipv6_ok}/${ipv6_total} 成功"
+    if [ "$ipv6_ok" -eq "$ipv6_total" ]; then
+        check_pass "IPv6 DNS: ${ipv6_ok}/${ipv6_total} 全部成功"
+    elif [ "$ipv6_ok" -ge $((ipv6_total * 2 / 3)) ]; then
+        check_pass "IPv6 DNS: ${ipv6_ok}/${ipv6_total} 基本可用"
     elif [ "$ipv6_ok" -gt 0 ]; then
         check_warn "IPv6 DNS: ${ipv6_ok}/${ipv6_total} 部分成功" "可能IPv6路由不完整"
     else
-        check_warn "IPv6 DNS: 全部失败" "IPv6 DNS解析不可用，检查IPv6网络"
+        check_warn "IPv6 DNS: 全部失败" "检查IPv6网络配置"
     fi
     
-    # IPv6 DNS连通性
     print_sub "IPv6 连通性"
     
-    # 本地IPv6 DNS
     ipv6_ns_found=0
     for ns in $(grep '^nameserver' /etc/resolv.conf 2>/dev/null | awk '{print $2}' | grep ':'); do
         ipv6_ns_found=1
@@ -482,19 +772,9 @@ check_ipv6_dns() {
     done
     [ "$ipv6_ns_found" -eq 0 ] && check_info "IPv6 DNS" "未配置IPv6 nameserver"
     
-    # 公网IPv6 DNS
-    ipv6_public_reachable=0
-    for public_dns6 in 2001:4860:4860::8888 2606:4700:4700::1111; do
-        if ping -6 -c 1 -W 2 "$public_dns6" >/dev/null 2>&1; then
-            ipv6_public_reachable=1
-            check_pass "公网DNS $public_dns6 可达"
-        else
-            check_warn "公网DNS $public_dns6 不可达"
-        fi
-    done
-    
-    # IPv6 HTTP (仅当公网IPv6可达时测试)
-    if [ "$ipv6_public_reachable" -eq 1 ]; then
+    if has_ipv6_internet; then
+        check_pass "公网IPv6可达"
+        
         print_sub "IPv6 HTTP 访问"
         if command -v curl >/dev/null 2>&1; then
             for url in "https://ipv6.google.com" "https://cloudflare.com"; do
@@ -510,13 +790,14 @@ check_ipv6_dns() {
             check_skip "curl未安装"
         fi
     else
-        check_info "IPv6 HTTP" "跳过 (公网IPv6不可达)"
+        if [ "$ipv6_ok" -gt 0 ]; then
+            check_info "公网IPv6" "不可达 (仅本地IPv6可用)"
+        else
+            check_warn "公网IPv6不可达" "IPv6功能受限"
+        fi
     fi
 }
 
-#==================================================
-# 第6部分: 最终报告
-#==================================================
 print_report() {
     print_section "检测报告"
     
@@ -525,6 +806,7 @@ print_report() {
     echo -e "  ${YELLOW}警告: $WARN${NC}"
     echo -e "  ${RED}失败: $FAIL${NC}"
     echo -e "  ${DIM}跳过: $SKIP${NC}"
+    [ "$RETRY_COUNT" -gt 0 ] && echo -e "  ${CYAN}重试成功: $RETRY_COUNT${NC}"
     echo -e "  ${BOLD}总计: $TOTAL${NC}"
     echo ""
     
@@ -555,6 +837,30 @@ print_report() {
 # 主函数
 #==================================================
 main() {
+    # 处理参数
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --fix-source)
+                fix_source
+                exit $?
+                ;;
+            -h|--help)
+                echo "用法: $0 [选项]"
+                echo ""
+                echo "选项:"
+                echo "  --fix-source    修复软件源 (自动选择可用镜像)"
+                echo "  -h, --help      显示帮助"
+                echo ""
+                echo "示例:"
+                echo "  $0                  # 检测DNS"
+                echo "  sudo $0 --fix-source # 修复源"
+                echo ""
+                exit 0
+                ;;
+        esac
+        shift
+    done
+    
     print_header
     check_system
     check_dns_config
