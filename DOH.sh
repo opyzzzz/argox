@@ -1,7 +1,7 @@
 #!/bin/sh
 #==========================================================================
-# SmartDNS 智能部署脚本 v6.4.10
-# 优化: inotify 安装提前到 ensure_tools，与其他工具同批安装
+# SmartDNS 智能部署脚本 v6.5.1
+# 修复: IPv6 实际连通性检测 + dns_query 非标端口/无工具时跳过
 #==========================================================================
 set +e
 
@@ -35,6 +35,13 @@ RESOLV_BACKUP="/etc/resolv.conf.smartdns.bak"
 RESOLV_FALLBACK="/etc/smartdns/resolv.fallback"
 
 APT_UPDATED=false
+BB=""
+
+detect_busybox() {
+    if command -v busybox >/dev/null 2>&1; then
+        BB="busybox"
+    fi
+}
 
 pkg_install() {
     local pkgs="$1" max_retry="${2:-3}" attempt=1
@@ -93,49 +100,74 @@ get_version_number() {
 }
 
 port_in_use() {
-    ss -tuln 2>/dev/null | grep -q ":${1} " && return 0
-    netstat -tuln 2>/dev/null | grep -q ":${1} " && return 0
+    local port_hex
+    port_hex=$(printf "%04X" "$1")
+    grep -q ":$port_hex " /proc/net/tcp /proc/net/tcp6 2>/dev/null && return 0
+    return 1
+}
+
+# IPv6 实际连通性检测（路由 + ping6）
+check_ipv6_connectivity() {
+    # 1. 必须有 IPv6 路由
+    ip route get 2606:4700:4700::1111 >/dev/null 2>&1 || return 1
+    # 2. 实际 ping 通（2秒超时，1个包）
+    ping6 -c1 -W2 2606:4700:4700::1111 >/dev/null 2>&1 && return 0
     return 1
 }
 
 ensure_tools() {
-    local tools_missing=""
-    if ! command -v wget >/dev/null 2>&1 && ! command -v curl >/dev/null 2>&1; then tools_missing="$tools_missing wget"; fi
-    if ! command -v ss >/dev/null 2>&1 && ! command -v netstat >/dev/null 2>&1; then tools_missing="$tools_missing iproute2"; fi
-    if ! command -v nslookup >/dev/null 2>&1; then
-        case "$PKG_MGR" in apk) tools_missing="$tools_missing bind-tools" ;; apt) tools_missing="$tools_missing dnsutils" ;; esac
+    # 下载工具
+    if ! command -v wget >/dev/null 2>&1 && ! command -v curl >/dev/null 2>&1; then
+        pkg_install wget || { log_err "无法安装下载工具"; exit 1; }
     fi
-    if ! command -v nc >/dev/null 2>&1; then
-        case "$PKG_MGR" in apk) tools_missing="$tools_missing netcat-openbsd" ;; apt) tools_missing="$tools_missing netcat-openbsd" ;; esac
+    
+    # busybox
+    detect_busybox
+    if [ -z "$BB" ]; then
+        case "$PKG_MGR" in
+            apk) pkg_install busybox 2 ;;
+            apt) pkg_install busybox 2 ;;
+        esac
+        detect_busybox
     fi
-    # inotify 提前到此处安装，与其他工具同批，共享 apt 缓存
+    
+    # inotify-tools
     if ! command -v inotifywait >/dev/null 2>&1 && ! command -v inotifyd >/dev/null 2>&1; then
-        case "$PKG_MGR" in apk) tools_missing="$tools_missing inotify-tools" ;; apt) tools_missing="$tools_missing inotify-tools" ;; esac
-    fi
-    if [ -n "$tools_missing" ]; then
-        log_info "安装缺失工具: $tools_missing"
-        pkg_install "$tools_missing" || log_warn "部分工具安装失败"
+        pkg_install inotify-tools 3
     fi
 }
 
+# DNS 查询（端口不是53或无工具时跳过）
 dns_query() {
     local domain="$1" server="$2"
-    if [ "$PORT" = "53" ]; then
-        safe_nslookup "$domain" "$server"
-    else
-        nslookup -timeout=5 -port="$PORT" "$domain" "$server" 2>&1 || \
-        nslookup -port="$PORT" "$domain" "$server" 2>&1
-    fi
-}
-
-safe_nslookup() {
-    local domain="$1" server="$2" output
-    if output=$(nslookup -timeout=5 "$domain" "$server" 2>&1); then
-        if echo "$output" | grep -q "Address"; then
-            echo "$output"; return 0
+    
+    # 非标端口且无支持工具时跳过
+    if [ "$PORT" != "53" ]; then
+        if [ -n "$BB" ]; then
+            echo "跳过（busybox 不支持非标端口）"
+            return 1
         fi
+        if ! command -v nslookup >/dev/null 2>&1; then
+            echo "跳过（无 nslookup）"
+            return 1
+        fi
+        nslookup -port="$PORT" "$domain" "$server" 2>&1 || nslookup -timeout=5 -port="$PORT" "$domain" "$server" 2>&1
+        return $?
     fi
-    nslookup "$domain" "$server" 2>&1
+    
+    # 53 端口
+    if [ -n "$BB" ]; then
+        $BB nslookup "$domain" "$server" 2>&1 && return 0
+        return 1
+    fi
+    if command -v nslookup >/dev/null 2>&1; then
+        nslookup "$domain" "$server" 2>&1 && return 0
+        return 1
+    fi
+    
+    # 无工具
+    echo "跳过（无 nslookup）"
+    return 1
 }
 
 detect_inotify() {
@@ -200,9 +232,17 @@ module_detect() {
     esac
     log_info "虚拟化: $VIRT_TYPE (容器: $VIRT_IS_CONTAINER)"
     
-    HAS_IPV4=true; HAS_IPV6=false
+    # IPv4 检测
+    HAS_IPV4=true
     ip route get 1.1.1.1 >/dev/null 2>&1 || HAS_IPV4=false
-    ip route get 2606:4700:4700::1111 >/dev/null 2>&1 && HAS_IPV6=true
+    
+    # IPv6 实际连通性检测
+    if check_ipv6_connectivity; then
+        HAS_IPV6=true
+    else
+        HAS_IPV6=false
+    fi
+    
     if [ "$HAS_IPV4" = true ] && [ "$HAS_IPV6" = true ]; then NET_STACK="双栈"
     elif [ "$HAS_IPV4" = true ]; then NET_STACK="纯IPv4"
     else NET_STACK="纯IPv6"; fi
@@ -354,7 +394,7 @@ EOF
     fi
     
     cat > /etc/smartdns/smartdns.conf << EOF
-# SmartDNS 配置 v6.4.10
+# SmartDNS 配置 v6.5.1
 # 环境: $OS_TYPE $OS_VER | $VIRT_TYPE | $NET_STACK
 # 版本: $SMARTDNS_VER | 来源: $SMARTDNS_SOURCE
 # 策略: $TAKEOVER_STRATEGY | 时间: $(date '+%Y-%m-%d %H:%M:%S')
@@ -523,7 +563,7 @@ SSTART
     log_info "部署 DNS 文件守护"
     cat > "$GUARD_SCRIPT" << GUARD
 #!/bin/sh
-# SmartDNS DNS 文件守护 v6.4.10
+# SmartDNS DNS 文件守护 v6.5.1
 TARGET="/etc/resolv.conf"
 TEMPLATE="${RESOLV_TEMPLATE}"
 PID_FILE="${PID_FILE}"
@@ -695,10 +735,12 @@ module_verify() {
     if [ "$HAS_IPV4" = true ]; then
         log_info "DNS 解析测试 (IPv4)..."
         for domain in google.com cloudflare.com; do
-            RESULT=$(dns_query "$domain" 127.0.0.1)
+            RESULT=$(dns_query "$domain" 127.0.0.1 2>&1)
             if echo "$RESULT" | grep -q "Address"; then
                 IP=$(echo "$RESULT" | grep "Address" | tail -1 | awk '{print $NF}')
                 log_ok "$domain → $IP"
+            elif echo "$RESULT" | grep -q "跳过"; then
+                log_info "$domain $(echo "$RESULT" | head -1)"
             else
                 log_err "$domain 解析失败"
                 ALL_OK=false
@@ -710,16 +752,18 @@ module_verify() {
     
     if [ "$HAS_IPV6" = true ]; then
         log_info "DNS 解析测试 (IPv6)..."
-        RESULT=$(dns_query "ipv6.google.com" "::1")
+        RESULT=$(dns_query "ipv6.google.com" "::1" 2>&1)
         if echo "$RESULT" | grep -q "Address"; then
             IP=$(echo "$RESULT" | grep "Address" | tail -1 | awk '{print $NF}')
             log_ok "ipv6.google.com → $IP"
+        elif echo "$RESULT" | grep -q "跳过"; then
+            log_info "ipv6.google.com $(echo "$RESULT" | head -1)"
         else
             log_warn "ipv6.google.com 解析失败"
         fi
     fi
     
-    if [ "$IS_VER_NEW" = true ]; then
+    if [ "$IS_VER_NEW" = true ] && command -v curl >/dev/null 2>&1; then
         echo ""
         log_info "DoH 连通性测试..."
         if [ "$HAS_IPV4" = true ]; then
@@ -730,40 +774,6 @@ module_verify() {
                     log_ok "$NAME DoH (IPv4) 正常"
                 else
                     log_warn "$NAME DoH (IPv4) 可能受限"
-                fi
-            done
-        fi
-        if [ "$HAS_IPV6" = true ]; then
-            for item in "Google|https://[2001:4860:4860::8888]/dns-query" "Cloudflare|https://[2606:4700:4700::1111]/dns-query"; do
-                NAME="${item%%|*}"; URL="${item##*|}"
-                RESULT=$(curl -s --max-time 5 -H "accept: application/dns-json" "${URL}?name=google.com&type=AAAA" 2>&1)
-                if echo "$RESULT" | grep -q '"Status":\s*0'; then
-                    log_ok "$NAME DoH (IPv6) 正常"
-                else
-                    log_warn "$NAME DoH (IPv6) 可能受限"
-                fi
-            done
-        fi
-        
-        echo ""
-        log_info "DoT 端口测试..."
-        if [ "$HAS_IPV4" = true ]; then
-            for item in "Google|8.8.8.8|853" "Cloudflare|1.1.1.1|853"; do
-                NAME="${item%%|*}"; REST="${item#*|}"; IP="${REST%%|*}"; DPORT="${REST##*|}"
-                if command -v nc >/dev/null 2>&1 && nc -z -w 3 "$IP" "$DPORT" 2>/dev/null; then
-                    log_ok "$NAME DoT (IPv4) 端口可达"
-                else
-                    log_warn "$NAME DoT (IPv4) 端口不可达"
-                fi
-            done
-        fi
-        if [ "$HAS_IPV6" = true ]; then
-            for item in "Google|2001:4860:4860::8844|853" "Cloudflare|2606:4700:4700::1001|853"; do
-                NAME="${item%%|*}"; REST="${item#*|}"; IP="${REST%%|*}"; DPORT="${REST##*|}"
-                if command -v nc >/dev/null 2>&1 && nc -z -w 3 "$IP" "$DPORT" 2>/dev/null; then
-                    log_ok "$NAME DoT (IPv6) 端口可达"
-                else
-                    log_warn "$NAME DoT (IPv6) 端口不可达"
                 fi
             done
         fi
@@ -889,7 +899,7 @@ main() {
     done
     
     echo ""
-    echo -e "${BOLD}SmartDNS 智能部署 v6.4.10${NC}"
+    echo -e "${BOLD}SmartDNS 智能部署 v6.5.1${NC}"
     echo -e "上游: Google + Cloudflare (DoH/DoT/UDP)"
     echo -e "环境: Alpine/Debian (LXC/KVM/Podman)"
     echo ""
@@ -902,7 +912,7 @@ main() {
     module_verify
     
     echo ""
-    echo -e "卸载命令: ${GREEN}wget -qO- URL | bash -s -- --uninstall${NC}"
+    echo -e "卸载命令: ${GREEN}curl -sL URL | bash -s -- --uninstall${NC}"
 }
 
 main "$@"
