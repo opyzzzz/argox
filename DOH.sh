@@ -1,7 +1,7 @@
 #!/bin/sh
 #==========================================================================
-# SmartDNS 智能部署脚本 v7.2.4
-# 修复systemd unit 文件格式错误
+# SmartDNS 智能部署脚本 v7.3.0
+# 守护改名: resolv-guard，彻底避免 pkill 误杀
 #==========================================================================
 set +e
 
@@ -27,8 +27,8 @@ TMPFILES_HAS_RESOLV=false
 DEPLOY_LOG="/var/log/smartdns-deploy.log"
 ARCH=""; PKG_MGR=""
 INOTIFY_CMD=""; INOTIFY_ARGS=""
-PID_FILE="/var/run/smartdns-dns-guard.pid"
-GUARD_SCRIPT="/usr/local/bin/smartdns-dns-guard.sh"
+PID_FILE="/var/run/resolv-guard.pid"
+GUARD_SCRIPT="/usr/local/bin/resolv-guard.sh"
 SDNS_CMD="/usr/local/bin/sdns"
 
 RESOLV_TEMPLATE="/etc/smartdns/resolv.smartdns"
@@ -244,7 +244,7 @@ EOF
     else log_ok "端口 53 可用"; fi
     
     cat > /etc/smartdns/smartdns.conf << EOF
-# SmartDNS 配置 v7.2.4
+# SmartDNS 配置 v7.3.0
 # 环境: $OS_TYPE $OS_VER | $VIRT_TYPE | $NET_STACK
 # 版本: $SMARTDNS_VER | 来源: $SMARTDNS_SOURCE
 # 策略: $TAKEOVER_STRATEGY | 时间: $(date '+%Y-%m-%d %H:%M:%S')
@@ -343,18 +343,18 @@ module_dns_takeover() {
     
     if [ "$INIT_TYPE" = "openrc" ]; then
         log_info "创建 Alpine 启动覆盖脚本"; mkdir -p /etc/local.d
-        cat > /etc/local.d/smartdns-dns.start << LSTART
+        cat > /etc/local.d/resolv-fix.start << LSTART
 #!/bin/sh
 sleep 5
 for i in 1 2 3 4 5; do if cmp -s ${RESOLV_TEMPLATE} /etc/resolv.conf 2>/dev/null; then exit 0; fi; sleep 1; done
 cat ${RESOLV_TEMPLATE} > /etc/resolv.conf
 LSTART
-        chmod +x /etc/local.d/smartdns-dns.start; safe_rc_add local default; log_ok "local.d 启动脚本已创建"
+        chmod +x /etc/local.d/resolv-fix.start; safe_rc_add local default; log_ok "local.d 启动脚本已创建"
     elif [ "$INIT_TYPE" = "systemd" ]; then
         log_info "创建 systemd oneshot 启动覆盖"
-        cat > /etc/systemd/system/smartdns-dns-fix.service << SSTART
+        cat > /etc/systemd/system/resolv-fix.service << SSTART
 [Unit]
-Description=SmartDNS DNS Fix
+Description=DNS Resolv Fix
 After=network-online.target cloud-init.service systemd-resolved.service
 Wants=network-online.target
 [Service]
@@ -363,7 +363,7 @@ ExecStart=/bin/sh -c 'sleep 5; for i in 1 2 3 4 5; do cmp -s ${RESOLV_TEMPLATE} 
 [Install]
 WantedBy=multi-user.target
 SSTART
-        systemctl daemon-reload 2>/dev/null; systemctl enable smartdns-dns-fix.service 2>/dev/null; log_ok "systemd oneshot 服务已创建"
+        systemctl daemon-reload 2>/dev/null; systemctl enable resolv-fix.service 2>/dev/null; log_ok "systemd oneshot 服务已创建"
     fi
     
     log_info "部署 DNS 文件守护"
@@ -380,32 +380,30 @@ TARGET="/etc/resolv.conf"; TEMPLATE="${RESOLV_TEMPLATE}"; PID_FILE="${PID_FILE}"
 GUARD
     chmod 700 "$GUARD_SCRIPT"
     [ -f "$PID_FILE" ] && { OLD_PID=$(cat "$PID_FILE" 2>/dev/null); [ -n "$OLD_PID" ] && kill "$OLD_PID" 2>/dev/null; rm -f "$PID_FILE"; }
-    pkill -f "^/usr/local/bin/smartdns-dns-guard\.sh" 2>/dev/null; sleep 0.5
+    pkill -f "^/usr/local/bin/resolv-guard\.sh" 2>/dev/null; sleep 0.5
     
     if [ "$INIT_TYPE" = "systemd" ]; then
-        cat > /etc/systemd/system/smartdns-dns-guard.service << 'GSTART'
+        cat > /etc/systemd/system/resolv-guard.service << 'GSTART'
 [Unit]
-Description=SmartDNS DNS Guard
-After=smartdns.service smartdns-dns-fix.service
+Description=DNS Resolv Guard
+After=smartdns.service resolv-fix.service
 Requires=smartdns.service
-
 [Service]
 Type=forking
-ExecStart=/usr/local/bin/smartdns-dns-guard.sh
-PIDFile=/var/run/smartdns-dns-guard.pid
+ExecStart=/usr/local/bin/resolv-guard.sh
+PIDFile=/var/run/resolv-guard.pid
 Restart=always
 RestartSec=3
-
 [Install]
 WantedBy=multi-user.target
 GSTART
-        systemctl daemon-reload 2>/dev/null; systemctl enable smartdns-dns-guard.service 2>/dev/null; systemctl start smartdns-dns-guard.service 2>/dev/null
+        systemctl daemon-reload 2>/dev/null; systemctl enable resolv-guard.service 2>/dev/null; systemctl start resolv-guard.service 2>/dev/null
     elif [ "$INIT_TYPE" = "openrc" ]; then
-        mkdir -p /etc/local.d; cat > /etc/local.d/smartdns-guard.start << 'OGSTART'
+        mkdir -p /etc/local.d; cat > /etc/local.d/resolv-guard.start << 'OGSTART'
 #!/bin/sh
-/usr/local/bin/smartdns-dns-guard.sh
+/usr/local/bin/resolv-guard.sh
 OGSTART
-        chmod +x /etc/local.d/smartdns-guard.start; "$GUARD_SCRIPT"; safe_rc_add local default
+        chmod +x /etc/local.d/resolv-guard.start; "$GUARD_SCRIPT"; safe_rc_add local default
     else "$GUARD_SCRIPT"; fi
     
     log_ok "DNS 守护已部署 (工具: ${INOTIFY_CMD:-轮询})"; log_ok "系统 DNS → $(head -1 "$RESOLV_TEMPLATE")"
@@ -424,7 +422,6 @@ module_service() {
 Description=SmartDNS (DoH+DoT+UDP)
 After=network-online.target
 Wants=network-online.target
-
 [Service]
 Type=forking
 ExecStart=/usr/bin/smartdns -c /etc/smartdns/smartdns.conf
@@ -433,7 +430,6 @@ ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=3
 WatchdogSec=30
-
 [Install]
 WantedBy=multi-user.target
 SVC
@@ -507,17 +503,19 @@ module_uninstall() {
     echo ""; echo -e "${YELLOW}卸载 SmartDNS...${NC}"
     [ -z "$INIT_TYPE" ] && { if [ -d /run/systemd/system ]; then INIT_TYPE="systemd"; elif [ -f /sbin/openrc ]; then INIT_TYPE="openrc"; else INIT_TYPE="none"; fi; }
     [ -f "$PID_FILE" ] && { GUARD_PID=$(cat "$PID_FILE" 2>/dev/null); [ -n "$GUARD_PID" ] && kill "$GUARD_PID" 2>/dev/null; rm -f "$PID_FILE"; }
-    pkill -f "^/usr/local/bin/smartdns-dns-guard\.sh" 2>/dev/null
+    pkill -f "^/usr/local/bin/resolv-guard\.sh" 2>/dev/null
     
     case "$INIT_TYPE" in
         systemd)
-            systemctl stop smartdns.service smartdns-dns-guard.service smartdns-dns-fix.service 2>/dev/null
-            systemctl disable smartdns.service smartdns-dns-guard.service smartdns-dns-fix.service 2>/dev/null
-            rm -f /etc/systemd/system/smartdns.service /etc/systemd/system/smartdns-dns-guard.service /etc/systemd/system/smartdns-dns-fix.service
+            systemctl stop smartdns.service resolv-guard.service resolv-fix.service 2>/dev/null
+            systemctl disable smartdns.service resolv-guard.service resolv-fix.service 2>/dev/null
+            rm -f /etc/systemd/system/smartdns.service /etc/systemd/system/resolv-guard.service /etc/systemd/system/resolv-fix.service
             systemctl daemon-reload 2>/dev/null
             systemctl is-enabled systemd-resolved 2>/dev/null | grep -q "masked" && systemctl unmask systemd-resolved 2>/dev/null
             if ! systemctl is-active systemd-resolved >/dev/null 2>&1; then systemctl enable systemd-resolved 2>/dev/null; systemctl start systemd-resolved 2>/dev/null; fi ;;
-        openrc) rc-service smartdns stop 2>/dev/null; rc-update del smartdns 2>/dev/null; rm -f /etc/init.d/smartdns /etc/local.d/smartdns-dns.start /etc/local.d/smartdns-guard.start ;;
+        openrc)
+            rc-service smartdns stop 2>/dev/null; rc-update del smartdns 2>/dev/null
+            rm -f /etc/init.d/smartdns /etc/local.d/resolv-fix.start /etc/local.d/resolv-guard.start ;;
     esac
     pkill -x smartdns 2>/dev/null; sleep 1
     
@@ -542,7 +540,7 @@ EOF
 }
 
 #==================================================
-# 模块7: 竖排菜单 (v7.2.4 精简)
+# 模块7: 竖排菜单 (v7.3.0)
 #==================================================
 install_shortcut() {
     local script_path=$(readlink -f "$0" 2>/dev/null || echo "$0")
@@ -553,7 +551,7 @@ hr() { printf "%${COLS}s\n" | tr ' ' '━'; }
 
 get_dots() {
     pgrep smartdns >/dev/null 2>&1 && S="${GREEN}●${NC}" || S="${RED}●${NC}"
-    pgrep -f smartdns-dns-guard >/dev/null 2>&1 && G="${GREEN}●${NC}" || G="${RED}●${NC}"
+    pgrep -f resolv-guard >/dev/null 2>&1 && G="${GREEN}●${NC}" || G="${RED}●${NC}"
     DNS=$(grep "^nameserver" /etc/resolv.conf 2>/dev/null | awk '{print $2}' | head -1); [ -z "$DNS" ] && DNS="未配置"
     UP=""; for ip in 8.8.8.8 1.1.1.1; do nc -z -w1 "$ip" 53 2>/dev/null && UP="$UP ${GREEN}●${NC}" || UP="$UP ${RED}●${NC}"; done
 }
@@ -651,7 +649,7 @@ main() {
     fi
     for arg in "$@"; do case "$arg" in --uninstall|-u) module_uninstall; exit 0 ;; esac; done
     
-    echo ""; echo -e "${BOLD}SmartDNS 智能部署 v7.2.4${NC}"; echo -e "上游: Google + Cloudflare (DoH/DoT/UDP)"; echo -e "环境: Alpine/Debian (LXC/KVM/Podman)"; echo ""
+    echo ""; echo -e "${BOLD}SmartDNS 智能部署 v7.3.0${NC}"; echo -e "上游: Google + Cloudflare (DoH/DoT/UDP)"; echo -e "环境: Alpine/Debian (LXC/KVM/Podman)"; echo ""
     module_detect; module_install; module_config; module_dns_takeover; module_service; module_verify
     echo ""; echo -e "管理命令: ${GREEN}sdns${NC}"; echo -e "  sdns t  测试  sdns l  日志  sdns c  配置  sdns u  更新"; echo -e "  sdns    菜单"
     module_menu
