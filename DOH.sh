@@ -622,7 +622,7 @@ show_menu() {
     echo -e "${BOLD}  SmartDNS 管理${NC}"; hr
     echo -e "  DNS:${S} 守护:${G}  ${DNS}"
     echo -e "  上游:${UP}"; hr
-    echo "  1. DNS 测试      2. 查看日志"
+    echo "  1. DNS测试      2. 查看日志"
     echo "  3. 查看配置      4. 编辑配置"
     echo "  5. 重启服务      6. 清除缓存"
     echo "  7. 检查更新      8. 卸载"
