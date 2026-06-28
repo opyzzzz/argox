@@ -17,6 +17,7 @@ log_step()  { printf "\n%b>>> %s%b\n" "$BOLD$BLUE" "$1" "$NC"; }
 [ "$(id -u)" -ne 0 ] && { log_err "需要 root 权限"; exit 1; }
 
 SMARTDNS_BIN=""; SMARTDNS_VER=""; SMARTDNS_VER_NUM=0; SMARTDNS_SOURCE=""
+STABLE_VER="${STABLE_VER:-Release47.1}"
 IS_VER_NEW=false; PORT=53
 OS_TYPE=""; OS_VER=""; INIT_TYPE=""; VIRT_TYPE=""; VIRT_IS_CONTAINER=false
 NET_STACK=""; HAS_IPV4=true; HAS_IPV6=false
@@ -177,20 +178,39 @@ module_detect() {
 }
 
 #==================================================
-# 模块1: 安装 SmartDNS
+# 模块1: 安装 SmartDNS (v7.5.3)
 #==================================================
 module_install() {
     log_step "模块1: 安装 SmartDNS"
-    GITHUB_URL="https://github.com/pymumu/smartdns/releases/latest/download/smartdns-${ARCH}"
+    STABLE_URL="https://github.com/pymumu/smartdns/releases/download/${STABLE_VER}/smartdns-${ARCH}"
+    LATEST_URL="https://github.com/pymumu/smartdns/releases/latest/download/smartdns-${ARCH}"
     TEMP_BIN="/tmp/smartdns-$$"
-    log_info "尝试 GitHub 最新版..."
-    if github_download "$GITHUB_URL" "$TEMP_BIN"; then chmod +x "$TEMP_BIN"; mv "$TEMP_BIN" /usr/bin/smartdns; SMARTDNS_BIN="/usr/bin/smartdns"; SMARTDNS_SOURCE="GitHub"; log_ok "GitHub 最新版安装成功"; fi
+    
+    log_info "安装稳定版: ${STABLE_VER}"
+    if github_download "$STABLE_URL" "$TEMP_BIN"; then
+        chmod +x "$TEMP_BIN"; mv "$TEMP_BIN" /usr/bin/smartdns
+        SMARTDNS_BIN="/usr/bin/smartdns"; SMARTDNS_SOURCE="GitHub"
+        log_ok "稳定版安装成功"
+    else
+        log_warn "稳定版下载失败，尝试最新版..."
+        if github_download "$LATEST_URL" "$TEMP_BIN"; then
+            chmod +x "$TEMP_BIN"; mv "$TEMP_BIN" /usr/bin/smartdns
+            SMARTDNS_BIN="/usr/bin/smartdns"; SMARTDNS_SOURCE="GitHub"
+            log_ok "最新版安装成功"
+        fi
+    fi
     rm -f "$TEMP_BIN"
+    
     if [ -z "$SMARTDNS_BIN" ]; then
         log_warn "GitHub 下载失败，尝试包管理器..."
-        if pkg_install smartdns 3; then SMARTDNS_BIN="/usr/sbin/smartdns"; [ -x "$SMARTDNS_BIN" ] || SMARTDNS_BIN="/usr/bin/smartdns"; [ -x "$SMARTDNS_BIN" ] || SMARTDNS_BIN=$(which smartdns 2>/dev/null); [ -n "$SMARTDNS_BIN" ] && SMARTDNS_SOURCE="$PKG_MGR" && log_ok "包管理器安装成功"; fi
+        if pkg_install smartdns 3; then
+            SMARTDNS_BIN="/usr/sbin/smartdns"; [ -x "$SMARTDNS_BIN" ] || SMARTDNS_BIN="/usr/bin/smartdns"
+            [ -x "$SMARTDNS_BIN" ] || SMARTDNS_BIN=$(which smartdns 2>/dev/null)
+            [ -n "$SMARTDNS_BIN" ] && SMARTDNS_SOURCE="$PKG_MGR" && log_ok "包管理器安装成功"
+        fi
     fi
     if [ -z "$SMARTDNS_BIN" ] || [ ! -x "$SMARTDNS_BIN" ]; then log_err "所有安装方式均失败"; exit 1; fi
+    
     SMARTDNS_VER=$("$SMARTDNS_BIN" -v 2>&1 | head -1); SMARTDNS_VER_NUM=$(get_version_number "$SMARTDNS_BIN")
     [ "$SMARTDNS_VER_NUM" -ge 42 ] 2>/dev/null && IS_VER_NEW=true || IS_VER_NEW=false
     log_info "版本: $SMARTDNS_VER (来源: $SMARTDNS_SOURCE)"
@@ -416,11 +436,13 @@ OGSTART
 }
 
 #==================================================
-# 模块4: 服务与守护
+# 模块4: 服务与守护 (v7.5.3)
 #==================================================
 module_service() {
     log_step "模块4: 部署 SmartDNS 服务"
-    pkill -x smartdns 2>/dev/null; sleep 1; echo "" > /var/log/smartdns.log 2>/dev/null
+    pkill -x smartdns 2>/dev/null; sleep 1
+    rm -rf /var/cache/smartdns/     # 清缓存，防止跨环境崩溃
+    echo "" > /var/log/smartdns.log 2>/dev/null
     case "$INIT_TYPE" in
         systemd)
             cat > /etc/systemd/system/smartdns.service << 'SVC'
