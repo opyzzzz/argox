@@ -1,6 +1,6 @@
 #!/bin/sh
 #==========================================================================
-# SmartDNS 智能部署脚本 v7.5.0
+# SmartDNS 智能部署脚本 v7.5.1
 # 守护改名: resolv-guard，彻底避免 pkill 误杀
 #==========================================================================
 set +e
@@ -244,7 +244,7 @@ EOF
     else log_ok "端口 53 可用"; fi
     
     cat > /etc/smartdns/smartdns.conf << EOF
-# SmartDNS 配置 v7.5.0
+# SmartDNS 配置 v7.5.1
 # 环境: $OS_TYPE $OS_VER | $VIRT_TYPE | $NET_STACK
 # 版本: $SMARTDNS_VER | 来源: $SMARTDNS_SOURCE
 # 策略: $TAKEOVER_STRATEGY | 时间: $(date '+%Y-%m-%d %H:%M:%S')
@@ -321,7 +321,7 @@ EOF
 }
 
 #==================================================
-# 模块3: 接管系统 DNS (v7.5.0)
+# 模块3: 接管系统 DNS (v7.5.1)
 #==================================================
 module_dns_takeover() {
     log_step "模块3: 接管系统 DNS (策略: $TAKEOVER_STRATEGY)"
@@ -380,12 +380,12 @@ TARGET="/etc/resolv.conf"; TEMPLATE="${RESOLV_TEMPLATE}"; PID_FILE="${PID_FILE}"
   if command -v inotifywait >/dev/null 2>&1; then while true; do inotifywait -m -e modify,close_write "\$TARGET" 2>/dev/null | while read -r path event file; do sleep 0.5; restore_dns; done; sleep 1; done
   elif command -v inotifyd >/dev/null 2>&1; then while true; do inotifyd - "\$TARGET" 2>/dev/null | while read -r event file; do case "\$event" in w|m|c) sleep 0.5; restore_dns ;; esac; done; sleep 1; done
   else while true; do sleep 5; restore_dns; done; fi
-) & disown; exit 0
+) & exit 0
 GUARD
     chmod 700 "$GUARD_SCRIPT"
     
-    # 清理旧守护残留
-    pkill -f resolv-guard 2>/dev/null
+    # 清理旧守护残留（Alpine ash 兼容，不依赖 disown）
+    pkill -f "resolv-guard\.sh" 2>/dev/null
     [ -f "$PID_FILE" ] && { OLD_PID=$(cat "$PID_FILE" 2>/dev/null); [ -n "$OLD_PID" ] && kill "$OLD_PID" 2>/dev/null; rm -f "$PID_FILE"; }
     sleep 0.5
     
@@ -504,7 +504,7 @@ module_verify() {
 }
 
 #==================================================
-# 模块6: 卸载 (v7.5.0)
+# 模块6: 卸载 (v7.5.1)
 #==================================================
 module_uninstall() {
     echo ""; echo -e "${YELLOW}══════════════════════════════════════${NC}"
@@ -551,10 +551,10 @@ module_uninstall() {
         rm -f "$PID_FILE"
     fi
     
-    # 4. 路径前缀兜底清理守护残留
-    pkill -f "^/usr/local/bin/resolv-guard\.sh" 2>/dev/null
+    # 4. 模糊匹配兜底清理守护残留（兼容 Alpine ash，进程名不含完整路径）
+    pkill -f "resolv-guard\.sh" 2>/dev/null
     sleep 0.3
-    pkill -9 -f "^/usr/local/bin/resolv-guard\.sh" 2>/dev/null
+    pkill -9 -f "resolv-guard\.sh" 2>/dev/null
     
     # 5. 清理 smartdns
     pkill -x smartdns 2>/dev/null
@@ -593,7 +593,7 @@ EOF
     echo -e "${BOLD}  清理报告:${NC}"
     local clean=true
     pgrep smartdns >/dev/null 2>&1 && { echo -e "    ${RED}⚠ SmartDNS 进程残留${NC}"; clean=false; }
-    pgrep -f resolv-guard >/dev/null 2>&1 && { echo -e "    ${RED}⚠ 守护进程残留${NC}"; clean=false; }
+    pgrep -f "resolv-guard" >/dev/null 2>&1 && { echo -e "    ${RED}⚠ 守护进程残留${NC}"; clean=false; }
     [ -f /usr/bin/smartdns ] && { echo -e "    ${RED}⚠ 二进制文件残留${NC}"; clean=false; }
     [ -d /etc/smartdns ] && { echo -e "    ${RED}⚠ 配置目录残留${NC}"; clean=false; }
     [ -f /etc/resolv.conf.smartdns.orig ] && { echo -e "    ${YELLOW}⚠ 原始 DNS 备份未清理${NC}"; rm -f /etc/resolv.conf.smartdns.orig; }
@@ -606,7 +606,7 @@ EOF
 }
 
 #==================================================
-# 模块7: 竖排菜单 (v7.5.0)
+# 模块7: 竖排菜单 (v7.5.1)
 #==================================================
 install_shortcut() {
     local script_path=$(readlink -f "$0" 2>/dev/null || echo "$0")
@@ -715,7 +715,7 @@ main() {
     fi
     for arg in "$@"; do case "$arg" in --uninstall|-u) module_uninstall; exit 0 ;; esac; done
     
-    echo ""; echo -e "${BOLD}SmartDNS 智能部署 v7.5.0${NC}"; echo -e "上游: Google + Cloudflare (DoH/DoT/UDP)"; echo -e "环境: Alpine/Debian (LXC/KVM/Podman)"; echo ""
+    echo ""; echo -e "${BOLD}SmartDNS 智能部署 v7.5.1${NC}"; echo -e "上游: Google + Cloudflare (DoH/DoT/UDP)"; echo -e "环境: Alpine/Debian (LXC/KVM/Podman)"; echo ""
     module_detect; module_install; module_config; module_dns_takeover; module_service; module_verify
     echo ""; echo -e "管理命令: ${GREEN}sdns${NC}"; echo -e "  sdns t  测试  sdns l  日志  sdns c  配置  sdns u  更新"; echo -e "  sdns    菜单"
     module_menu
