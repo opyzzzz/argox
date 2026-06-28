@@ -1,6 +1,6 @@
 #!/bin/sh
 #==========================================================================
-# SmartDNS 智能部署脚本 v7.5.2
+# SmartDNS 智能部署脚本 v7.5.3
 # 守护改名: resolv-guard，彻底避免 pkill 误杀
 #==========================================================================
 set +e
@@ -244,7 +244,7 @@ EOF
     else log_ok "端口 53 可用"; fi
     
     cat > /etc/smartdns/smartdns.conf << EOF
-# SmartDNS 配置 v7.5.2
+# SmartDNS 配置 v7.5.3
 # 环境: $OS_TYPE $OS_VER | $VIRT_TYPE | $NET_STACK
 # 版本: $SMARTDNS_VER | 来源: $SMARTDNS_SOURCE
 # 策略: $TAKEOVER_STRATEGY | 时间: $(date '+%Y-%m-%d %H:%M:%S')
@@ -321,7 +321,7 @@ EOF
 }
 
 #==================================================
-# 模块3: 接管系统 DNS (v7.5.2)
+# 模块3: 接管系统 DNS (v7.5.3)
 #==================================================
 module_dns_takeover() {
     log_step "模块3: 接管系统 DNS (策略: $TAKEOVER_STRATEGY)"
@@ -503,7 +503,7 @@ module_verify() {
 }
 
 #==================================================
-# 模块6: 卸载 (v7.5.2)
+# 模块6: 卸载 (v7.5.3)
 #==================================================
 module_uninstall() {
     echo ""; echo -e "${YELLOW}══════════════════════════════════════${NC}"
@@ -600,7 +600,7 @@ EOF
 }
 
 #==================================================
-# 模块7: 竖排菜单 (v7.5.2)
+# 模块7: 竖排菜单 (v7.5.3)
 #==================================================
 install_shortcut() {
     local script_path=$(readlink -f "$0" 2>/dev/null || echo "$0")
@@ -622,7 +622,7 @@ show_menu() {
     echo -e "${BOLD}  SmartDNS 管理${NC}"; hr
     echo -e "  DNS:${S} 守护:${G}  ${DNS}"
     echo -e "  上游:${UP}"; hr
-    echo "  1. DNS测试      2. 查看日志"
+    echo "  1. DNS 测试      2. 查看日志"
     echo "  3. 查看配置      4. 编辑配置"
     echo "  5. 重启服务      6. 清除缓存"
     echo "  7. 检查更新      8. 卸载"
@@ -661,20 +661,45 @@ do_restart() {
 do_flush() { pkill -HUP -x smartdns 2>/dev/null && echo -e "${GREEN}✓ 缓存已清除${NC}" || echo -e "${RED}✗ 未运行${NC}"; }
 
 do_update() {
-    clear 2>/dev/null || echo ""; echo -e "${BOLD}── 检查更新 ──${NC}"
+    clear 2>/dev/null || echo ""; echo -e "${BOLD}── SmartDNS 版本管理 ──${NC}"
     if ! command -v curl >/dev/null 2>&1; then echo -e "${RED}  需要 curl${NC}"; return; fi
-    echo "  获取最新版本..."
+    
+    CURRENT_TAG=$("$SMARTDNS_BIN" -v 2>&1 | grep -o 'Release[0-9.]*' | head -1)
+    echo -e "  当前版本: ${GREEN}${CURRENT_TAG:-未知}${NC}"
+    
+    # 获取最新版
     LATEST_JSON=$(curl -sL --max-time 10 https://api.github.com/repos/pymumu/smartdns/releases/latest 2>/dev/null)
     LATEST_TAG=$(echo "$LATEST_JSON" | grep '"tag_name"' | head -1 | sed 's/.*": "//;s/"//')
-    if [ -z "$LATEST_TAG" ]; then echo -e "${RED}  无法获取版本信息${NC}"; return; fi
-    CURRENT_TAG=$("$SMARTDNS_BIN" -v 2>&1 | grep -o 'Release[0-9.]*' | head -1)
-    echo "  当前: ${CURRENT_TAG:-未知}"; echo "  最新: $LATEST_TAG"
-    if [ "$CURRENT_TAG" = "$LATEST_TAG" ]; then echo -e "  ${GREEN}已是最新版${NC}"; return; fi
-    printf "  更新? [y/N]: "; read -r confirm; [ "$confirm" != "y" ] && [ "$confirm" != "Y" ] && { echo "  已取消"; return; }
-    echo "  下载中..."; ARCH=$(get_arch); URL="https://github.com/pymumu/smartdns/releases/latest/download/smartdns-$ARCH"
+    echo -e "  最新版本: ${CYAN}${LATEST_TAG:-获取失败}${NC}"
+    echo ""
+    
+    echo "  1. 升级到最新版"
+    echo "  2. 回滚到备份版本"
+    echo "  3. 手动指定版本"
+    echo "  0. 返回"
+    echo ""
+    printf "  请选择 [0-3]: "; read -r choice
+    
+    case "$choice" in
+        1) TARGET_TAG="$LATEST_TAG" ;;
+        2) if [ -f /usr/bin/smartdns.bak ]; then
+               cp /usr/bin/smartdns.bak /usr/bin/smartdns; chmod +x /usr/bin/smartdns
+               do_restart; echo -e "${GREEN}✓ 已回滚${NC}"; return
+           else echo -e "${RED}  无备份文件${NC}"; return; fi ;;
+        3) printf "  版本号(如 Release48.1): "; read -r TARGET_TAG ;;
+        0) return ;;
+        *) echo "  无效选择"; return ;;
+    esac
+    
+    [ -z "$TARGET_TAG" ] && { echo "  版本号不能为空"; return; }
+    echo ""; echo "  下载 ${TARGET_TAG}..."
+    ARCH=$(get_arch); URL="https://github.com/pymumu/smartdns/releases/download/${TARGET_TAG}/smartdns-${ARCH}"
+    
     if github_download "$URL" "/tmp/smartdns-new"; then
-        cp /usr/bin/smartdns /usr/bin/smartdns.bak 2>/dev/null; mv /tmp/smartdns-new /usr/bin/smartdns; chmod +x /usr/bin/smartdns
-        SMARTDNS_BIN="/usr/bin/smartdns"; do_restart; echo -e "${GREEN}✓ 更新完成${NC}"
+        cp /usr/bin/smartdns /usr/bin/smartdns.bak 2>/dev/null
+        mv /tmp/smartdns-new /usr/bin/smartdns; chmod +x /usr/bin/smartdns
+        SMARTDNS_BIN="/usr/bin/smartdns"; do_restart
+        echo -e "${GREEN}✓ 切换完成${NC}"
     else echo -e "${RED}✗ 下载失败${NC}"; fi
 }
 
@@ -709,7 +734,7 @@ main() {
     fi
     for arg in "$@"; do case "$arg" in --uninstall|-u) module_uninstall; exit 0 ;; esac; done
     
-    echo ""; echo -e "${BOLD}SmartDNS 智能部署 v7.5.2${NC}"; echo -e "上游: Google + Cloudflare (DoH/DoT/UDP)"; echo -e "环境: Alpine/Debian (LXC/KVM/Podman)"; echo ""
+    echo ""; echo -e "${BOLD}SmartDNS 智能部署 v7.5.3${NC}"; echo -e "上游: Google + Cloudflare (DoH/DoT/UDP)"; echo -e "环境: Alpine/Debian (LXC/KVM/Podman)"; echo ""
     module_detect; module_install; module_config; module_dns_takeover; module_service; module_verify
     echo ""; echo -e "管理命令: ${GREEN}sdns${NC}"; echo -e "  sdns t  测试  sdns l  日志  sdns c  配置  sdns u  更新"; echo -e "  sdns    菜单"
     module_menu
