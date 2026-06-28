@@ -1,7 +1,7 @@
 #!/bin/sh
 #==========================================================================
-# SmartDNS 智能部署脚本 v6.6.0
-# 新增: 交互菜单 + 快捷命令 sdns + 卸载 cat > 兼容 tmpfs
+# SmartDNS 智能部署脚本 v6.6.2
+# 修复: ensure_tools 提前 + run_test busybox 兼容
 #==========================================================================
 set +e
 
@@ -37,11 +37,7 @@ RESOLV_FALLBACK="/etc/smartdns/resolv.fallback"
 
 APT_UPDATED=false; BB=""
 
-detect_busybox() {
-    if command -v busybox >/dev/null 2>&1; then
-        BB="busybox"
-    fi
-}
+detect_busybox() { if command -v busybox >/dev/null 2>&1; then BB="busybox"; fi; }
 
 pkg_install() {
     local pkgs="$1" max_retry="${2:-3}" attempt=1
@@ -49,15 +45,11 @@ pkg_install() {
         case "$PKG_MGR" in
             apk) apk add --no-cache $pkgs 2>/dev/null && return 0 ;;
             apt)
-                for i in $(seq 1 30); do
-                    fuser /var/lib/dpkg/lock-frontend 2>/dev/null && sleep 1 || break
-                done
+                for i in $(seq 1 30); do fuser /var/lib/dpkg/lock-frontend 2>/dev/null && sleep 1 || break; done
                 if ! $APT_UPDATED; then apt-get update -qq 2>/dev/null && APT_UPDATED=true; fi
-                apt-get install -y -qq $pkgs 2>/dev/null && return 0
-                ;;
+                apt-get install -y -qq $pkgs 2>/dev/null && return 0 ;;
         esac
-        attempt=$((attempt + 1))
-        [ "$attempt" -le "$max_retry" ] && sleep 2
+        attempt=$((attempt + 1)); [ "$attempt" -le "$max_retry" ] && sleep 2
     done
     return 1
 }
@@ -67,8 +59,7 @@ github_download() {
     while [ "$attempt" -le 3 ]; do
         wget -q --timeout=30 --tries=1 -O "$output" "$url" 2>/dev/null && [ -s "$output" ] && return 0
         curl -sL --max-time 30 -o "$output" "$url" 2>/dev/null && [ -s "$output" ] && return 0
-        attempt=$((attempt + 1))
-        [ "$attempt" -le 3 ] && sleep 3
+        attempt=$((attempt + 1)); [ "$attempt" -le 3 ] && sleep 3
     done
     return 1
 }
@@ -82,35 +73,32 @@ get_arch() {
 
 get_version_number() {
     local ver_output=$("$1" -v 2>&1)
-    if echo "$ver_output" | grep -qi "Release\([0-9]\+\)"; then
-        echo "$ver_output" | grep -oi "Release\([0-9]\+\)" | grep -o '[0-9]*' | head -1
+    if echo "$ver_output" | grep -qi "Release\([0-9]\+\)"; then echo "$ver_output" | grep -oi "Release\([0-9]\+\)" | grep -o '[0-9]*' | head -1
     else echo "0"; fi
 }
 
 port_in_use() {
     local port_hex=$(printf "%04X" "$1")
-    grep -q ":$port_hex " /proc/net/tcp /proc/net/tcp6 2>/dev/null && return 0
-    return 1
+    grep -q ":$port_hex " /proc/net/tcp /proc/net/tcp6 2>/dev/null && return 0; return 1
 }
 
 check_ipv6_connectivity() {
     ip route get 2606:4700:4700::1111 >/dev/null 2>&1 || return 1
-    ping6 -c1 -W2 2606:4700:4700::1111 >/dev/null 2>&1 && return 0
+    if [ -n "$BB" ]; then
+        $BB nslookup google.com 2001:4860:4860::8888 >/dev/null 2>&1 && return 0
+        $BB nslookup google.com 2606:4700:4700::1111 >/dev/null 2>&1 && return 0
+    else
+        nslookup -timeout=3 google.com 2001:4860:4860::8888 >/dev/null 2>&1 && return 0
+        nslookup -timeout=3 google.com 2606:4700:4700::1111 >/dev/null 2>&1 && return 0
+    fi
     return 1
 }
 
 ensure_tools() {
-    if ! command -v wget >/dev/null 2>&1 && ! command -v curl >/dev/null 2>&1; then
-        pkg_install wget || { log_err "无法安装下载工具"; exit 1; }
-    fi
+    if ! command -v wget >/dev/null 2>&1 && ! command -v curl >/dev/null 2>&1; then pkg_install wget || { log_err "无法安装下载工具"; exit 1; }; fi
     detect_busybox
-    if [ -z "$BB" ]; then
-        case "$PKG_MGR" in apk) pkg_install busybox 2 ;; apt) pkg_install busybox 2 ;; esac
-        detect_busybox
-    fi
-    if ! command -v inotifywait >/dev/null 2>&1 && ! command -v inotifyd >/dev/null 2>&1; then
-        pkg_install inotify-tools 3
-    fi
+    if [ -z "$BB" ]; then case "$PKG_MGR" in apk) pkg_install busybox 2 ;; apt) pkg_install busybox 2 ;; esac; detect_busybox; fi
+    if ! command -v inotifywait >/dev/null 2>&1 && ! command -v inotifyd >/dev/null 2>&1; then pkg_install inotify-tools 3; fi
 }
 
 dns_query() {
@@ -118,8 +106,7 @@ dns_query() {
     if [ "$PORT" != "53" ]; then
         if [ -n "$BB" ]; then echo "跳过（busybox 不支持非标端口）"; return 1; fi
         if ! command -v nslookup >/dev/null 2>&1; then echo "跳过（无 nslookup）"; return 1; fi
-        nslookup -port="$PORT" "$domain" "$server" 2>&1 || nslookup -timeout=5 -port="$PORT" "$domain" "$server" 2>&1
-        return $?
+        nslookup -port="$PORT" "$domain" "$server" 2>&1 || nslookup -timeout=5 -port="$PORT" "$domain" "$server" 2>&1; return $?
     fi
     if [ -n "$BB" ]; then $BB nslookup "$domain" "$server" 2>&1 && return 0; return 1; fi
     if command -v nslookup >/dev/null 2>&1; then nslookup "$domain" "$server" 2>&1 && return 0; return 1; fi
@@ -132,13 +119,7 @@ detect_inotify() {
     log_warn "inotify 工具不可用，将使用轻量级轮询 (5秒间隔)"; return 1
 }
 
-safe_rc_add() {
-    local service="$1" runlevel="${2:-default}"
-    if ! rc-update show 2>/dev/null | grep -q "$service.*$runlevel"; then
-        rc-update add "$service" "$runlevel" 2>/dev/null
-    fi
-}
-
+safe_rc_add() { local service="$1" runlevel="${2:-default}"; if ! rc-update show 2>/dev/null | grep -q "$service.*$runlevel"; then rc-update add "$service" "$runlevel" 2>/dev/null; fi; }
 write_resolv() { cat "$RESOLV_TEMPLATE" > /etc/resolv.conf; }
 
 #==================================================
@@ -163,6 +144,9 @@ module_detect() {
     if [ -f /.dockerenv ] || [ -f /run/.containerenv ]; then VIRT_TYPE="podman"; fi
     case "$VIRT_TYPE" in podman|docker|lxc) VIRT_IS_CONTAINER=true ;; *) VIRT_IS_CONTAINER=false ;; esac
     log_info "虚拟化: $VIRT_TYPE (容器: $VIRT_IS_CONTAINER)"
+    
+    # 先装工具，确保 nslookup 可用
+    ARCH=$(get_arch); ensure_tools
     
     HAS_IPV4=true; ip route get 1.1.1.1 >/dev/null 2>&1 || HAS_IPV4=false
     if check_ipv6_connectivity; then HAS_IPV6=true; else HAS_IPV6=false; fi
@@ -190,8 +174,6 @@ module_detect() {
     elif $CLOUD_INIT_EXISTS && $CLOUD_INIT_MANAGES_DNS; then TAKEOVER_STRATEGY="cloudinit"
     else TAKEOVER_STRATEGY="standard"; fi
     log_ok "接管策略: $TAKEOVER_STRATEGY"
-    
-    ARCH=$(get_arch); ensure_tools
 }
 
 #==================================================
@@ -262,7 +244,7 @@ EOF
     else log_ok "端口 53 可用"; fi
     
     cat > /etc/smartdns/smartdns.conf << EOF
-# SmartDNS 配置 v6.6.0
+# SmartDNS 配置 v6.6.2
 # 环境: $OS_TYPE $OS_VER | $VIRT_TYPE | $NET_STACK
 # 版本: $SMARTDNS_VER | 来源: $SMARTDNS_SOURCE
 # 策略: $TAKEOVER_STRATEGY | 时间: $(date '+%Y-%m-%d %H:%M:%S')
@@ -569,7 +551,7 @@ install_shortcut() {
 }
 
 show_banner() {
-    clear 2>/dev/null || echo ""
+    echo ""
     printf "%b\n" "${GREEN}${BOLD}"; echo "╔══════════════════════════════════════╗"; echo "║       SmartDNS 管理 (sdns)          ║"; echo "╠══════════════════════════════════════╣"; printf "%b" "${NC}"
     echo -e "  系统: ${CYAN}$OS_TYPE $OS_VER ($VIRT_TYPE)${NC}"; echo -e "  版本: ${CYAN}${SMARTDNS_VER:-未知}${NC}"; echo -e "  端口: ${CYAN}127.0.0.1:${PORT:-?}${NC}"; echo -e "  守护: ${GREEN}${INOTIFY_CMD:-轮询}${NC}"
     printf "%b\n" "${GREEN}${BOLD}"; echo "╠══════════════════════════════════════╣"; echo "║  [s] 状态  [l] 日志  [t] 测试      ║"; echo "║  [c] 配置  [e] 编辑  [r] 重启      ║"; echo "║  [f] 清缓存  [u] 卸载  [q] 退出    ║"; echo "╚══════════════════════════════════════╝"; printf "%b" "${NC}"
@@ -581,27 +563,22 @@ show_status() {
     pgrep -f smartdns-dns-guard >/dev/null 2>&1 && echo -e "  DNS守护: ${GREEN}运行中${NC}" || echo -e "  DNS守护: ${RED}未运行${NC}"
     echo -e "  resolv.conf: $(head -1 /etc/resolv.conf 2>/dev/null || echo '无')"
     echo ""; echo -e "${BOLD}上游连通性:${NC}"
-    for ip in 8.8.8.8 1.1.1.1; do
-        nc -z -w1 "$ip" 53 2>/dev/null && echo -e "  UDP $ip: ${GREEN}通${NC}" || echo -e "  UDP $ip: ${RED}不通${NC}"
-    done
+    for ip in 8.8.8.8 1.1.1.1; do nc -z -w1 "$ip" 53 2>/dev/null && echo -e "  UDP $ip: ${GREEN}通${NC}" || echo -e "  UDP $ip: ${RED}不通${NC}"; done
 }
 
-show_log() {
-    if [ -f /var/log/smartdns.log ]; then echo ""; echo -e "${BOLD}最近 20 行日志:${NC}"; tail -20 /var/log/smartdns.log; echo -e "实时: ${CYAN}tail -f /var/log/smartdns.log${NC}"
-    else echo "日志文件不存在"; fi
-}
+show_log() { [ -f /var/log/smartdns.log ] && { echo ""; echo -e "${BOLD}最近 20 行日志:${NC}"; tail -20 /var/log/smartdns.log; echo -e "实时: ${CYAN}tail -f /var/log/smartdns.log${NC}"; } || echo "日志文件不存在"; }
 
 run_test() {
     echo ""; echo -e "${BOLD}DNS 解析测试:${NC}"
     for domain in google.com cloudflare.com github.com; do
-        RESULT=$(nslookup "$domain" 127.0.0.1 2>&1)
+        if [ -n "$BB" ]; then RESULT=$($BB nslookup "$domain" 127.0.0.1 2>&1)
+        else RESULT=$(nslookup "$domain" 127.0.0.1 2>&1); fi
         if echo "$RESULT" | grep -q "Address"; then echo -e "  ${GREEN}✓${NC} $domain → $(echo "$RESULT" | grep "Address" | tail -1 | awk '{print $NF}')"
         else echo -e "  ${RED}✗${NC} $domain 失败"; fi
     done
 }
 
 show_config() { [ -f /etc/smartdns/smartdns.conf ] && { echo ""; grep -v "^#\|^$" /etc/smartdns/smartdns.conf | head -30; }; }
-
 edit_config() { local editor="vi"; command -v nano >/dev/null 2>&1 && editor="nano"; "$editor" /etc/smartdns/smartdns.conf; echo -e "${YELLOW}配置已修改，需要重启: sdns r${NC}"; }
 
 restart_service() {
@@ -623,9 +600,8 @@ module_menu() {
         case "$choice" in
             s|S) show_status ;; l|L) show_log ;; t|T) run_test ;; c|C) show_config ;;
             e|E) edit_config ;; r|R) restart_service ;; f|F) clear_cache ;; u|U) module_uninstall; break ;;
-            q|Q) break ;;
+            q|Q) echo ""; break ;;
         esac
-        [ "$choice" != "q" ] && [ "$choice" != "Q" ] && { echo ""; printf "按回车继续..."; read -r _; }
     done
 }
 
@@ -633,11 +609,11 @@ main() {
     if [ "$(readlink -f "$0" 2>/dev/null || echo "$0")" = "$SDNS_CMD" ]; then
         [ -f /etc/smartdns/smartdns.conf ] && PORT=$(grep "^bind" /etc/smartdns/smartdns.conf | grep -o '[0-9]*$' | head -1); [ -z "$PORT" ] && PORT=53
         [ -f /etc/alpine-release ] && OS_TYPE="alpine"; [ -d /run/systemd/system ] && INIT_TYPE="systemd"
-        detect_inotify; module_menu "$@"; exit 0
+        detect_busybox; detect_inotify; module_menu "$@"; exit 0
     fi
     for arg in "$@"; do case "$arg" in --uninstall|-u) module_uninstall; exit 0 ;; esac; done
     
-    echo ""; echo -e "${BOLD}SmartDNS 智能部署 v6.6.0${NC}"; echo -e "上游: Google + Cloudflare (DoH/DoT/UDP)"; echo -e "环境: Alpine/Debian (LXC/KVM/Podman)"; echo ""
+    echo ""; echo -e "${BOLD}SmartDNS 智能部署 v6.6.2${NC}"; echo -e "上游: Google + Cloudflare (DoH/DoT/UDP)"; echo -e "环境: Alpine/Debian (LXC/KVM/Podman)"; echo ""
     module_detect; module_install; module_config; module_dns_takeover; module_service; module_verify
     echo ""; echo -e "管理命令: ${GREEN}sdns${NC}"; echo -e "  sdns s  状态  sdns l  日志  sdns t  测试"; echo -e "  sdns r  重启  sdns e  编辑  sdns    菜单"
     module_menu
