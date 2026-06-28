@@ -1,4 +1,3 @@
-cat > /usr/local/bin/smartdns-check.sh << 'EOF'
 #!/bin/sh
 #==================================================
 # SmartDNS 部署后功能检测脚本 v2.8
@@ -424,7 +423,3 @@ fi
 echo ""
 echo -e "检测完成: $(date '+%Y-%m-%d %H:%M:%S')"
 echo ""
-EOF
-
-chmod +x /usr/local/bin/smartdns-check.sh
-/usr/local/bin/smartdns-check.sh
