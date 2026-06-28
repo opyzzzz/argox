@@ -1,6 +1,6 @@
 #!/bin/sh
 #==========================================================================
-# SmartDNS 智能部署脚本 v7.3.3
+# SmartDNS 智能部署脚本 v7.5.0
 # 守护改名: resolv-guard，彻底避免 pkill 误杀
 #==========================================================================
 set +e
@@ -244,7 +244,7 @@ EOF
     else log_ok "端口 53 可用"; fi
     
     cat > /etc/smartdns/smartdns.conf << EOF
-# SmartDNS 配置 v7.3.3
+# SmartDNS 配置 v7.5.0
 # 环境: $OS_TYPE $OS_VER | $VIRT_TYPE | $NET_STACK
 # 版本: $SMARTDNS_VER | 来源: $SMARTDNS_SOURCE
 # 策略: $TAKEOVER_STRATEGY | 时间: $(date '+%Y-%m-%d %H:%M:%S')
@@ -321,13 +321,17 @@ EOF
 }
 
 #==================================================
-# 模块3: 接管系统 DNS (v7.3.3 启动前清理残留)
+# 模块3: 接管系统 DNS (v7.5.0)
 #==================================================
 module_dns_takeover() {
     log_step "模块3: 接管系统 DNS (策略: $TAKEOVER_STRATEGY)"
     detect_inotify
     [ -z "$INOTIFY_CMD" ] && log_warn "inotify 工具不可用，将使用轻量级轮询 (5秒间隔)" || log_info "inotify 工具: $INOTIFY_CMD"
-    if [ -f /etc/resolv.conf ] && [ ! -L /etc/resolv.conf ]; then cp /etc/resolv.conf "/etc/resolv.conf.bak.$(date +%Y%m%d-%H%M%S)" 2>/dev/null; fi
+    
+    # 备份原始 DNS（只备份一次，已存在则跳过）
+    if [ -f /etc/resolv.conf ] && [ ! -L /etc/resolv.conf ]; then
+        [ ! -f /etc/resolv.conf.smartdns.orig ] && cp /etc/resolv.conf /etc/resolv.conf.smartdns.orig 2>/dev/null
+    fi
     
     if [ "$TAKEOVER_STRATEGY" = "resolved" ]; then
         log_info "执行策略: 停用 systemd-resolved"
@@ -376,11 +380,11 @@ TARGET="/etc/resolv.conf"; TEMPLATE="${RESOLV_TEMPLATE}"; PID_FILE="${PID_FILE}"
   if command -v inotifywait >/dev/null 2>&1; then while true; do inotifywait -m -e modify,close_write "\$TARGET" 2>/dev/null | while read -r path event file; do sleep 0.5; restore_dns; done; sleep 1; done
   elif command -v inotifyd >/dev/null 2>&1; then while true; do inotifyd - "\$TARGET" 2>/dev/null | while read -r event file; do case "\$event" in w|m|c) sleep 0.5; restore_dns ;; esac; done; sleep 1; done
   else while true; do sleep 5; restore_dns; done; fi
-) & exit 0
+) & disown; exit 0
 GUARD
     chmod 700 "$GUARD_SCRIPT"
     
-    # 清理旧守护残留（改名后不会误杀 smartdns）
+    # 清理旧守护残留
     pkill -f resolv-guard 2>/dev/null
     [ -f "$PID_FILE" ] && { OLD_PID=$(cat "$PID_FILE" 2>/dev/null); [ -n "$OLD_PID" ] && kill "$OLD_PID" 2>/dev/null; rm -f "$PID_FILE"; }
     sleep 0.5
@@ -500,7 +504,7 @@ module_verify() {
 }
 
 #==================================================
-# 模块6: 卸载 (v7.4.1)
+# 模块6: 卸载 (v7.5.0)
 #==================================================
 module_uninstall() {
     echo ""; echo -e "${YELLOW}══════════════════════════════════════${NC}"
@@ -519,7 +523,7 @@ module_uninstall() {
     # 1. 检测 init 类型
     [ -z "$INIT_TYPE" ] && { if [ -d /run/systemd/system ]; then INIT_TYPE="systemd"; elif [ -f /sbin/openrc ]; then INIT_TYPE="openrc"; else INIT_TYPE="none"; fi; }
     
-    # 2. 停止并禁用服务
+    # 2. 停止服务
     case "$INIT_TYPE" in
         systemd)
             systemctl stop resolv-guard.service resolv-fix.service smartdns.service 2>/dev/null
@@ -536,41 +540,55 @@ module_uninstall() {
             ;;
     esac
     
-    # 3. 杀掉所有相关进程
-    pkill -f resolv-guard 2>/dev/null
+    # 3. 用 PID 文件精确终止守护
+    if [ -f "$PID_FILE" ]; then
+        GUARD_PID=$(cat "$PID_FILE" 2>/dev/null)
+        if [ -n "$GUARD_PID" ]; then
+            kill "$GUARD_PID" 2>/dev/null
+            sleep 0.3
+            kill -9 "$GUARD_PID" 2>/dev/null
+        fi
+        rm -f "$PID_FILE"
+    fi
+    
+    # 4. 路径前缀兜底清理守护残留
+    pkill -f "^/usr/local/bin/resolv-guard\.sh" 2>/dev/null
+    sleep 0.3
+    pkill -9 -f "^/usr/local/bin/resolv-guard\.sh" 2>/dev/null
+    
+    # 5. 清理 smartdns
     pkill -x smartdns 2>/dev/null
+    sleep 0.5
+    pkill -9 -x smartdns 2>/dev/null
     sleep 1
     
-    # 4. 强制清理残留
-    [ -f "$PID_FILE" ] && { GUARD_PID=$(cat "$PID_FILE" 2>/dev/null); [ -n "$GUARD_PID" ] && kill -9 "$GUARD_PID" 2>/dev/null; rm -f "$PID_FILE"; }
-    pkill -9 -f resolv-guard 2>/dev/null
-    pkill -9 -x smartdns 2>/dev/null
-    sleep 0.5
-    
-    # 5. 清理文件
+    # 6. 清理文件
     rm -f "$GUARD_SCRIPT" "$RESOLV_BACKUP" "$SDNS_CMD"
     rm -f /etc/cloud/cloud.cfg.d/99-smartdns-dns.cfg
     [ -f /etc/tmpfiles.d/systemd-resolved.conf ] && grep -q "SmartDNS" /etc/tmpfiles.d/systemd-resolved.conf 2>/dev/null && rm -f /etc/tmpfiles.d/systemd-resolved.conf
     crontab -l 2>/dev/null | grep -q "resolv-check\|smartdns" && { crontab -l 2>/dev/null | grep -v "resolv-check\|smartdns" | crontab - 2>/dev/null; }
     
-    # 6. 恢复 DNS
-    BAK=$(ls -t /etc/resolv.conf.bak.* 2>/dev/null | head -1)
-    if [ -n "$BAK" ]; then cat "$BAK" > /etc/resolv.conf
-    elif [ -f "$RESOLV_FALLBACK" ]; then cat "$RESOLV_FALLBACK" > /etc/resolv.conf
-    else cat > /etc/resolv.conf << EOF
+    # 7. 恢复 DNS（优先用部署时备份的原始配置）
+    if [ -f /etc/resolv.conf.smartdns.orig ]; then
+        cat /etc/resolv.conf.smartdns.orig > /etc/resolv.conf
+        rm -f /etc/resolv.conf.smartdns.orig
+    elif [ -f "$RESOLV_FALLBACK" ]; then
+        cat "$RESOLV_FALLBACK" > /etc/resolv.conf
+    else
+        cat > /etc/resolv.conf << EOF
 nameserver 1.1.1.1
 nameserver 8.8.8.8
 EOF
     fi
     
-    # 7. 清理二进制和配置目录
+    # 8. 清理二进制和配置目录
     rm -f /usr/bin/smartdns /usr/sbin/smartdns /usr/local/bin/smartdns
     rm -rf /etc/smartdns
     rm -f /var/log/smartdns.log* "$DEPLOY_LOG"
     apt-get remove -y smartdns 2>/dev/null
     apk del smartdns 2>/dev/null
     
-    # 8. 残留检测
+    # 9. 残留检测
     echo ""
     echo -e "${BOLD}  清理报告:${NC}"
     local clean=true
@@ -578,6 +596,7 @@ EOF
     pgrep -f resolv-guard >/dev/null 2>&1 && { echo -e "    ${RED}⚠ 守护进程残留${NC}"; clean=false; }
     [ -f /usr/bin/smartdns ] && { echo -e "    ${RED}⚠ 二进制文件残留${NC}"; clean=false; }
     [ -d /etc/smartdns ] && { echo -e "    ${RED}⚠ 配置目录残留${NC}"; clean=false; }
+    [ -f /etc/resolv.conf.smartdns.orig ] && { echo -e "    ${YELLOW}⚠ 原始 DNS 备份未清理${NC}"; rm -f /etc/resolv.conf.smartdns.orig; }
     $clean && echo -e "    ${GREEN}✓ 清理完成，无残留${NC}"
     
     echo ""
@@ -587,7 +606,7 @@ EOF
 }
 
 #==================================================
-# 模块7: 竖排菜单 (v7.3.3)
+# 模块7: 竖排菜单 (v7.5.0)
 #==================================================
 install_shortcut() {
     local script_path=$(readlink -f "$0" 2>/dev/null || echo "$0")
@@ -696,7 +715,7 @@ main() {
     fi
     for arg in "$@"; do case "$arg" in --uninstall|-u) module_uninstall; exit 0 ;; esac; done
     
-    echo ""; echo -e "${BOLD}SmartDNS 智能部署 v7.3.3${NC}"; echo -e "上游: Google + Cloudflare (DoH/DoT/UDP)"; echo -e "环境: Alpine/Debian (LXC/KVM/Podman)"; echo ""
+    echo ""; echo -e "${BOLD}SmartDNS 智能部署 v7.5.0${NC}"; echo -e "上游: Google + Cloudflare (DoH/DoT/UDP)"; echo -e "环境: Alpine/Debian (LXC/KVM/Podman)"; echo ""
     module_detect; module_install; module_config; module_dns_takeover; module_service; module_verify
     echo ""; echo -e "管理命令: ${GREEN}sdns${NC}"; echo -e "  sdns t  测试  sdns l  日志  sdns c  配置  sdns u  更新"; echo -e "  sdns    菜单"
     module_menu
