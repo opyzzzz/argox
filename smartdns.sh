@@ -1,6 +1,6 @@
 #!/bin/sh
 #==========================================================================
-# SmartDNS 智能部署脚本 v7.7.0-alt5
+# SmartDNS 智能部署脚本 v7.7.0-alt6
 # PID 文件路径 /var/run → /run (systemd 兼容)
 #==========================================================================
 set +e
@@ -178,7 +178,7 @@ module_detect() {
 }
 
 #==================================================
-# 模块1: 安装 SmartDNS (v7.7.0-alt5)
+# 模块1: 安装 SmartDNS (v7.7.0-alt6)
 #==================================================
 module_install() {
     log_step "模块1: 安装 SmartDNS"
@@ -259,7 +259,7 @@ EOF
     else log_ok "端口 53 可用"; fi
     
     cat > /etc/smartdns/smartdns.conf << EOF
-# SmartDNS 配置 v7.7.0-alt5
+# SmartDNS 配置 v7.7.0-alt6
 # 环境: $OS_TYPE $OS_VER | $VIRT_TYPE | $NET_STACK
 # 版本: $SMARTDNS_VER | 来源: $SMARTDNS_SOURCE
 # 策略: $TAKEOVER_STRATEGY | 时间: $(date '+%Y-%m-%d %H:%M:%S')
@@ -336,7 +336,7 @@ EOF
 }
 
 #==================================================
-# 模块3: 接管系统 DNS (v7.7.0-alt5 - 修复审计问题)
+# 模块3: 接管系统 DNS (v7.7.0-alt6 - 修复 resolved 软链接)
 #==================================================
 module_dns_takeover() {
     log_step "模块3: 接管系统 DNS (策略: $TAKEOVER_STRATEGY)"
@@ -347,20 +347,22 @@ module_dns_takeover() {
     if [ -f /etc/resolv.conf ] && [ ! -L /etc/resolv.conf ]; then
         [ ! -f /etc/resolv.conf.smartdns.orig ] && cp /etc/resolv.conf /etc/resolv.conf.smartdns.orig 2>/dev/null
     fi
+    # 如果是软链接，备份链接目标的内容
+    if [ -L /etc/resolv.conf ] && [ ! -f /etc/resolv.conf.smartdns.orig ]; then
+        cat /etc/resolv.conf 2>/dev/null > /etc/resolv.conf.smartdns.orig 2>/dev/null
+    fi
     
     # ── 从模板文件统一提取 DNS 值（与模块2同源）──
     local dns_list; local dns_yaml; local dns_list_grep
     if [ -f "$RESOLV_TEMPLATE" ]; then
         dns_list=$(grep "^nameserver" "$RESOLV_TEMPLATE" 2>/dev/null | awk '{print $2}' | tr '\n' ' ' | sed 's/ $//')
     fi
-    # fallback：模板不存在时从网络栈变量生成
     if [ -z "$dns_list" ]; then
         if [ "$HAS_IPV4" = true ] && [ "$HAS_IPV6" = true ]; then dns_list="127.0.0.1 ::1"
         elif [ "$HAS_IPV6" = true ]; then dns_list="::1"
         else dns_list="127.0.0.1"; fi
     fi
     
-    # 生成 YAML 格式（逐个 IP 加引号，逗号分隔）
     dns_yaml=""
     for ip in $dns_list; do
         if [ -z "$dns_yaml" ]; then dns_yaml="'$ip'"
@@ -398,6 +400,19 @@ DNSStubListener=no
 EOF
         echo "/etc/systemd/resolved.conf.d/smartdns.conf:DELETE" >> "$BACKUP_LIST"
         systemctl restart systemd-resolved 2>/dev/null
+        
+        # 删除旧的 stub 软链接，创建静态 resolv.conf
+        if [ -L /etc/resolv.conf ]; then
+            rm -f /etc/resolv.conf
+            write_resolv
+            log_info "systemd-resolved: stub 软链接已替换为静态文件"
+        fi
+        # 覆盖 tmpfiles.d 防止重启后重建软链接
+        if [ "$TMPFILES_HAS_RESOLV" = true ]; then
+            mkdir -p /etc/tmpfiles.d
+            printf "# SmartDNS 接管\n" > /etc/tmpfiles.d/systemd-resolved.conf
+            echo "/etc/tmpfiles.d/systemd-resolved.conf:DELETE" >> "$BACKUP_LIST"
+        fi
         log_info "systemd-resolved: 上游 → ${dns_list}"
     fi
     
@@ -582,7 +597,7 @@ OGSTART
 }
 
 #==================================================
-# 模块4: 服务与守护 (v7.7.0-alt5)
+# 模块4: 服务与守护 (v7.7.0-alt6)
 #==================================================
 module_service() {
     log_step "模块4: 部署 SmartDNS 服务"
@@ -767,7 +782,7 @@ EOF
 }
 
 #==================================================
-# 模块7: 三分区菜单 (v7.7.0-alt5)
+# 模块7: 三分区菜单 (v7.7.0-alt6)
 #==================================================
 install_shortcut() {
     local script_path=$(readlink -f "$0" 2>/dev/null || echo "$0")
@@ -961,7 +976,7 @@ main() {
     fi
     for arg in "$@"; do case "$arg" in --uninstall|-u) module_uninstall; exit 0 ;; esac; done
     
-    echo ""; printf "%b\n" "${BOLD}SmartDNS 智能部署 v7.7.0-alt5${NC}"; echo "上游: Google + Cloudflare (DoH/DoT/UDP)"; echo "环境: Alpine/Debian (LXC/KVM/Podman)"; echo ""
+    echo ""; printf "%b\n" "${BOLD}SmartDNS 智能部署 v7.7.0-alt6${NC}"; echo "上游: Google + Cloudflare (DoH/DoT/UDP)"; echo "环境: Alpine/Debian (LXC/KVM/Podman)"; echo ""
     module_detect; module_install; module_config; module_dns_takeover; module_service; module_verify
     echo ""; printf "%b\n" "管理命令: ${GREEN}sdns${NC}"; echo "  sdns t  测试  sdns l  日志  sdns c  配置  sdns u  版本管理"; echo "  sdns    菜单"
     module_menu
