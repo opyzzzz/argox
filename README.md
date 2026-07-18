@@ -18,9 +18,9 @@ uufw防火墙
 curl -fsSL https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/uufw.sh -o /usr/local/bin/uufw && chmod +x /usr/local/bin/uufw && uufw
 `````
 
-dns
+DNS
 `````
-curl -fsSL https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/smart_dns.sh -o smart_dns.sh && chmod +x smart_dns.sh && ./smart_dns.sh && rm -f smart_dns.sh
+curl -fsSL https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/smart_dns.sh -o /tmp/smart_dns.sh && sh /tmp/smart_dns.sh && rm -f /tmp/smart_dns.sh
 `````
 
 dns-detective
