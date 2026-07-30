@@ -17,7 +17,7 @@ log_step()  { printf "\n%b>>> %s%b\n" "$BOLD$BLUE" "$1" "$NC"; }
 [ "$(id -u)" -ne 0 ] && { log_err "需要 root 权限"; exit 1; }
 
 SMARTDNS_BIN=""; SMARTDNS_VER=""; SMARTDNS_VER_NUM=0; SMARTDNS_SOURCE=""
-STABLE_VER="${STABLE_VER:-Release48.2}"
+STABLE_VER="${STABLE_VER:-Release48.3}"
 IS_VER_NEW=false; PORT=53
 OS_TYPE=""; OS_VER=""; INIT_TYPE=""; VIRT_TYPE=""; VIRT_IS_CONTAINER=false
 NET_STACK=""; HAS_IPV4=true; HAS_IPV6=false
