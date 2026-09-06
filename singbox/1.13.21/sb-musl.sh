@@ -1,31 +1,56 @@
 #!/bin/ash
 # setup-singbox-reality.sh
 #
-# Alpine low-memory sing-box VLESS + REALITY installer/config updater.
+# Alpine Linux low-memory sing-box VLESS + REALITY installer/config updater.
 #
-# 特点：
-#   - 自动从指定 GitHub Release 下载 amd64/musl sing-box 二进制
-#   - 不需要服务器预先上传 sing-box
-#   - 适合低内存 Alpine VPS / Container
-#   - 使用 OpenRC 管理 sing-box
-#   - 自动生成 VLESS UUID / REALITY keypair / short_id
-#   - 自动生成 VLESS 分享链接
+# Supported architectures:
+#   x86_64 / amd64
+#   aarch64 / arm64
 #
-# 当前下载版本：
-#   sing-box v1.13.21
+# sing-box binaries:
+#   amd64:
+#   https://github.com/opyzzzz/argox/releases/download/v1.13.21-multi/sing-box-amd64
 #
-# 下载文件：
-#   https://github.com/opyzzzz/argox/releases/download/v1.13.21/sing-box
+#   arm64:
+#   https://github.com/opyzzzz/argox/releases/download/v1.13.21-multi/sing-box-arm64
+#
+# Binary files are already unpacked musl executables.
+#
+# Installation flow:
+#
+#   1. Check root
+#        ↓
+#   2. Detect CPU architecture
+#        ↓
+#   3. Select amd64 / arm64 binary
+#        ↓
+#   4. Download to /tmp
+#        ↓
+#   5. Execute temporary binary "version" for validation
+#        ↓
+#   6. mv to /usr/local/bin/sing-box
+#        ↓
+#   7. Check configuration
+#        ↓
+#   8. Start / restart OpenRC service
+#
+# Designed for small Alpine VPS / containers.
+#
+# NOTE:
+#   This script does NOT download archives.
+#   The GitHub Release files are already unpacked executables.
 
 set -eu
 
+
 ###############################################################################
-# 基本路径
+# Configuration
 ###############################################################################
 
-BIN_URL="${BIN_URL:-https://github.com/opyzzzz/argox/releases/download/v1.13.21/sing-box}"
+BIN_BASE_URL="${BIN_BASE_URL:-https://github.com/opyzzzz/argox/releases/download/v1.13.21-multi}"
+
 BIN_DST="/usr/local/bin/sing-box"
-BIN_TMP="/tmp/sing-box-download"
+BIN_TMP="/tmp/sing-box-download.$$"
 
 CONF_DIR="/usr/local/etc/sing-box"
 CONF_FILE="${CONF_DIR}/config.json"
@@ -38,7 +63,42 @@ DEFAULT_DOMAIN="${DEFAULT_DOMAIN:-www.cloudflare.com}"
 
 
 ###############################################################################
-# 基础函数
+# Runtime variables
+###############################################################################
+
+ARCH=""
+SING_BOX_ARCH=""
+SING_BOX_FILE=""
+BIN_URL=""
+DOWNLOAD_TOOL=""
+
+PORT=""
+REALITY_DOMAIN=""
+HANDSHAKE_SERVER=""
+HANDSHAKE_PORT="443"
+
+UUID=""
+PRIVATE_KEY=""
+PUBLIC_KEY=""
+SHORT_ID=""
+
+SERVER_ADDR=""
+LINK=""
+
+
+###############################################################################
+# Cleanup
+###############################################################################
+
+cleanup() {
+    rm -f "$BIN_TMP" 2>/dev/null || true
+}
+
+trap cleanup EXIT INT TERM
+
+
+###############################################################################
+# Basic functions
 ###############################################################################
 
 log() {
@@ -60,20 +120,25 @@ pause() {
     read -r _ || true
 }
 
+
+###############################################################################
+# Root
+###############################################################################
+
 require_root() {
     [ "$(id -u)" = "0" ] || die "请使用 root 用户运行。"
 }
 
 
 ###############################################################################
-# 低内存保护
+# Low-memory protection
 ###############################################################################
 
 protect_ssh() {
-    # 尽量避免当前 SSH shell / sshd 在低内存情况下优先被 OOM killer 杀掉。
-
+    # Lower OOM score for current shell.
     echo -1000 > /proc/$$/oom_score_adj 2>/dev/null || true
 
+    # Lower OOM score for sshd processes where possible.
     for p in $(pgrep -x sshd 2>/dev/null || true); do
         echo -1000 > "/proc/$p/oom_score_adj" 2>/dev/null || true
     done
@@ -81,7 +146,7 @@ protect_ssh() {
 
 
 ###############################################################################
-# OpenRC
+# OpenRC runtime
 ###############################################################################
 
 ensure_openrc_runtime() {
@@ -91,14 +156,193 @@ ensure_openrc_runtime() {
 
 
 ###############################################################################
-# 输入验证
+# Directory preparation
+###############################################################################
+
+prepare_directories() {
+    mkdir -p \
+        /usr/local/bin \
+        "$CONF_DIR" \
+        "$LOG_DIR"
+}
+
+
+###############################################################################
+# Detect CPU architecture
+###############################################################################
+
+detect_arch() {
+    ARCH="$(uname -m)"
+
+    case "$ARCH" in
+        x86_64|amd64)
+            SING_BOX_ARCH="amd64"
+            SING_BOX_FILE="sing-box-amd64"
+            ;;
+
+        aarch64|arm64)
+            SING_BOX_ARCH="arm64"
+            SING_BOX_FILE="sing-box-arm64"
+            ;;
+
+        *)
+            die "不支持的 CPU 架构：${ARCH}
+
+当前脚本支持：
+  x86_64 / amd64
+  aarch64 / arm64"
+            ;;
+    esac
+
+    BIN_URL="${BIN_BASE_URL}/${SING_BOX_FILE}"
+
+    log "CPU 架构：${ARCH}"
+    log "目标架构：${SING_BOX_ARCH}"
+    log "核心文件：${SING_BOX_FILE}"
+}
+
+
+###############################################################################
+# Detect wget / curl
+###############################################################################
+
+detect_download_tool() {
+    if command -v wget >/dev/null 2>&1; then
+        DOWNLOAD_TOOL="wget"
+        return
+    fi
+
+    if command -v curl >/dev/null 2>&1; then
+        DOWNLOAD_TOOL="curl"
+        return
+    fi
+
+    die "系统没有 wget 或 curl，无法下载 sing-box。"
+}
+
+
+###############################################################################
+# Download sing-box safely
+#
+# Important:
+#   Existing /usr/local/bin/sing-box is NOT touched until the new binary
+#   has successfully downloaded and passed the version test.
+###############################################################################
+
+download_binary() {
+    detect_arch
+    detect_download_tool
+
+    rm -f "$BIN_TMP"
+
+    echo
+    log "开始下载 sing-box..."
+    log "下载地址：${BIN_URL}"
+    log "临时文件：${BIN_TMP}"
+
+    case "$DOWNLOAD_TOOL" in
+        wget)
+            wget \
+                -q \
+                --show-progress \
+                --tries=3 \
+                --timeout=20 \
+                -O "$BIN_TMP" \
+                "$BIN_URL" \
+                || die "sing-box 下载失败。"
+            ;;
+
+        curl)
+            curl \
+                -fL \
+                --retry 3 \
+                --connect-timeout 20 \
+                --max-time 300 \
+                -o "$BIN_TMP" \
+                "$BIN_URL" \
+                || die "sing-box 下载失败。"
+            ;;
+    esac
+
+    # Basic file check.
+    [ -s "$BIN_TMP" ] \
+        || die "下载失败：临时文件为空。"
+
+    chmod 755 "$BIN_TMP"
+
+    echo
+    log "正在验证下载的 sing-box..."
+
+    # Do NOT replace existing binary before this succeeds.
+    "$BIN_TMP" version \
+        || die "下载的 sing-box 无法执行。
+
+请检查：
+  - CPU 架构
+  - musl / glibc
+  - GitHub Release 文件
+  - 下载内容是否完整"
+    
+    echo
+    log "临时核心验证成功。"
+
+    echo
+    log "安装前版本信息："
+    "$BIN_TMP" version
+
+    echo
+    log "使用 mv 原子替换正式核心..."
+
+    mv -f "$BIN_TMP" "$BIN_DST"
+
+    chmod 755 "$BIN_DST"
+
+    echo
+    log "sing-box 已安装到：${BIN_DST}"
+
+    echo
+    log "当前版本："
+    "$BIN_DST" version
+}
+
+
+###############################################################################
+# Check installed binary
+###############################################################################
+
+check_binary_exists() {
+    [ -x "$BIN_DST" ] || {
+        die "没有找到 ${BIN_DST}。
+
+请先执行：
+  1) 安装"
+    }
+
+    "$BIN_DST" version >/dev/null 2>&1 || {
+        die "${BIN_DST} 存在，但无法正常执行。"
+    }
+}
+
+check_binary() {
+    check_binary_exists
+
+    log "当前 sing-box："
+    "$BIN_DST" version
+}
+
+
+###############################################################################
+# Validate port
 ###############################################################################
 
 validate_port() {
     port="$1"
 
     case "$port" in
-        ""|*[!0-9]*)
+        "")
+            die "端口不能为空。"
+            ;;
+        *[!0-9]*)
             die "端口必须是数字。"
             ;;
     esac
@@ -108,6 +352,11 @@ validate_port() {
     fi
 }
 
+
+###############################################################################
+# Validate domain
+###############################################################################
+
 validate_domain() {
     domain="$1"
 
@@ -116,7 +365,7 @@ validate_domain() {
             die "域名不能为空。"
             ;;
         */*)
-            die "域名格式不正确，请不要带 /。"
+            die "域名格式不正确，请不要包含 /。"
             ;;
         *:*)
             die "域名格式不正确，请不要带端口。"
@@ -124,15 +373,18 @@ validate_domain() {
         *" "*)
             die "域名格式不正确，请不要包含空格。"
             ;;
-        http://*|https://*)
-            die "请输入纯域名，例如 www.cloudflare.com，不要带 https://。"
+        http://*)
+            die "请输入纯域名，不要带 http://。"
+            ;;
+        https://*)
+            die "请输入纯域名，不要带 https://。"
             ;;
     esac
 }
 
 
 ###############################################################################
-# 询问端口 / REALITY SNI
+# Ask port / REALITY domain
 ###############################################################################
 
 ask_port_domain() {
@@ -154,119 +406,15 @@ ask_port_domain() {
 
     HANDSHAKE_SERVER="$REALITY_DOMAIN"
     HANDSHAKE_PORT="443"
+
+    echo
+    log "监听端口：${PORT}"
+    log "REALITY SNI：${REALITY_DOMAIN}"
 }
 
 
 ###############################################################################
-# 下载工具
-###############################################################################
-
-detect_download_tool() {
-    if command -v wget >/dev/null 2>&1; then
-        DOWNLOAD_TOOL="wget"
-        return
-    fi
-
-    if command -v curl >/dev/null 2>&1; then
-        DOWNLOAD_TOOL="curl"
-        return
-    fi
-
-    die "系统中没有 wget 或 curl，无法下载 sing-box。"
-}
-
-
-###############################################################################
-# 下载 sing-box
-###############################################################################
-
-download_binary() {
-    detect_download_tool
-
-    log "准备下载 sing-box..."
-    log "URL: ${BIN_URL}"
-
-    rm -f "$BIN_TMP"
-
-    case "$DOWNLOAD_TOOL" in
-        wget)
-            wget \
-                -q \
-                --show-progress \
-                -O "$BIN_TMP" \
-                "$BIN_URL" \
-                || die "sing-box 下载失败。"
-            ;;
-        curl)
-            curl \
-                -fL \
-                --retry 3 \
-                --connect-timeout 15 \
-                --max-time 300 \
-                -o "$BIN_TMP" \
-                "$BIN_URL" \
-                || die "sing-box 下载失败。"
-            ;;
-    esac
-
-    [ -s "$BIN_TMP" ] || die "下载完成，但文件为空。"
-
-    chmod 755 "$BIN_TMP"
-
-    log "检查下载的 sing-box..."
-
-    "$BIN_TMP" version >/dev/null 2>&1 \
-        || die "下载的文件无法执行，可能不是正确的 Alpine/musl sing-box 二进制。"
-
-    log "下载成功。"
-
-    rm -f "$BIN_DST"
-
-    mv "$BIN_TMP" "$BIN_DST"
-
-    chmod 755 "$BIN_DST"
-
-    log "sing-box 已安装到：${BIN_DST}"
-
-    "$BIN_DST" version
-}
-
-
-###############################################################################
-# 检查现有二进制
-###############################################################################
-
-check_binary_exists() {
-    [ -x "$BIN_DST" ] || {
-        die "没有找到 ${BIN_DST}。请先执行安装。"
-    }
-}
-
-check_binary() {
-    check_binary_exists
-
-    "$BIN_DST" version >/dev/null 2>&1 \
-        || die "${BIN_DST} 存在，但无法正常执行。"
-
-    log "当前 sing-box："
-    "$BIN_DST" version
-}
-
-
-###############################################################################
-# 安装目录
-###############################################################################
-
-prepare_directories() {
-    mkdir -p \
-        /usr/local/bin \
-        "$CONF_DIR" \
-        "$LOG_DIR"
-}
-
-
-###############################################################################
-# 停止可能冲突的服务
+# Stop conflicting services
 ###############################################################################
 
 stop_conflicting_services() {
@@ -284,13 +432,17 @@ stop_conflicting_services() {
 
 
 ###############################################################################
-# 生成 UUID / REALITY keypair / short_id
+# Generate UUID / REALITY keypair / short_id
 ###############################################################################
 
 generate_reality_values() {
-    log "生成 VLESS UUID / REALITY 密钥..."
+    log "生成 VLESS UUID..."
 
     UUID="$(cat /proc/sys/kernel/random/uuid)"
+
+    [ -n "$UUID" ] || die "UUID 生成失败。"
+
+    log "生成 REALITY keypair..."
 
     KEYPAIR="$("$BIN_DST" generate reality-keypair)" \
         || die "REALITY keypair 生成失败。"
@@ -305,29 +457,28 @@ generate_reality_values() {
         awk -F': ' 'tolower($1) ~ /public/ {print $2; exit}'
     )"
 
-    SHORT_ID="$(
-        od -An -N8 -tx1 /dev/urandom |
-        tr -d ' \n'
-    )"
-
-    [ -n "$UUID" ] \
-        || die "UUID 生成失败。"
-
     [ -n "$PRIVATE_KEY" ] \
         || die "REALITY private_key 生成失败。"
 
     [ -n "$PUBLIC_KEY" ] \
         || die "REALITY public_key 生成失败。"
 
+    log "生成 REALITY short_id..."
+
+    SHORT_ID="$(
+        od -An -N8 -tx1 /dev/urandom |
+        tr -d ' \n'
+    )"
+
     [ -n "$SHORT_ID" ] \
         || die "REALITY short_id 生成失败。"
 
-    log "UUID / REALITY 参数生成完成。"
+    log "VLESS / REALITY 参数生成完成。"
 }
 
 
 ###############################################################################
-# 写入 sing-box 配置
+# Write sing-box config
 ###############################################################################
 
 write_config() {
@@ -385,7 +536,7 @@ EOF
 
 
 ###############################################################################
-# OpenRC 服务
+# Write OpenRC service
 ###############################################################################
 
 write_openrc_service() {
@@ -404,8 +555,7 @@ pidfile="/run/sing-box.pid"
 output_log="/dev/null"
 error_log="${LOG_DIR}/error.log"
 
-# 低内存环境的 Go runtime 参数。
-# 注意：这不是内存硬限制，只是降低 Go GC / heap 的内存压力。
+# Low-memory Go runtime hints.
 export GOMEMLIMIT="32MiB"
 export GOGC="25"
 
@@ -435,21 +585,37 @@ EOF
 
 
 ###############################################################################
-# 检查配置并启动
+# Validate configuration
 ###############################################################################
 
-test_and_restart() {
+check_config() {
+    [ -f "$CONF_FILE" ] \
+        || die "配置文件不存在：${CONF_FILE}"
+
     log "检查 sing-box 配置..."
 
     "$BIN_DST" check -c "$CONF_FILE" \
-        || die "sing-box 配置检查失败，服务不会启动。"
+        || die "sing-box 配置检查失败。
+
+配置文件：
+${CONF_FILE}"
 
     log "配置检查通过。"
+}
 
+
+###############################################################################
+# Restart service
+###############################################################################
+
+restart_service() {
     log "启动 / 重启 sing-box..."
 
     rc-service sing-box restart \
-        || die "sing-box 启动失败，请检查日志：${LOG_DIR}/error.log"
+        || die "sing-box 启动失败。
+
+请检查：
+${LOG_DIR}/error.log"
 
     echo
     log "服务状态："
@@ -459,7 +625,17 @@ test_and_restart() {
 
 
 ###############################################################################
-# 获取服务器公网 IP
+# Test configuration and restart
+###############################################################################
+
+test_and_restart() {
+    check_config
+    restart_service
+}
+
+
+###############################################################################
+# Detect public IP
 ###############################################################################
 
 detect_server_ip() {
@@ -471,17 +647,20 @@ detect_server_ip() {
 
     if command -v wget >/dev/null 2>&1; then
         SERVER_ADDR="$(
-            wget -qO- \
-            https://api.ipify.org \
-            2>/dev/null || true
-        )"
+            wget \
+                -qO- \
+                --timeout=10 \
+                https://api.ipify.org \
+                2>/dev/null || true
+        )
     elif command -v curl >/dev/null 2>&1; then
         SERVER_ADDR="$(
-            curl -fsSL \
-            --max-time 10 \
-            https://api.ipify.org \
-            2>/dev/null || true
-        )"
+            curl \
+                -fsSL \
+                --max-time 10 \
+                https://api.ipify.org \
+                2>/dev/null || true
+        )
     fi
 
     if [ -z "$SERVER_ADDR" ]; then
@@ -494,7 +673,7 @@ detect_server_ip() {
 
 
 ###############################################################################
-# 写入节点信息
+# Write node information
 ###############################################################################
 
 write_info() {
@@ -505,15 +684,32 @@ write_info() {
     cat > "$INFO_FILE" <<EOF
 sing-box VLESS + REALITY
 
-Address: ${SERVER_ADDR}
-Port: ${PORT}
+Architecture:
+${SING_BOX_ARCH}
 
-UUID: ${UUID}
-Flow: xtls-rprx-vision
-Network: tcp
-Security: reality
+Binary:
+${BIN_DST}
 
-SNI / serverName: ${REALITY_DOMAIN}
+Address:
+${SERVER_ADDR}
+
+Port:
+${PORT}
+
+UUID:
+${UUID}
+
+Flow:
+xtls-rprx-vision
+
+Network:
+tcp
+
+Security:
+reality
+
+SNI / serverName:
+${REALITY_DOMAIN}
 
 Handshake:
 ${HANDSHAKE_SERVER}:${HANDSHAKE_PORT}
@@ -553,56 +749,80 @@ EOF
 
     echo "提示："
     echo "1. 请确认云服务器安全组 / 防火墙已放行 TCP ${PORT}。"
-    echo "2. 请确认 ${REALITY_DOMAIN}:443 可以正常访问。"
+    echo "2. 请确认 REALITY handshake 目标 ${REALITY_DOMAIN}:443 可访问。"
     echo "3. 节点信息已保存到：${INFO_FILE}"
 }
 
 
 ###############################################################################
-# 安装
+# Install mode
 ###############################################################################
 
 install_mode() {
     echo
-    echo "=== 安装 sing-box + 生成 REALITY 配置 ==="
-
-    ask_port_domain
+    echo "=============================================="
+    echo " 安装 sing-box + VLESS REALITY"
+    echo "=============================================="
 
     protect_ssh
 
+    # 1. Detect architecture
+    detect_arch
+
+    # 2. Prepare directories
     prepare_directories
 
-    # 自动下载指定版本
+    # 3. Download selected architecture binary
+    # 4. Validate temporary binary
+    # 5. mv to final location
     download_binary
 
+    # Check final binary after installation.
+    check_binary
+
+    # Ask configuration parameters.
+    ask_port_domain
+
+    # Stop old services before starting the new one.
     stop_conflicting_services
 
+    # Generate new VLESS / REALITY credentials.
     generate_reality_values
 
+    # Write configuration.
     write_config
 
+    # Write OpenRC service.
     write_openrc_service
 
+    # Check configuration and start service.
     test_and_restart
 
+    # Save client information.
     write_info
 }
 
 
 ###############################################################################
-# 更新配置
+# Update configuration mode
+#
+# Does NOT download the binary.
 ###############################################################################
 
 update_config_mode() {
     echo
-    echo "=== 更新 REALITY 配置 ==="
-
-    ask_port_domain
+    echo "=============================================="
+    echo " 更新 VLESS REALITY 配置"
+    echo "=============================================="
 
     protect_ssh
 
     check_binary
 
+    ask_port_domain
+
+    stop_conflicting_services
+
     generate_reality_values
 
     write_config
@@ -616,53 +836,78 @@ update_config_mode() {
 
 
 ###############################################################################
-# 更新 sing-box 二进制
+# Update binary mode
+#
+# Automatically detects CPU architecture again.
 ###############################################################################
 
 update_binary_mode() {
     echo
-    echo "=== 更新 sing-box 二进制 ==="
+    echo "=============================================="
+    echo " 更新 sing-box 二进制"
+    echo "=============================================="
 
     protect_ssh
 
     prepare_directories
 
+    detect_arch
+
+    echo
+    echo "当前系统架构：${ARCH}"
+    echo "目标 sing-box：${SING_BOX_FILE}"
+    echo "下载地址：${BIN_URL}"
+    echo
+
     stop_conflicting_services
 
+    # Download -> temporary version check -> mv.
     download_binary
 
+    check_binary
+
+    # If configuration exists, validate it before restarting.
     if [ -f "$CONF_FILE" ]; then
-        log "检测到现有配置，重新检查配置..."
+        echo
+        log "检测到现有配置。"
 
-        "$BIN_DST" check -c "$CONF_FILE" \
-            || die "现有配置与当前 sing-box 不兼容。"
+        check_config
 
-        rc-service sing-box restart \
-            || die "sing-box 重启失败。"
+        restart_service
+    else
+        warn "没有找到现有配置：${CONF_FILE}"
+        warn "二进制已更新，但不会自动创建节点配置。"
     fi
 
     echo
     log "sing-box 二进制更新完成。"
 
     "$BIN_DST" version
-
-    rc-service sing-box status || true
 }
 
 
 ###############################################################################
-# 查看状态
+# Show status
 ###############################################################################
 
 show_status() {
     echo
-    echo "=== 当前状态 ==="
+    echo "=============================================="
+    echo " 当前状态"
+    echo "=============================================="
 
     echo
+    echo "--- CPU architecture ---"
+
+    uname -m 2>/dev/null || true
+
+    echo
+    echo "--- sing-box ---"
+
     if [ -x "$BIN_DST" ]; then
         "$BIN_DST" version || true
     else
-        warn "未安装 sing-box：${BIN_DST} 不存在。"
+        warn "未安装 sing-box：${BIN_DST}"
     fi
 
     echo
@@ -673,9 +918,26 @@ show_status() {
     echo
     echo "--- Listening ports ---"
 
-    ss -lntp 2>/dev/null |
-        grep sing-box ||
-        true
+    if command -v ss >/dev/null 2>&1; then
+        ss -lntp 2>/dev/null |
+            grep sing-box ||
+            true
+    else
+        warn "系统没有 ss，无法显示监听端口。"
+    fi
+
+    echo
+    echo "--- Configuration ---"
+
+    if [ -f "$CONF_FILE" ]; then
+        echo "$CONF_FILE"
+
+        if [ -x "$BIN_DST" ]; then
+            "$BIN_DST" check -c "$CONF_FILE" 2>/dev/null || true
+        fi
+    else
+        warn "配置文件不存在：${CONF_FILE}"
+    fi
 
     echo
     echo "--- Node information ---"
@@ -691,7 +953,7 @@ show_status() {
 
 
 ###############################################################################
-# 主菜单
+# Main menu
 ###############################################################################
 
 main_menu() {
@@ -702,7 +964,8 @@ main_menu() {
         echo " sing-box VLESS + REALITY for Alpine"
         echo "=============================================="
         echo " Version: 1.13.21"
-        echo " Arch: amd64 / musl"
+        echo " Binary: musl"
+        echo " Architecture: amd64 / arm64"
         echo "=============================================="
         echo " 1) 安装"
         echo " 2) 更新配置"
@@ -720,20 +983,25 @@ main_menu() {
                 install_mode
                 break
                 ;;
+
             2)
                 update_config_mode
                 break
                 ;;
+
             3)
                 update_binary_mode
                 break
                 ;;
+
             4)
                 show_status
                 ;;
+
             0)
                 exit 0
                 ;;
+
             *)
                 echo "无效选择。"
                 pause
@@ -749,7 +1017,6 @@ main_menu() {
 
 main() {
     require_root
-
     main_menu
 }
 
