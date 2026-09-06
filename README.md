@@ -1,3 +1,5 @@
+自用脚本，不一定能用
+
 `````
 wget -O /usr/local/bin/argo https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/argo.sh && chmod +x /usr/local/bin/argo && argo install
 `````
