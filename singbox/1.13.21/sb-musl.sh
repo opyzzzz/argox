@@ -1,4 +1,3 @@
-```sh
 #!/bin/ash
 # setup-singbox-reality.sh
 #
@@ -1036,4 +1035,3 @@ main() {
 }
 
 main "$@"
-```
