@@ -291,7 +291,7 @@ generate_reality_values() {
 
   PRIVATE_KEY="$(echo "$KEYPAIR" | awk -F': *' 'tolower($1) ~ /private/ {print $2; exit}')"
   PUBLIC_KEY="$(echo "$KEYPAIR" | awk -F': *' 'tolower($1) ~ /public/ {print $2; exit}')"
-  SHORT_ID="$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+  SHORT_ID="$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
 
   [ -n "$UUID" ] || die "UUID 生成失败。"
   [ -n "$PRIVATE_KEY" ] || die "REALITY private_key 生成失败。"
