@@ -1,3 +1,4 @@
+```sh
 #!/bin/ash
 # setup-singbox-reality.sh
 #
@@ -640,11 +641,10 @@ test_and_restart() {
 ###############################################################################
 
 detect_server_ip() {
-    SERVER_ADDR="${SERVER_ADDR:-}"
-
-    if [ -n "$SERVER_ADDR" ]; then
-        return
-    fi
+    # Do not inherit SERVER_ADDR from the remote execution environment.
+    # This prevents an external environment variable from contaminating
+    # the generated VLESS client link.
+    SERVER_ADDR=""
 
     if command -v wget >/dev/null 2>&1; then
         SERVER_ADDR="$(
@@ -664,12 +664,22 @@ detect_server_ip() {
         )
     fi
 
-    if [ -z "$SERVER_ADDR" ]; then
-        SERVER_ADDR="你的服务器IP"
+    # Remove accidental CR/LF and whitespace.
+    SERVER_ADDR="$(
+        printf '%s' "$SERVER_ADDR" |
+        tr -d '[:space:]'
+    )"
 
-        warn "无法自动获取公网 IP。"
-        warn "请在客户端链接中手动替换服务器地址。"
-    fi
+    # This script generates an IPv4 node address.
+    # Reject anything containing characters other than digits and dots.
+    case "$SERVER_ADDR" in
+        ''|*[!0-9.]*)
+            SERVER_ADDR="你的服务器IP"
+
+            warn "无法获取有效的公网 IPv4 地址。"
+            warn "请在客户端链接中手动替换服务器地址。"
+            ;;
+    esac
 }
 
 
@@ -1026,3 +1036,4 @@ main() {
 }
 
 main "$@"
+```
