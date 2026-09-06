@@ -48,3 +48,8 @@ check-dot dns
 `````
 wget -qO- https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/dns-check.sh | bash
 `````
+
+sb-musl安装
+`````
+wget -qO /tmp/sb-musl.sh https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/singbox/1.13.21/sb-musl.sh && chmod +x /tmp/sb-musl.sh && /tmp/sb-musl.sh
+`````
