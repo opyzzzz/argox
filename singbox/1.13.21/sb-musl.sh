@@ -467,7 +467,7 @@ generate_reality_values() {
     log "生成 REALITY short_id..."
 
     SHORT_ID="$(
-        od -An -N8 -tx1 /dev/urandom |
+        od -An -N4 -tx1 /dev/urandom |
         tr -d ' \n'
     )"
 
@@ -860,10 +860,14 @@ update_binary_mode() {
     echo "下载地址：${BIN_URL}"
     echo
 
-    stop_conflicting_services
-
-    # Download -> temporary version check -> mv.
+    # Download and validate the new binary BEFORE stopping the existing service.
+    # This prevents a failed download from unnecessarily taking down the
+    # currently running sing-box service.
     download_binary
+
+    # Only stop services after the new binary has been successfully downloaded,
+    # validated, and atomically installed.
+    stop_conflicting_services
 
     check_binary
 
