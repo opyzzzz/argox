@@ -848,6 +848,118 @@ remove_ssh_port() {
     done < <(ssh_port_config_files)
 }
 
+change_ssh_port() {
+    is_ssh_installed || { print_error "SSH 尚未安装。"; return 1; }
+    local old_port new_port backup
+    old_port="$(get_ssh_port)"
+    echo "当前 SSH 有效端口：$old_port"
+    read -r -p "新的 SSH 端口（1-65535）: " new_port
+    if ! [[ "$new_port" =~ ^[0-9]+$ ]] || (( new_port < 1 || new_port > 65535 )); then
+        print_error "端口号无效。"
+        return 1
+    fi
+    [[ "$new_port" == "$old_port" ]] && { print_warning "端口没有变化。"; return 0; }
+    if port_is_listening "$new_port"; then
+        print_error "端口 $new_port 已被占用。"
+        return 1
+    fi
+
+    backup="$(backup_sshd_config)" || { print_error "无法备份 SSH 配置。"; return 1; }
+    if is_ufw_installed && ! ensure_ufw_ssh_rule "$new_port"; then
+        print_error "UFW 无法放行新端口，停止操作。"
+        return 1
+    fi
+
+    if ! set_ssh_ports "$old_port" "$new_port"; then
+        restore_sshd_config_backup "$backup" || true
+        return 1
+    fi
+    if ! restart_ssh; then
+        print_error "SSH 重启失败，恢复配置。"
+        restore_sshd_config_backup "$backup" || true
+        restart_ssh >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    sleep 1
+    if ! port_is_listening "$new_port"; then
+        print_error "新端口未监听，恢复配置。"
+        restore_sshd_config_backup "$backup" || true
+        restart_ssh >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    print_success "SSH 已实际监听 $old_port 和 $new_port。"
+    print_warning "请先在另一个终端测试：ssh -p $new_port <用户>@<服务器IP>"
+    if confirm_action "确认新端口可登录后，是否移除旧端口 $old_port？"; then
+        backup="$(backup_sshd_config)" || return 1
+        if ! remove_ssh_port "$old_port"; then
+            restore_sshd_config_backup "$backup" || true
+            restart_ssh >/dev/null 2>&1 || true
+            print_error "移除旧端口配置失败，已恢复。"
+            return 1
+        fi
+        if test_sshd_config && restart_ssh; then
+            if is_ufw_installed; then
+                ufw delete allow "$old_port/tcp" >/dev/null 2>&1 || true
+            fi
+            print_success "旧 SSH 端口 $old_port 已移除。"
+        else
+            restore_sshd_config_backup "$backup" || true
+            restart_ssh >/dev/null 2>&1 || true
+            print_error "移除旧端口失败，已恢复。"
+            return 1
+        fi
+    else
+        print_info "保留旧端口 $old_port。"
+    fi
+}
+
+restore_default_ssh_port() {
+    local current backup
+    current="$(get_ssh_port)"
+    [[ "$current" == "$DEFAULT_SSH_PORT" ]] && { print_info "当前已经是 22 端口。"; return 0; }
+
+    backup="$(backup_sshd_config)" || return 1
+    if is_ufw_installed && ! ensure_ufw_ssh_rule "$DEFAULT_SSH_PORT"; then
+        print_error "无法放行 22/tcp。"
+        return 1
+    fi
+    if ! set_ssh_ports "$current" "$DEFAULT_SSH_PORT" || ! restart_ssh; then
+        restore_sshd_config_backup "$backup" || true
+        restart_ssh >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    sleep 1
+    if ! port_is_listening "$DEFAULT_SSH_PORT"; then
+        print_error "22 端口未监听，恢复配置。"
+        restore_sshd_config_backup "$backup" || true
+        restart_ssh >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    print_success "SSH 已切换到 22，原端口 $current 暂时保留。"
+    if confirm_action "确认 22 登录正常后，是否移除旧端口 $current？"; then
+        backup="$(backup_sshd_config)" || return 1
+        if ! remove_ssh_port "$current"; then
+            restore_sshd_config_backup "$backup" || true
+            restart_ssh >/dev/null 2>&1 || true
+            print_error "移除旧端口失败，已恢复。"
+            return 1
+        fi
+        if test_sshd_config && restart_ssh; then
+            is_ufw_installed && ufw delete allow "$current/tcp" >/dev/null 2>&1 || true
+            print_success "旧端口已移除。"
+        else
+            restore_sshd_config_backup "$backup" || true
+            restart_ssh >/dev/null 2>&1 || true
+            print_error "移除旧端口失败，已恢复。"
+            return 1
+        fi
+    fi
+}
+
 # ==================== UFW 规则管理 ====================
 
 show_ufw_rules() {
