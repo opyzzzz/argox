@@ -1261,3 +1261,20 @@ main_menu() {
             3) ssh_port_menu ;;
             4) ufw_menu ;;
             5) ssh_service_menu ;;
+            6) show_detailed_status; pause_menu ;;
+            7) reset_ufw; pause_menu ;;
+            0) return 0 ;;
+            *) print_error "无效选择。" ;;
+        esac
+    done
+}
+
+main() {
+    check_root || exit 1
+    detect_os || exit 1
+    get_target_ssh_user
+    detect_ssh_service
+    main_menu
+}
+
+main "$@"
