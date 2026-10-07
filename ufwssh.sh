@@ -790,9 +790,40 @@ ssh_port_config_files() {
 }
 port_is_listening() {
     local port="$1"
-    command_exists ss || return 1
-    ss -lnt 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)$port$|\]:$port$"
+    if command_exists ss; then
+        ss -lntH 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)$port$|\\]:$port$" && return 0
+    fi
+    if command_exists netstat; then
+        netstat -lnt 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)$port$|\\]:$port$" && return 0
+    fi
+    return 1
 }
+
+sshd_listening_ports() {
+    command_exists sshd || return 1
+    sshd -T 2>/dev/null | awk '$1 == "port" {print $2}'
+}
+
+verify_ssh_port() {
+    local port="$1"
+    if ! sshd_listening_ports | grep -Fxq "$port"; then
+        print_error "sshd 当前生效配置没有端口 $port。"
+        print_info "当前生效端口：$(sshd_listening_ports | tr '
+' ' ' | sed 's/[[:space:]]*$//')"
+        return 1
+    fi
+    if port_is_listening "$port"; then
+        return 0
+    fi
+    print_error "sshd 配置包含端口 $port，但系统没有检测到该端口监听。"
+    if command_exists ss; then
+        ss -lntH 2>/dev/null | sed -n '1,20p' || true
+    elif command_exists netstat; then
+        netstat -lnt 2>/dev/null | sed -n '1,20p' || true
+    fi
+    return 1
+}
+
 ensure_ufw_ssh_rule() {
     local port="$1"
     is_ufw_installed || return 1
@@ -854,7 +885,7 @@ change_ssh_port() {
     fi
 
     sleep 1
-    if ! port_is_listening "$new_port"; then
+    if ! verify_ssh_port "$new_port"; then
         print_error "新端口未监听，恢复配置。"
         restore_sshd_config_backup "$backup" || true
         restart_ssh >/dev/null 2>&1 || true
@@ -904,7 +935,7 @@ restore_default_ssh_port() {
     fi
 
     sleep 1
-    if ! port_is_listening "$DEFAULT_SSH_PORT"; then
+    if ! verify_ssh_port "$DEFAULT_SSH_PORT"; then
         print_error "22 端口未监听，恢复配置。"
         restore_sshd_config_backup "$backup" || true
         restart_ssh >/dev/null 2>&1 || true
@@ -977,11 +1008,52 @@ delete_ufw_rule() {
     is_ufw_installed || { print_error "UFW 尚未安装。"; return 1; }
     ufw status numbered
     echo ""
-    local number
-    read -r -p "要删除的规则编号: " number
-    [[ "$number" =~ ^[0-9]+$ ]] || { print_error "编号必须是数字。"; return 1; }
-    confirm_action "确定删除规则 #$number？" || return 0
-    ufw --force delete "$number"
+    local input token normalized numbers=()
+    read -r -p "要删除的规则编号（可输入 1,3,5 或 1 3 5；连续数字如 135 表示 #1 #3 #5）: " input
+    [[ -n "$input" ]] || { print_error "未输入规则编号。"; return 1; }
+
+    normalized="${input//,/ }"
+    if [[ "$normalized" =~ ^[0-9[:space:]]+$ ]]; then
+        if [[ "$normalized" =~ [[:space:]] ]]; then
+            for token in $normalized; do numbers+=( "$token" ); done
+        else
+            while [[ -n "$normalized" ]]; do
+                token="${normalized:0:1}"
+                numbers+=( "$token" )
+                normalized="${normalized:1}"
+            done
+        fi
+    else
+        print_error "规则编号只能使用数字、空格或逗号。"
+        return 1
+    fi
+
+    local n
+    for n in "${numbers[@]}"; do
+        [[ "$n" =~ ^[0-9]+$ ]] || { print_error "无效规则编号：$n"; return 1; }
+        (( n > 0 )) || { print_error "规则编号必须大于 0。"; return 1; }
+    done
+
+    echo "将删除规则：${numbers[*]}"
+    confirm_action "确定删除以上 UFW 规则？" || return 0
+
+    # 从大编号到小编号删除，避免前面的删除导致后续编号发生偏移。
+    local i j tmp
+    for ((i=0; i<${#numbers[@]}; i++)); do
+        for ((j=i+1; j<${#numbers[@]}; j++)); do
+            if (( numbers[i] < numbers[j] )); then
+                tmp="${numbers[i]}"
+                numbers[i]="${numbers[j]}"
+                numbers[j]="$tmp"
+            fi
+        done
+    done
+
+    for n in "${numbers[@]}"; do
+        if ! ufw --force delete "$n"; then
+            print_warning "删除规则 #$n 失败，继续处理其余规则。"
+        fi
+    done
 }
 
 change_ufw_defaults() {
