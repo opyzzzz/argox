@@ -197,7 +197,8 @@ ufw_status_text() {
         echo "已安装 / 已启用"
     else
         echo "已安装 / 未启用"
-    fi}
+    fi
+}
 configure_ufw_ipv6() {
     is_ufw_installed || return 0
     mkdir -p "$(dirname "$UFW_DEFAULT")"
@@ -221,7 +222,8 @@ debian_prepare_apt() {
 }
 
 debian_install_package() {
-    local package="$1" backup profile
+    local package="${1:-}" backup profile
+    [[ -n "$package" ]] || { print_error "未指定 Debian/Ubuntu 软件包。"; return 1; }
     if debian_prepare_apt && debian_package_available "$package"; then
         DEBIAN_FRONTEND=noninteractive apt-get install -y "$package"
         return $?
@@ -310,35 +312,14 @@ alpine_refresh_repositories() {
     apk update
 }
 
-alpine_enable_community() {
-    command_exists apk || { print_error "未找到 apk。"; return 1; }
-    [[ -f /etc/apk/repositories ]] || { print_error "未找到 /etc/apk/repositories。"; return 1; }
-    if grep -Eq '^[[:space:]]*[^#[:space:]].*/community([[:space:]]*)$' /etc/apk/repositories; then return 0; fi
-    local community_repo=""
-    community_repo="$(awk '
-        /^[[:space:]]*#/ { next }
-        /^[[:space:]]*[^[:space:]]/ {
-            url=$0
-            sub(/[[:space:]]+$/, "", url)
-            if (url ~ /\/main$/) { sub(/\/main$/, "/community", url); print url; exit }
-        }
-    ' /etc/apk/repositories)"
-    if [[ -n "$community_repo" ]]; then
-        printf '%s\n' "$community_repo" >> /etc/apk/repositories
-        print_success "已启用 Alpine community 仓库：$community_repo"
-        return 0
-    fi
-    print_warning "无法从现有仓库自动推导 community 地址。"
-    return 1
-}
-
 alpine_package_available() {
     local package="$1"
     apk policy "$package" 2>/dev/null | grep -Eq '^[^[:space:]].*-[0-9][^:]*:'
 }
 
 alpine_install_package() {
-    local package="$1" branch backup profile
+    local package="${1:-}" branch backup profile
+    [[ -n "$package" ]] || { print_error "未指定 Alpine 软件包。"; return 1; }
     if alpine_refresh_repositories && alpine_package_available "$package"; then
         apk add --no-cache "$package"
         return $?
@@ -392,6 +373,29 @@ install_alpine_ufw() {
     alpine_install_package ufw || return 1
     configure_ufw_ipv6
     print_success "Alpine UFW 安装完成。"
+}
+
+install_ssh() {
+    case "$OS_TYPE" in
+        debian) install_debian_ssh ;;
+        alpine) install_alpine_ssh ;;
+        *) print_error "当前系统不支持 SSH 安装。"; return 1 ;;
+    esac
+}
+
+install_ufw() {
+    case "$OS_TYPE" in
+        debian) install_debian_ufw ;;
+        alpine) install_alpine_ufw ;;
+        *) print_error "当前系统不支持 UFW 安装。"; return 1 ;;
+    esac
+}
+
+install_all() {
+    print_info "开始安装/修复 SSH + UFW..."
+    install_ssh || return 1
+    install_ufw || return 1
+    print_success "SSH + UFW 安装/修复完成。"
 }
 
 
@@ -483,8 +487,8 @@ debian_write_sources() {
         *) print_error "不支持的 APT 软件源配置：$distro / $profile"; return 1 ;;
     esac
 
-    mkdir -p /etc/apt/sources.list.d
-    debian_disable_existing_sources
+    mkdir -p /etc/apt/sources.list.d || return 1
+    debian_disable_existing_sources || return 1
     rm -f "$DEBIAN_MANAGED_SOURCE" "$DEBIAN_MANAGED_LEGACY_SOURCE"
     if debian_apt_supports_deb822; then
         cat > "$DEBIAN_MANAGED_SOURCE" <<EOF
@@ -544,6 +548,7 @@ alpine_version_branch() {
 
 alpine_write_repositories() {
     local branch="$1"
+    mkdir -p "$(dirname "$ALPINE_MANAGED_SOURCE")" || return 1
     cat > "$ALPINE_MANAGED_SOURCE" <<EOF
 https://dl-cdn.alpinelinux.org/alpine/$branch/main
 https://dl-cdn.alpinelinux.org/alpine/$branch/community
@@ -552,6 +557,7 @@ EOF
 
 alpine_write_tuna_repositories() {
     local branch="$1"
+    mkdir -p "$(dirname "$ALPINE_MANAGED_SOURCE")" || return 1
     cat > "$ALPINE_MANAGED_SOURCE" <<EOF
 https://mirrors.tuna.tsinghua.edu.cn/alpine/$branch/main
 https://mirrors.tuna.tsinghua.edu.cn/alpine/$branch/community
@@ -840,7 +846,12 @@ change_ssh_port() {
 
     if confirm_action "确认新端口可登录后，是否移除旧端口 $old_port？"; then
         backup="$(backup_sshd_config)" || return 1
-        remove_ssh_port "$old_port" || return 1
+        if ! remove_ssh_port "$old_port"; then
+            cp -a "$backup" "$SSHD_CONFIG"
+            restart_ssh >/dev/null 2>&1 || true
+            print_error "移除旧端口配置失败，已恢复。"
+            return 1
+        fi
         if test_sshd_config && restart_ssh; then
             if is_ufw_installed; then
                 ufw delete allow "$old_port/tcp" >/dev/null 2>&1 || true
@@ -1018,7 +1029,7 @@ configure_ssh_key() {
     auth_keys="$ssh_dir/authorized_keys"
 
     read -r -p "请粘贴 SSH 公钥: " public_key
-    public_key="$(printf '%s' "$public_key" | tr -d '\r\n' | xargs)"
+    public_key="$(printf '%s' "$public_key" | tr -d '\r\n')"
 
     [[ -n "$public_key" ]] || { print_error "公钥不能为空。"; return 1; }
     printf '%s\n' "$public_key" | grep -qE '^(ssh-rsa|ssh-ed25519|ecdsa-sha2-nistp|sk-ssh-ed25519|sk-ecdsa-sha2)-' || {
