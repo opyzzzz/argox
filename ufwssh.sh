@@ -1,905 +1,1560 @@
 #!/bin/bash
 #
-# Debian UFW 防火墙 + SSH 密钥登录一键配置脚本 (最终修正版 v3.6)
-# 
-# 版本历史：
-#   v3.1 - 修复 sshd_config 文件不存在的问题
-#   v3.2 - 统一变量命名规范和函数封装
-#   v3.3 - 修正防火墙启用顺序防止断连，动态获取用户，IPv6安全处理
-#   v3.4 - 进一步优化错误处理，添加断连保护机制，完善日志输出
-#   v3.5 - 修复 SSH_SERVICE 变量为空导致 systemctl 命令失败
-#   v3.6 - 完善函数调用顺序，优化错误恢复，增强边界条件检查
+# UFW + SSH 交互式管理工具 v4.2
+# Debian/Ubuntu: apt + systemd
+# Alpine Linux:  apk + OpenRC
+#
+# v4.2 修复清单：
+#   - 消除 alpine_packages_available 嵌套定义
+#   - delete_ufw_rule 不再把 "12" 拆成 "#1 #2"
+#   - enable_ufw_safely 放行全部监听端口
+#   - Alpine 确保 sshd_config 含 Include sshd_config.d/*.conf
+#   - detect_ssh_service Alpine grep -qx -> grep -qw
+#   - configure_ssh_key chown 仅改属主
+#   - 补 KbdInteractiveAuthentication no
+#   - remove_ssh_port 清理历史注释
+#   - get_ssh_port 返回主端口，新增 get_all_ssh_ports
+#   - debian_disable_existing_sources 打印被禁用文件
+#   - SSH_USER 拆为 DEFAULT_SSH_USER + 局部 target_user
+#   - 菜单 choice 全部 local
+#   - 函数按域统一前缀重命名
 #
 
-set -e
+set -uo pipefail
 
-# ========== 全局常量定义 ==========
-readonly RED='\033[0;31m'
-readonly GREEN='\033[0;32m'
-readonly YELLOW='\033[1;33m'
-readonly BLUE='\033[0;34m'
-readonly NC='\033[0m'
+# ============================================================
+# 0. 常量
+# ============================================================
 
-readonly SSHD_CONFIG="/etc/ssh/sshd_config"
-readonly SSHD_CONFIG_DIR="/etc/ssh/sshd_config.d"
-readonly UFW_DEFAULT="/etc/default/ufw"
-readonly MIN_PORT=1024
-readonly MAX_PORT=65535
-readonly DEFAULT_PORT=2222
-readonly DEFAULT_SSH_PORT=22
-readonly SCRIPT_VERSION="v3.6"
+SCRIPT_VERSION="v4.2"
+SSHD_CONFIG="/etc/ssh/sshd_config"
+SSHD_CONFIG_DIR="/etc/ssh/sshd_config.d"
+UFW_DEFAULT="/etc/default/ufw"
+DEFAULT_SSH_PORT=22
 
-# ========== 全局变量声明（按使用顺序） ==========
-SSH_USER="root"                    # 操作目标用户
-SSH_SERVICE=""                     # SSH服务名称（ssh或sshd）
-CURRENT_SSH_PORT="$DEFAULT_SSH_PORT"  # 当前SSH端口
-NEW_SSH_PORT=""                    # 新SSH端口
-STACK_TYPE=""                      # 网络栈类型
-STACK_DESC=""                      # 网络栈描述
-IPV4_ADDR=""                       # IPv4地址
-IPV6_ADDR=""                       # IPv6地址
-BACKUP_FILE=""                     # SSH配置备份文件路径
-AUTH_KEYS_FILE=""                  # 授权密钥文件路径
+SOURCE_BACKUP_ROOT="/etc/ufwssh/source-backups"
+SSH_BACKUP_ROOT="/etc/ufwssh/ssh-backups"
+DEBIAN_MANAGED_SOURCE="/etc/apt/sources.list.d/ufwssh-official.sources"
+DEBIAN_MANAGED_LEGACY_SOURCE="/etc/apt/sources.list.d/ufwssh-official.list"
+ALPINE_MANAGED_SOURCE="/etc/apk/repositories"
 
-# ========== 工具函数 ==========
-print_banner() {
-    echo -e "${GREEN}========================================${NC}"
-    echo -e "${GREEN}  Debian UFW + SSH 安全配置脚本 ${SCRIPT_VERSION}${NC}"
-    echo -e "${GREEN}========================================${NC}"
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+# 全局状态
+OS_TYPE=""
+OS_NAME=""
+OS_VERSION=""
+SSH_SERVICE=""
+DEFAULT_SSH_USER="root"
+CURRENT_SSH_PORT="$DEFAULT_SSH_PORT"
+
+# ============================================================
+# 1. 基础工具层
+# ============================================================
+
+ui_print_banner() {
+    clear 2>/dev/null || true
+    echo -e "$GREEN============================================================$NC"
+    echo -e "$GREEN             UFW + SSH 管理工具 $SCRIPT_VERSION$NC"
+    echo -e "$GREEN============================================================$NC"
     echo ""
 }
 
-print_error() { 
-    echo -e "${RED}错误：$1${NC}" >&2
-    logger -t "ssh-setup" "ERROR: $1" 2>/dev/null || true
+ui_error() { echo -e "$RED错误：$1$NC" >&2; }
+ui_warning() { echo -e "$YELLOW警告：$1$NC"; }
+ui_success() { echo -e "$GREEN$1$NC"; }
+ui_info() { echo -e "$BLUE$1$NC"; }
+
+ui_pause() { echo ""; read -r -p "按 Enter 返回..." _; }
+
+ui_confirm() {
+    local answer
+    read -r -p "$1 [y/N]: " answer
+    [[ "$answer" =~ ^[Yy]$ ]]
 }
 
-print_warning() { 
-    echo -e "${YELLOW}警告：$1${NC}"
-    logger -t "ssh-setup" "WARNING: $1" 2>/dev/null || true
+sys_command_exists() { command -v "$1" >/dev/null 2>&1; }
+
+sys_check_root() {
+    [[ "$EUID" -eq 0 ]] || { ui_error "此脚本必须以 root 用户执行。"; return 1; }
 }
 
-print_success() { 
-    echo -e "${GREEN}$1${NC}"
-    logger -t "ssh-setup" "SUCCESS: $1" 2>/dev/null || true
-}
+# ============================================================
+# 2. 系统探测层
+# ============================================================
 
-print_info() { 
-    echo -e "${BLUE}$1${NC}"
-    logger -t "ssh-setup" "INFO: $1" 2>/dev/null || true
-}
-
-# ========== SSH 服务管理函数 ==========
-detect_ssh_service() {
-    # 如果已经检测到，直接返回
-    [[ -n "$SSH_SERVICE" ]] && return 0
-    
-    print_info "检测 SSH 服务名称..."
-    local detected_service=""
-    
-    # 方法1: 通过 systemctl list-unit-files 查找
-    if systemctl list-unit-files 2>/dev/null | grep -qE "^(sshd|ssh)\.service"; then
-        detected_service=$(systemctl list-unit-files 2>/dev/null | grep -oE "^(sshd|ssh)\.service" | head -1 | sed 's/\.service//')
+sys_detect_os() {
+    if [[ -f /etc/alpine-release ]]; then
+        OS_TYPE="alpine"
+        OS_NAME="Alpine Linux"
+        OS_VERSION="$(cat /etc/alpine-release 2>/dev/null || true)"
+        return 0
     fi
-    
-    # 方法2: 通过服务状态检查
-    if [[ -z "$detected_service" ]]; then
-        for svc in sshd ssh; do
-            if systemctl status "$svc" >/dev/null 2>&1; then
-                detected_service="$svc"
-                break
-            fi
-        done
-    fi
-    
-    # 方法3: 通过进程名检查
-    if [[ -z "$detected_service" ]]; then
-        if pgrep -x "sshd" >/dev/null 2>&1; then
-            detected_service="sshd"
-        elif pgrep -x "ssh" >/dev/null 2>&1; then
-            detected_service="ssh"
+
+    if [[ -f /etc/debian_version ]]; then
+        OS_TYPE="debian"
+        OS_NAME="Debian/Ubuntu"
+        OS_VERSION="$(cat /etc/debian_version 2>/dev/null || true)"
+        if [[ -r /etc/os-release ]]; then
+            OS_NAME="$(grep '^PRETTY_NAME=' /etc/os-release | cut -d= -f2- | tr -d '"')"
+            OS_VERSION="$(grep '^VERSION_ID=' /etc/os-release | cut -d= -f2- | tr -d '"')"
         fi
+        return 0
     fi
-    
-    # 方法4: 使用发行版默认值
-    if [[ -z "$detected_service" ]]; then
-        if [[ -f /etc/debian_version ]]; then
-            detected_service="ssh"  # Debian/Ubuntu 默认
-        else
-            detected_service="sshd" # RHEL/CentOS 默认
-        fi
-        print_warning "使用默认服务名: $detected_service"
-    fi
-    
-    SSH_SERVICE="$detected_service"
-    print_success "SSH 服务名称: $SSH_SERVICE"
-    return 0
+
+    ui_error "不支持的操作系统，仅支持 Debian/Ubuntu 和 Alpine Linux。"
+    return 1
 }
 
-validate_ssh_service() {
-    # 验证 SSH_SERVICE 变量和实际服务
-    if [[ -z "$SSH_SERVICE" ]]; then
-        print_error "SSH_SERVICE 变量为空"
-        return 1
-    fi
-    
-    if ! systemctl list-unit-files 2>/dev/null | grep -q "^${SSH_SERVICE}.service"; then
-        print_warning "$SSH_SERVICE.service 未注册，尝试备选名称"
-        
-        # 尝试备选名称
-        local alt_service=""
-        if [[ "$SSH_SERVICE" == "ssh" ]]; then
-            alt_service="sshd"
-        else
-            alt_service="ssh"
-        fi
-        
-        if systemctl list-unit-files 2>/dev/null | grep -q "^${alt_service}.service"; then
-            print_info "切换到备选服务: $alt_service"
-            SSH_SERVICE="$alt_service"
-        else
-            print_error "无法找到有效的 SSH 服务"
-            return 1
-        fi
-    fi
-    
-    return 0
+sys_service_manager() {
+    case "$OS_TYPE" in
+        debian) echo "systemd" ;;
+        alpine) echo "OpenRC" ;;
+        *) echo "unknown" ;;
+    esac
 }
 
-safe_ssh_command() {
-    # 统一的 SSH 服务操作函数
-    local action="${1:-status}"
-    
-    # 确保 SSH_SERVICE 已设置
-    if [[ -z "$SSH_SERVICE" ]]; then
-        detect_ssh_service || return 1
+sys_get_distro_id() {
+    [[ -r /etc/os-release ]] || return 1
+    (
+        . /etc/os-release
+        printf '%s\n' "$ID"
+    )
+}
+
+sys_get_distro_codename() {
+    local codename=""
+    if [[ -r /etc/os-release ]]; then
+        codename="$(
+            . /etc/os-release
+            printf '%s\n' "${VERSION_CODENAME:-${UBUNTU_CODENAME:-}}"
+        )"
     fi
-    
-    # 验证服务有效性
-    validate_ssh_service || return 1
-    
-    print_info "执行: systemctl $action $SSH_SERVICE"
-    
-    case "$action" in
-        restart|start|stop|enable|disable)
-            if systemctl "$action" "$SSH_SERVICE" 2>/dev/null; then
-                print_success "systemctl $action $SSH_SERVICE 成功"
-                return 0
-            else
-                print_error "systemctl $action $SSH_SERVICE 失败"
-                return 1
+    if [[ -z "$codename" ]] && sys_command_exists lsb_release; then
+        codename="$(lsb_release -cs 2>/dev/null || true)"
+    fi
+    printf '%s\n' "$codename"
+}
+
+# ============================================================
+# 3. SSH 服务抽象层
+# ============================================================
+
+ssh_detect_service() {
+    SSH_SERVICE=""
+    case "$OS_TYPE" in
+        debian)
+            if systemctl list-unit-files 2>/dev/null | grep -q '^ssh\.service'; then
+                SSH_SERVICE="ssh"
+            elif systemctl list-unit-files 2>/dev/null | grep -q '^sshd\.service'; then
+                SSH_SERVICE="sshd"
+            elif sys_command_exists sshd; then
+                SSH_SERVICE="ssh"
             fi
             ;;
-        status|is-active)
-            systemctl "$action" "$SSH_SERVICE" 2>/dev/null
-            return $?
-            ;;
-        *)
-            print_error "不支持的操作: $action"
-            return 1
+        alpine)
+            if rc-status --servicelist 2>/dev/null | grep -qw 'sshd'; then
+                SSH_SERVICE="sshd"
+            elif sys_command_exists sshd; then
+                SSH_SERVICE="sshd"
+            fi
             ;;
     esac
 }
 
-safe_sshd_test() {
-    # 安全的 SSH 配置测试
-    local error_output
-    if error_output=$(sshd -t 2>&1); then
-        return 0
+ssh_is_installed() {
+    case "$OS_TYPE" in
+        debian) dpkg-query -W -f='${Status}' openssh-server 2>/dev/null | grep -q 'install ok installed' ;;
+        alpine) apk info -e openssh >/dev/null 2>&1 ;;
+        *) return 1 ;;
+    esac
+}
+
+ssh_is_running() {
+    [[ -n "$SSH_SERVICE" ]] || ssh_detect_service
+    case "$OS_TYPE" in
+        debian) [[ -n "$SSH_SERVICE" ]] && systemctl is-active --quiet "$SSH_SERVICE" 2>/dev/null ;;
+        alpine) [[ -n "$SSH_SERVICE" ]] && rc-service "$SSH_SERVICE" status >/dev/null 2>&1 ;;
+        *) return 1 ;;
+    esac
+}
+
+ssh_is_enabled() {
+    [[ -n "$SSH_SERVICE" ]] || ssh_detect_service
+    case "$OS_TYPE" in
+        debian) [[ -n "$SSH_SERVICE" ]] && systemctl is-enabled --quiet "$SSH_SERVICE" 2>/dev/null ;;
+        alpine) rc-update show default 2>/dev/null | grep -Eq '^[[:space:]]*sshd[[:space:]]' ;;
+        *) return 1 ;;
+    esac
+}
+
+ssh_start() {
+    [[ -n "$SSH_SERVICE" ]] || ssh_detect_service
+    case "$OS_TYPE" in
+        debian) systemctl start "$SSH_SERVICE" ;;
+        alpine) rc-service "$SSH_SERVICE" start ;;
+        *) return 1 ;;
+    esac
+}
+
+ssh_stop() {
+    [[ -n "$SSH_SERVICE" ]] || ssh_detect_service
+    case "$OS_TYPE" in
+        debian) systemctl stop "$SSH_SERVICE" ;;
+        alpine) rc-service "$SSH_SERVICE" stop ;;
+        *) return 1 ;;
+    esac
+}
+
+ssh_restart() {
+    [[ -n "$SSH_SERVICE" ]] || ssh_detect_service
+    case "$OS_TYPE" in
+        debian) systemctl restart "$SSH_SERVICE" ;;
+        alpine) rc-service "$SSH_SERVICE" restart ;;
+        *) return 1 ;;
+    esac
+}
+
+ssh_enable() {
+    [[ -n "$SSH_SERVICE" ]] || ssh_detect_service
+    case "$OS_TYPE" in
+        debian) systemctl enable "$SSH_SERVICE" ;;
+        alpine) rc-update add "$SSH_SERVICE" default ;;
+        *) return 1 ;;
+    esac
+}
+
+ssh_disable() {
+    [[ -n "$SSH_SERVICE" ]] || ssh_detect_service
+    case "$OS_TYPE" in
+        debian) systemctl disable "$SSH_SERVICE" ;;
+        alpine) rc-update del "$SSH_SERVICE" default ;;
+        *) return 1 ;;
+    esac
+}
+
+ssh_status_text() {
+    if ! ssh_is_installed; then
+        echo "未安装"
+    elif ssh_is_running; then
+        echo "已安装 / 运行中"
     else
-        print_error "SSH 配置测试失败: $error_output"
-        return 1
+        echo "已安装 / 未运行"
     fi
 }
 
-# ========== 系统检查函数 ==========
-check_root() {
-    if [[ $EUID -ne 0 ]]; then
-        print_error "此脚本必须以 root 用户执行"
-        exit 1
-    fi
-    
-    # 动态获取实际操作的用户
-    if [[ -n "$SUDO_USER" ]]; then
-        SSH_USER="$SUDO_USER"
-        print_info "检测到 sudo 用户: $SSH_USER"
+# ============================================================
+# 4. UFW 抽象层
+# ============================================================
+
+ufw_is_installed() { sys_command_exists ufw; }
+
+ufw_is_active() {
+    ufw_is_installed || return 1
+    ufw status 2>/dev/null | head -1 | grep -q '^Status: active'
+}
+
+ufw_status_text() {
+    if ! ufw_is_installed; then
+        echo "未安装"
+    elif ufw_is_active; then
+        echo "已安装 / 已启用"
     else
-        SSH_USER="root"
-        print_info "使用 root 用户"
-    fi
-    
-    # 验证用户存在性
-    if ! id "$SSH_USER" &>/dev/null; then
-        print_warning "用户 $SSH_USER 不存在，回退为 root"
-        SSH_USER="root"
+        echo "已安装 / 未启用"
     fi
 }
 
-check_ssh_service() {
-    print_info "[0/10] 检查 SSH 服务..."
-    
-    # 1. 检测服务名称
-    detect_ssh_service || {
-        print_error "无法检测 SSH 服务名称"
-        exit 1
-    }
-    
-    # 2. 检查并安装 OpenSSH
-    if ! dpkg -l 2>/dev/null | grep -qE "^ii\s+openssh-server"; then
-        print_warning "未检测到 OpenSSH 服务，正在安装..."
-        apt-get update -qq
-        apt-get install -y openssh-server || {
-            print_error "OpenSSH 安装失败"
-            exit 1
-        }
-        print_success "OpenSSH 服务安装完成"
-    else
-        print_success "OpenSSH 服务已安装"
-    fi
-    
-    # 3. 确保服务运行
-    if ! systemctl is-active --quiet "$SSH_SERVICE" 2>/dev/null; then
-        print_warning "$SSH_SERVICE 服务未运行，正在启动..."
-        safe_ssh_command "start" || {
-            print_error "无法启动 SSH 服务"
-            exit 1
-        }
-    fi
-    
-    # 4. 设置开机自启
-    safe_ssh_command "enable" || print_warning "无法设置 $SSH_SERVICE 开机自启"
-    
-    echo ""
-}
-
-check_network() {
-    print_info "[1/10] 检查网络环境..."
-    
-    # 获取 IPv4 地址
-    IPV4_ADDR=$(ip -4 addr show scope global 2>/dev/null | \
-                grep -w "inet" | \
-                grep -v "127.0.0.1" | \
-                awk '{print $2}' | \
-                cut -d/ -f1 | \
-                head -1)
-    
-    # 获取 IPv6 地址（改进过滤逻辑）
-    IPV6_ADDR=$(ip -6 addr show scope global 2>/dev/null | \
-                grep -w "inet6" | \
-                grep -vE "fe80:|temporary|deprecated" | \
-                grep -v "::1" | \
-                awk '{print $2}' | \
-                cut -d/ -f1 | \
-                head -1)
-    
-    echo "  检测到 IPv4: ${IPV4_ADDR:-无}"
-    echo "  检测到 IPv6: ${IPV6_ADDR:-无}"
-    
-    # 验证网络栈类型与IP可用性
-    local can_continue=true
-    
-    if [[ "$STACK_TYPE" == "ipv6" ]] && [[ -z "$IPV6_ADDR" ]]; then
-        print_error "选择仅 IPv6 但未检测到公网 IPv6 地址"
-        can_continue=false
-    elif [[ "$STACK_TYPE" == "ipv4" ]] && [[ -z "$IPV4_ADDR" ]]; then
-        print_error "选择仅 IPv4 但未检测到公网 IPv4 地址"
-        can_continue=false
-    elif [[ "$STACK_TYPE" == "dual" ]] && [[ -z "$IPV4_ADDR" ]] && [[ -z "$IPV6_ADDR" ]]; then
-        print_error "选择双栈但未检测到任何公网 IP 地址"
-        can_continue=false
-    fi
-    
-    if ! $can_continue; then
-        read -p "是否继续？(y/n): " CONTINUE
-        [[ "$CONTINUE" != "y" && "$CONTINUE" != "Y" ]] && exit 1
-    fi
-    
-    print_success "网络环境检查完成"
-    echo ""
-}
-
-# ========== 用户配置函数 ==========
-configure_port() {
-    print_info "[配置] SSH 端口设置"
-    
-    while true; do
-        read -p "请输入新的 SSH 端口号 (${MIN_PORT}-${MAX_PORT}，默认 ${DEFAULT_PORT}): " input_port
-        NEW_SSH_PORT=${input_port:-$DEFAULT_PORT}
-        
-        # 验证端口号
-        if [[ ! "$NEW_SSH_PORT" =~ ^[0-9]+$ ]]; then
-            print_error "端口号必须为数字"
-            continue
-        fi
-        
-        if [[ "$NEW_SSH_PORT" -lt "$MIN_PORT" ]] || [[ "$NEW_SSH_PORT" -gt "$MAX_PORT" ]]; then
-            print_error "端口号必须在 ${MIN_PORT}-${MAX_PORT} 之间"
-            continue
-        fi
-        
-        # 检查端口是否被占用
-        if ss -tlnp 2>/dev/null | grep -q ":${NEW_SSH_PORT}\s"; then
-            print_warning "端口 $NEW_SSH_PORT 已被占用"
-            read -p "是否继续使用此端口？(y/n): " use_occupied
-            [[ "$use_occupied" != "y" && "$use_occupied" != "Y" ]] && continue
-        fi
-        
-        break
-    done
-    
-    print_success "新 SSH 端口: $NEW_SSH_PORT"
-    echo ""
-}
-
-configure_stack() {
-    print_info "[配置] SSH 端口网络栈类型"
-    echo "1) 双栈 (IPv4 + IPv6) - 推荐"
-    echo "2) 仅 IPv4"
-    echo "3) 仅 IPv6"
-    
-    while true; do
-        read -p "请选择 (1/2/3，默认 1): " stack_choice
-        stack_choice=${stack_choice:-1}
-        
-        case $stack_choice in
-            1) 
-                STACK_TYPE="dual"
-                STACK_DESC="双栈 (IPv4 + IPv6)"
-                break 
-                ;;
-            2) 
-                STACK_TYPE="ipv4"
-                STACK_DESC="仅 IPv4"
-                break 
-                ;;
-            3) 
-                STACK_TYPE="ipv6"
-                STACK_DESC="仅 IPv6"
-                break 
-                ;;
-            *) 
-                print_error "无效选择，请输入 1、2 或 3"
-                ;;
-        esac
-    done
-    
-    print_success "网络栈类型: $STACK_DESC"
-    echo ""
-}
-
-# ========== UFW 安装与配置函数 ==========
-install_ufw() {
-    print_info "[2/10] 安装 UFW..."
-    
-    apt-get update -qq
-    apt-get install -y ufw || {
-        print_error "UFW 安装失败"
-        exit 1
-    }
-    
-    # 确保 UFW 默认配置文件存在
+ufw_configure_ipv6() {
+    ufw_is_installed || return 0
     mkdir -p "$(dirname "$UFW_DEFAULT")"
-    
-    # 启用 IPv6 支持
     if [[ -f "$UFW_DEFAULT" ]]; then
-        if grep -q "^IPV6=" "$UFW_DEFAULT"; then
+        if grep -qE '^IPV6=' "$UFW_DEFAULT"; then
             sed -i 's/^IPV6=.*/IPV6=yes/' "$UFW_DEFAULT"
         else
-            echo "IPV6=yes" >> "$UFW_DEFAULT"
+            printf '\nIPV6=yes\n' >> "$UFW_DEFAULT"
         fi
     else
-        echo "IPV6=yes" > "$UFW_DEFAULT"
+        printf 'IPV6=yes\n' > "$UFW_DEFAULT"
     fi
-    
-    print_success "UFW 安装完成，IPv6 已启用"
 }
 
-# ========== SSH 配置文件处理函数 ==========
-check_sshd_config() {
-    print_info "[3/10] 检查 SSH 配置文件..."
-    
-    # 如果配置文件不存在，尝试恢复或创建
-    if [[ ! -f "$SSHD_CONFIG" ]]; then
-        print_warning "$SSHD_CONFIG 不存在，尝试恢复..."
-        local created=false
-        
-        # 尝试多个可能的源
-        for src in \
-            "/etc/ssh/sshd_config.dpkg-dist" \
-            "/usr/share/openssh/sshd_config" \
-            "/usr/share/doc/openssh-server/examples/sshd_config"; do
-            if [[ -f "$src" ]]; then
-                cp "$src" "$SSHD_CONFIG"
-                created=true
-                print_success "从 $src 恢复配置文件"
-                break
+# ============================================================
+# 5. 软件源抽象层
+# ============================================================
+
+src_backup() {
+    local backup_dir
+    mkdir -p "$SOURCE_BACKUP_ROOT" || return 1
+    backup_dir="$(mktemp -d "$SOURCE_BACKUP_ROOT/backup.XXXXXX")" || return 1
+    case "$OS_TYPE" in
+        debian)
+            if [[ -e /etc/apt/sources.list ]]; then
+                cp -a /etc/apt/sources.list "$backup_dir/sources.list"
+            else
+                : > "$backup_dir/sources.list.missing"
             fi
-        done
-        
-        if ! $created; then
-            # 创建基本配置
-            print_warning "创建默认 SSH 配置文件"
-            cat > "$SSHD_CONFIG" << 'EOF'
-# Default SSH Server Configuration
-Include /etc/ssh/sshd_config.d/*.conf
-Port 22
-AddressFamily any
-ListenAddress 0.0.0.0
-ListenAddress ::
-PubkeyAuthentication yes
-PasswordAuthentication yes
-PermitRootLogin yes
-Subsystem sftp /usr/lib/openssh/sftp-server
-EOF
-        fi
-    fi
-    
-    # 提取当前端口
-    CURRENT_SSH_PORT=$(grep -E "^[[:space:]]*Port[[:space:]]" "$SSHD_CONFIG" | \
-                       awk '{print $2}' | head -1)
-    CURRENT_SSH_PORT=${CURRENT_SSH_PORT:-$DEFAULT_SSH_PORT}
-    
-    echo "  当前 SSH 端口: $CURRENT_SSH_PORT"
-    echo ""
+            if [[ -d /etc/apt/sources.list.d ]]; then
+                cp -a /etc/apt/sources.list.d "$backup_dir/sources.list.d"
+            else
+                : > "$backup_dir/sources.list.d.missing"
+            fi
+            ;;
+        alpine)
+            if [[ -e /etc/apk/repositories ]]; then
+                cp -a /etc/apk/repositories "$backup_dir/repositories"
+            else
+                : > "$backup_dir/repositories.missing"
+            fi
+            ;;
+        *) rm -rf "$backup_dir"; return 1 ;;
+    esac
+    echo "$backup_dir"
 }
 
-set_ssh_option() {
-    local key="$1"
-    local value="$2"
-    local config_file="${3:-$SSHD_CONFIG}"
-    
-    if [[ ! -f "$config_file" ]]; then
-        print_error "配置文件 $config_file 不存在"
-        return 1
-    fi
-    
-    if [[ ! -w "$config_file" ]]; then
-        print_error "配置文件 $config_file 不可写"
-        return 1
-    fi
-    
-    # 设置或更新配置项
-    if grep -qE "^[[:space:]]*[#]*${key}[[:space:]]" "$config_file"; then
-        sed -i "s|^[[:space:]]*[#]*${key}[[:space:]].*|${key} ${value}|g" "$config_file"
+src_backup_latest() {
+    [[ -d "$SOURCE_BACKUP_ROOT" ]] || return 1
+    ls -dt "$SOURCE_BACKUP_ROOT"/backup.* 2>/dev/null | head -1
+}
+
+src_restore_backup() {
+    local backup_dir=""
+    [[ $# -gt 0 ]] && backup_dir="$1"
+    [[ -n "$backup_dir" && -d "$backup_dir" ]] || backup_dir="$(src_backup_latest 2>/dev/null || true)"
+    [[ -n "$backup_dir" && -d "$backup_dir" ]] || { ui_error "没有可恢复的软件源备份。"; return 1; }
+    case "$OS_TYPE" in
+        debian)
+            if [[ -f "$backup_dir/sources.list" ]]; then
+                rm -f /etc/apt/sources.list
+                cp -a "$backup_dir/sources.list" /etc/apt/sources.list
+            elif [[ -f "$backup_dir/sources.list.missing" ]]; then
+                rm -f /etc/apt/sources.list
+            fi
+            if [[ -d "$backup_dir/sources.list.d" ]]; then
+                rm -rf /etc/apt/sources.list.d
+                cp -a "$backup_dir/sources.list.d" /etc/apt/sources.list.d
+            elif [[ -f "$backup_dir/sources.list.d.missing" ]]; then
+                rm -rf /etc/apt/sources.list.d
+                mkdir -p /etc/apt/sources.list.d
+            fi
+            ;;
+        alpine)
+            if [[ -f "$backup_dir/repositories" ]]; then
+                cp -a "$backup_dir/repositories" /etc/apk/repositories
+            elif [[ -f "$backup_dir/repositories.missing" ]]; then
+                rm -f /etc/apk/repositories
+            fi
+            ;;
+        *) return 1 ;;
+    esac
+    ui_success "已恢复软件源备份：$backup_dir"
+}
+
+# ---- Debian/Ubuntu 软件源 ----
+
+src_debian_files() {
+    [[ -d /etc/apt/sources.list.d ]] || return 0
+    find /etc/apt/sources.list.d -maxdepth 1 -type f \( -name '*.list' -o -name '*.sources' \) -print 2>/dev/null
+}
+
+src_debian_apt_supports_deb822() {
+    local major="" minor=""
+    read -r major minor _ < <(apt-get --version 2>/dev/null | awk 'NR==1 {split($2,v,"."); print v[1],v[2]}')
+    [[ -n "$major" && "$major" =~ ^[0-9]+$ ]] || return 1
+    [[ -n "$minor" && "$minor" =~ ^[0-9]+$ ]] || minor=0
+    (( major > 1 || (major == 1 && minor >= 1) ))
+}
+
+src_debian_disable_existing() {
+    local file
+    while IFS= read -r file; do
+        [[ -n "$file" ]] || continue
+        case "$file" in
+            "$DEBIAN_MANAGED_SOURCE"|"$DEBIAN_MANAGED_LEGACY_SOURCE") continue ;;
+        esac
+        ui_warning "禁用现有软件源：$file -> $file.ufwssh-disabled"
+        mv "$file" "$file.ufwssh-disabled"
+    done < <(src_debian_files)
+}
+
+src_debian_write() {
+    local profile="official"
+    [[ $# -gt 0 ]] && profile="$1"
+    local distro codename base_uri security_uri components
+    distro="$(sys_get_distro_id)"
+    codename="$(sys_get_distro_codename)"
+    [[ -n "$codename" ]] || { ui_error "无法检测 Debian/Ubuntu 发行版代号。"; return 1; }
+
+    case "$distro:$profile" in
+        debian:official) base_uri="https://deb.debian.org/debian"; security_uri="https://security.debian.org/debian-security"; components="main contrib non-free non-free-firmware" ;;
+        debian:tuna) base_uri="https://mirrors.tuna.tsinghua.edu.cn/debian"; security_uri="https://mirrors.tuna.tsinghua.edu.cn/debian-security"; components="main contrib non-free non-free-firmware" ;;
+        ubuntu:official) base_uri="https://archive.ubuntu.com/ubuntu"; security_uri="https://security.ubuntu.com/ubuntu"; components="main restricted universe multiverse" ;;
+        ubuntu:tuna) base_uri="https://mirrors.tuna.tsinghua.edu.cn/ubuntu"; security_uri="https://mirrors.tuna.tsinghua.edu.cn/ubuntu"; components="main restricted universe multiverse" ;;
+        *) ui_error "不支持的 APT 软件源配置：$distro / $profile"; return 1 ;;
+    esac
+
+    mkdir -p /etc/apt/sources.list.d || return 1
+    src_debian_disable_existing || return 1
+    rm -f "$DEBIAN_MANAGED_SOURCE" "$DEBIAN_MANAGED_LEGACY_SOURCE"
+    if src_debian_apt_supports_deb822; then
+        cat > "$DEBIAN_MANAGED_SOURCE" <<EOF
+Types: deb
+URIs: $base_uri
+Suites: $codename $codename-updates
+Components: $components
+Signed-By: /usr/share/keyrings/$distro-archive-keyring.gpg
+
+Types: deb
+URIs: $security_uri
+Suites: $codename-security
+Components: $components
+Signed-By: /usr/share/keyrings/$distro-archive-keyring.gpg
+EOF
     else
-        echo "${key} ${value}" >> "$config_file"
+        cat > "$DEBIAN_MANAGED_LEGACY_SOURCE" <<EOF
+deb $base_uri $codename $components
+deb $base_uri $codename-updates $components
+deb $security_uri $codename-security $components
+EOF
     fi
-    
+}
+
+src_debian_package_available() {
+    local package="$1" policy candidate
+    sys_command_exists apt-cache || return 1
+    policy="$(apt-cache policy "$package" 2>/dev/null || true)"
+    candidate="$(printf '%s\n' "$policy" | awk -F': ' '/^[[:space:]]*Candidate:/ {print $2; exit}')"
+    [[ -n "$candidate" && "$candidate" != "(none)" ]]
+}
+
+src_debian_packages_available() {
+    local package
+    for package in "$@"; do src_debian_package_available "$package" || return 1; done
     return 0
 }
 
-backup_sshd_config() {
-    BACKUP_FILE="${SSHD_CONFIG}.bak.$(date +%Y%m%d%H%M%S)"
-    if cp "$SSHD_CONFIG" "$BACKUP_FILE"; then
-        print_info "配置文件已备份至: $BACKUP_FILE"
-        return 0
+src_debian_refresh_and_check() {
+    ui_info "刷新 APT 软件包索引..."
+    apt-get update || { ui_warning "APT update 失败。"; return 1; }
+    src_debian_packages_available "$@" || { ui_warning "当前 APT 源刷新成功，但目标软件包没有可用候选版本。"; return 1; }
+}
+
+src_debian_try_profile() {
+    local profile="$1"; shift
+    ui_info "尝试 Debian/Ubuntu $profile 软件源..."
+    src_debian_write "$profile" || return 1
+    src_debian_refresh_and_check "$@"
+}
+
+# ---- Alpine 软件源 ----
+
+src_alpine_refresh() {
+    sys_command_exists apk || { ui_error "未找到 apk。"; return 1; }
+    ui_info "刷新 Alpine 软件源..."
+    apk update
+}
+
+src_alpine_write_official() {
+    local branch="$1"
+    cat > /etc/apk/repositories <<EOF
+https://dl-cdn.alpinelinux.org/alpine/$branch/main
+https://dl-cdn.alpinelinux.org/alpine/$branch/community
+@edge https://dl-cdn.alpinelinux.org/alpine/edge/main
+@edge-community https://dl-cdn.alpinelinux.org/alpine/edge/community
+EOF
+}
+
+src_alpine_write_tuna() {
+    local branch="$1"
+    cat > /etc/apk/repositories <<EOF
+https://mirrors.tuna.tsinghua.edu.cn/alpine/$branch/main
+https://mirrors.tuna.tsinghua.edu.cn/alpine/$branch/community
+@edge https://mirrors.tuna.tsinghua.edu.cn/alpine/edge/main
+@edge-community https://mirrors.tuna.tsinghua.edu.cn/alpine/edge/community
+EOF
+}
+
+src_alpine_package_available() {
+    local package="$1"
+    apk policy "$package" 2>/dev/null | grep -Eq '^[[:space:]]*[^[:space:]]+'
+}
+
+src_alpine_edge_package_available() {
+    local package="$1" repo_tag="$2"
+    apk policy "$package@$repo_tag" 2>/dev/null | grep -Eq '^[[:space:]]*[^[:space:]]+'
+}
+
+src_alpine_packages_available() {
+    local package
+    for package in "$@"; do
+        src_alpine_package_available "$package" || return 1
+    done
+    return 0
+}
+
+src_alpine_install_from_repos() {
+    local package="$1"
+    if [[ "$package" == "ufw" ]] && src_alpine_edge_package_available "$package" "edge-community"; then
+        ui_info "从 Alpine edge/community 安装 $package..."
+        apk add --no-cache "$package@edge-community"
+    elif [[ "$package" == "openssl" ]] && src_alpine_edge_package_available "$package" "edge"; then
+        ui_info "从 Alpine edge/main 安装 $package..."
+        apk add --no-cache "$package@edge"
+    elif src_alpine_package_available "$package"; then
+        ui_info "从 Alpine stable main/community 安装 $package..."
+        apk add --no-cache "$package"
     else
-        print_error "配置文件备份失败"
         return 1
     fi
 }
 
-# ========== 防火墙规则配置 ==========
-configure_ufw_rules_safely() {
-    print_info "[4/10] 安全配置 UFW 防火墙规则..."
-    print_warning "正在配置防火墙规则，请勿中断..."
-    
-    # 步骤1: 禁用并重置 UFW
-    ufw --force disable > /dev/null 2>&1 || true
-    echo "y" | ufw --force reset > /dev/null 2>&1 || true
-    
-    # 步骤2: 设置默认策略
-    ufw default deny incoming
-    ufw default allow outgoing
-    ufw logging low
-    
-    # 步骤3: 【关键】在启用UFW前添加所有放行规则
-    
-    # 3.1 放行当前SSH端口（保持现有连接）
-    if [[ "$CURRENT_SSH_PORT" != "$NEW_SSH_PORT" ]]; then
-        ufw allow "$CURRENT_SSH_PORT/tcp" comment "Current SSH port (temporary)"
-        print_info "已添加当前端口 $CURRENT_SSH_PORT 的临时放行规则"
-    fi
-    
-    # 3.2 添加新SSH端口的限速规则
-    local rules_added=false
-    
-    # IPv4规则
-    if [[ "$STACK_TYPE" == "dual" ]] || [[ "$STACK_TYPE" == "ipv4" ]]; then
-        if ufw limit proto tcp from 0.0.0.0/0 to any port "$NEW_SSH_PORT" comment "SSH rate limit IPv4"; then
-            print_info "已添加新端口 $NEW_SSH_PORT 的IPv4限速规则"
-            rules_added=true
-        else
-            print_error "IPv4限速规则添加失败"
-        fi
-    fi
-    
-    # IPv6规则（仅当系统支持IPv6时添加）
-    if [[ "$STACK_TYPE" == "dual" ]] || [[ "$STACK_TYPE" == "ipv6" ]]; then
-        if [[ -n "$IPV6_ADDR" ]] || [[ "$STACK_TYPE" == "ipv6" ]]; then
-            if ufw limit proto tcp from ::/0 to any port "$NEW_SSH_PORT" comment "SSH rate limit IPv6"; then
-                print_info "已添加新端口 $NEW_SSH_PORT 的IPv6限速规则"
-                rules_added=true
-            else
-                print_error "IPv6限速规则添加失败"
-            fi
-        else
-            print_warning "系统无IPv6地址，跳过IPv6规则"
-        fi
-    fi
-    
-    if ! $rules_added; then
-        print_error "未能添加任何防火墙规则"
-        exit 1
-    fi
-    
-    # 步骤4: 启用 UFW
-    print_info "正在启用 UFW..."
-    if ufw --force enable > /dev/null 2>&1; then
-        print_success "防火墙规则已安全配置并启用"
-    else
-        print_error "UFW 启用失败"
-        exit 1
-    fi
-    
-    echo ""
+src_alpine_version_branch() {
+    local version
+    version="$(printf '%s' "$OS_VERSION" | cut -d- -f1)"
+    printf '%s\n' "$version" | sed -n 's/^\([0-9]\+\.[0-9]\+\).*/v\1/p'
 }
 
-# ========== SSH 端口修改 ==========
-modify_ssh_port() {
-    print_info "[5/10] 修改 SSH 端口配置..."
-    
-    # 备份配置
-    backup_sshd_config || {
-        print_error "配置备份失败，中止操作"
-        exit 1
-    }
-    
-    # 清理所有旧的 Port 行（避免重复）
-    sed -i '/^[[:space:]]*Port[[:space:]]/d' "$SSHD_CONFIG"
-    
-    # 添加新旧端口
-    echo "Port $CURRENT_SSH_PORT" >> "$SSHD_CONFIG"
-    echo "Port $NEW_SSH_PORT" >> "$SSHD_CONFIG"
-    
-    # 验证配置语法
-    if ! safe_sshd_test; then
-        print_error "SSH 配置语法错误，恢复备份"
-        cp "$BACKUP_FILE" "$SSHD_CONFIG"
-        exit 1
-    fi
-    
-    # 重启 SSH 服务
-    print_info "正在重启 SSH 服务..."
-    if safe_ssh_command "restart"; then
-        sleep 2
-        if systemctl is-active --quiet "$SSH_SERVICE"; then
-            print_success "SSH 端口已配置: $CURRENT_SSH_PORT (旧) + $NEW_SSH_PORT (新)"
-        else
-            print_error "SSH 服务启动异常，恢复备份"
-            cp "$BACKUP_FILE" "$SSHD_CONFIG"
-            safe_ssh_command "restart" || true
-            exit 1
-        fi
-    else
-        print_error "SSH 服务重启失败，恢复备份"
-        cp "$BACKUP_FILE" "$SSHD_CONFIG"
-        safe_ssh_command "restart" || {
-            print_error "自动恢复失败，请手动执行: systemctl restart $SSH_SERVICE"
-        }
-        exit 1
-    fi
-    echo ""
+src_alpine_try_profile() {
+    local profile="$1" branch="$2"
+    shift 2
+    case "$profile" in
+        official) src_alpine_write_official "$branch" ;;
+        tuna) src_alpine_write_tuna "$branch" ;;
+        *) return 1 ;;
+    esac
+    ui_info "尝试 Alpine $profile 软件源：$branch"
+    src_alpine_refresh || return 1
+    src_alpine_packages_available "$@"
 }
 
-# ========== SSH 密钥配置 ==========
-configure_ssh_key() {
-    print_info "[6/10] 配置 SSH 公钥..."
-    echo ""
-    print_info "目标用户: $SSH_USER"
-    echo -n "请粘贴公钥 (以 ssh-rsa/ssh-ed25519 等开头): "
-    
-    local public_key=""
-    read -r public_key
-    
-    # 清理输入
-    public_key=$(echo "$public_key" | tr -d '\r\n' | xargs)
-    
-    # 验证公钥
-    if [[ -z "$public_key" ]]; then
-        print_error "未检测到公钥输入"
-        exit 1
-    fi
-    
-    # 验证公钥格式（更严格的正则）
-    if ! echo "$public_key" | grep -qE "^[[:space:]]*(ssh-rsa|ssh-ed25519|ecdsa-sha2-nistp|sk-ssh-ed25519|sk-ecdsa-sha2)[[:space:]]"; then
-        print_error "公钥格式不正确"
-        echo -e "${YELLOW}期望格式: ssh-rsa/ssh-ed25519/ecdsa-sha2-nistp 开头${NC}"
-        echo -e "${YELLOW}您输入的内容：${NC}"
-        echo "$public_key"
-        exit 1
-    fi
-    
-    # 确定 .ssh 目录
-    local ssh_dir=""
-    if [[ "$SSH_USER" == "root" ]]; then
-        ssh_dir="/root/.ssh"
-    else
-        ssh_dir="/home/${SSH_USER}/.ssh"
-    fi
-    
-    # 创建 .ssh 目录
-    if ! mkdir -p "$ssh_dir"; then
-        print_error "无法创建 $ssh_dir 目录"
-        exit 1
-    fi
-    
-    # 设置目录权限
-    chmod 700 "$ssh_dir"
-    if [[ "$SSH_USER" != "root" ]]; then
-        chown "${SSH_USER}:${SSH_USER}" "$ssh_dir" 2>/dev/null || true
-    fi
-    
-    # 备份旧密钥
-    AUTH_KEYS_FILE="${ssh_dir}/authorized_keys"
-    if [[ -f "$AUTH_KEYS_FILE" ]]; then
-        cp "$AUTH_KEYS_FILE" "${AUTH_KEYS_FILE}.bak.$(date +%Y%m%d%H%M%S)"
-        print_info "已备份旧密钥文件"
-    fi
-    
-    # 写入新公钥
-    if echo "$public_key" > "$AUTH_KEYS_FILE"; then
-        chmod 600 "$AUTH_KEYS_FILE"
-        if [[ "$SSH_USER" != "root" ]]; then
-            chown "${SSH_USER}:${SSH_USER}" "$AUTH_KEYS_FILE" 2>/dev/null || true
+# ============================================================
+# 6. SSH 配置业务层
+# ============================================================
+
+ssh_config_ensure() {
+    [[ -f "$SSHD_CONFIG" ]] && return 0
+    local source
+    for source in /etc/ssh/sshd_config.dpkg-dist /usr/share/openssh/sshd_config /usr/share/doc/openssh-server/examples/sshd_config; do
+        if [[ -f "$source" ]]; then
+            cp "$source" "$SSHD_CONFIG"
+            return 0
         fi
-        print_success "公钥写入完成"
+    done
+    cat > "$SSHD_CONFIG" <<'EOF'
+Include /etc/ssh/sshd_config.d/*.conf
+Port 22
+PubkeyAuthentication yes
+PasswordAuthentication yes
+PermitRootLogin yes
+EOF
+}
+
+ssh_config_ensure_include() {
+    ssh_config_ensure || return 1
+    if grep -Eq '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/\*\.conf' "$SSHD_CONFIG"; then
+        return 0
+    fi
+    local tmp
+    tmp="$(mktemp)" || return 1
+    {
+        printf 'Include /etc/ssh/sshd_config.d/*.conf\n'
+        cat "$SSHD_CONFIG"
+    } > "$tmp" || { rm -f "$tmp"; return 1; }
+    mv "$tmp" "$SSHD_CONFIG"
+}
+
+ssh_config_get_port() {
+    CURRENT_SSH_PORT="$DEFAULT_SSH_PORT"
+    if ! ssh_is_installed; then
+        echo "$CURRENT_SSH_PORT"
+        return 0
+    fi
+    ssh_config_ensure
+    if sys_command_exists sshd; then
+        local port
+        port="$(sshd -T 2>/dev/null | awk '$1 == "port" {print $2; exit}')"
+        if [[ "$port" =~ ^[0-9]+$ ]]; then
+            CURRENT_SSH_PORT="$port"
+            echo "$CURRENT_SSH_PORT"
+            return 0
+        fi
+    fi
+    local config_port
+    config_port="$(grep -E '^[[:space:]]*Port[[:space:]]+[0-9]+' "$SSHD_CONFIG" 2>/dev/null | awk '{print $2}' | head -1)"
+    [[ "$config_port" =~ ^[0-9]+$ ]] && CURRENT_SSH_PORT="$config_port"
+    echo "$CURRENT_SSH_PORT"
+}
+
+ssh_config_get_all_ports() {
+    if ssh_is_installed && sys_command_exists sshd; then
+        sshd -T 2>/dev/null | awk '$1 == "port" {print $2}'
+        return 0
+    fi
+    echo "$DEFAULT_SSH_PORT"
+}
+
+ssh_config_test() {
+    sys_command_exists sshd || { ui_error "未找到 sshd。"; return 1; }
+    local output
+    if output="$(sshd -t 2>&1)"; then
+        ui_success "SSH 配置语法检查通过。"
+        return 0
+    fi
+    ui_error "SSH 配置检查失败：$output"
+    return 1
+}
+
+ssh_config_backup() {
+    ssh_config_ensure || return 1
+    local backup_dir
+    mkdir -p "$SSH_BACKUP_ROOT" || return 1
+    backup_dir="$(mktemp -d "$SSH_BACKUP_ROOT/backup.XXXXXX")" || return 1
+    cp -a "$SSHD_CONFIG" "$backup_dir/sshd_config" || { rm -rf "$backup_dir"; return 1; }
+    if [[ -d "$SSHD_CONFIG_DIR" ]]; then
+        cp -a "$SSHD_CONFIG_DIR" "$backup_dir/sshd_config.d" || { rm -rf "$backup_dir"; return 1; }
     else
-        print_error "公钥写入失败"
-        exit 1
+        : > "$backup_dir/sshd_config.d.missing"
+    fi
+    echo "$backup_dir"
+}
+
+ssh_config_restore_backup() {
+    local backup="$1"
+    [[ -f "$backup/sshd_config" ]] || return 1
+    cp -a "$backup/sshd_config" "$SSHD_CONFIG" || return 1
+    if [[ -f "$backup/sshd_config.d.missing" ]]; then
+        rm -rf "$SSHD_CONFIG_DIR"
+    elif [[ -d "$backup/sshd_config.d" ]]; then
+        rm -rf "$SSHD_CONFIG_DIR"
+        cp -a "$backup/sshd_config.d" "$SSHD_CONFIG_DIR" || return 1
     fi
 }
 
-verify_ssh_key() {
-    print_info "[7/10] 验证公钥..."
-    
-    if [[ ! -f "$AUTH_KEYS_FILE" ]]; then
-        print_error "密钥文件不存在: $AUTH_KEYS_FILE"
-        exit 1
-    fi
-    
-    if ssh-keygen -l -f "$AUTH_KEYS_FILE" >/dev/null 2>&1; then
-        print_success "密钥验证通过："
-        ssh-keygen -l -f "$AUTH_KEYS_FILE"
-    else
-        print_error "密钥验证失败"
-        echo "密钥文件内容："
-        cat "$AUTH_KEYS_FILE"
-        exit 1
-    fi
-    echo ""
+ssh_config_port_files() {
+    printf '%s\n' "$SSHD_CONFIG"
+    [[ -d "$SSHD_CONFIG_DIR" ]] || return 0
+    local file
+    for file in "$SSHD_CONFIG_DIR"/*.conf; do
+        [[ -f "$file" ]] || continue
+        printf '%s\n' "$file"
+    done
 }
 
-# ========== SSH 安全优化 ==========
-optimize_ssh_security() {
-    print_info "[8/10] 优化 SSH 安全配置..."
-    
-    # 设置安全选项（明确每个配置项的作用）
-    set_ssh_option "PubkeyAuthentication" "yes"          # 启用密钥认证
-    set_ssh_option "PasswordAuthentication" "yes"         # 暂时保留密码登录
-    set_ssh_option "PermitRootLogin" "prohibit-password"  # 禁止root密码登录
-    set_ssh_option "MaxAuthTries" "5"                     # 限制认证尝试次数
-    set_ssh_option "X11Forwarding" "no"                   # 关闭X11转发
-    set_ssh_option "PermitEmptyPasswords" "no"            # 禁止空密码
-    
-    # 可选：禁用不安全的认证方式
-    set_ssh_option "ChallengeResponseAuthentication" "no"
-    set_ssh_option "KerberosAuthentication" "no"
-    set_ssh_option "GSSAPIAuthentication" "no"
-    
-    # 验证配置
-    if ! safe_sshd_test; then
-        print_error "SSH 配置语法错误，恢复备份"
-        cp "$BACKUP_FILE" "$SSHD_CONFIG"
-        exit 1
+ssh_port_is_listening() {
+    local port="$1"
+    if sys_command_exists ss; then
+        ss -lntH 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)$port$|\]:$port$" && return 0
     fi
-    
-    # 重启服务应用配置
-    print_info "正在重启 SSH 服务应用新配置..."
-    if safe_ssh_command "restart"; then
-        sleep 2
-        if systemctl is-active --quiet "$SSH_SERVICE"; then
-            print_success "SSH 安全策略应用成功"
-        else
-            print_error "SSH 服务异常，恢复备份"
-            cp "$BACKUP_FILE" "$SSHD_CONFIG"
-            safe_ssh_command "restart" || true
-            exit 1
-        fi
-    else
-        print_error "SSH 服务重启失败，恢复备份"
-        cp "$BACKUP_FILE" "$SSHD_CONFIG"
-        safe_ssh_command "restart" || true
-        exit 1
+    if sys_command_exists netstat; then
+        netstat -lnt 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)$port$|\]:$port$" && return 0
     fi
-    echo ""
+    return 1
 }
 
-# ========== 输出函数 ==========
-print_summary() {
-    echo ""
-    echo -e "${GREEN}========================================${NC}"
-    echo -e "${GREEN}  配置完成！${NC}"
-    echo -e "${GREEN}========================================${NC}"
-    echo ""
-    
-    echo -e "${YELLOW}配置摘要：${NC}"
-    echo -e "  脚本版本:       ${SCRIPT_VERSION}"
-    echo -e "  SSH 服务:       $SSH_SERVICE"
-    echo -e "  旧 SSH 端口:    $CURRENT_SSH_PORT"
-    echo -e "  新 SSH 端口:    ${GREEN}$NEW_SSH_PORT${NC}"
-    echo -e "  网络栈类型:     $STACK_DESC"
-    echo -e "  目标用户:       $SSH_USER"
-    echo -e "  公钥文件:       $AUTH_KEYS_FILE"
-    echo -e "  配置备份:       $BACKUP_FILE"
-    echo ""
-    
-    print_info "当前防火墙规则："
-    ufw status numbered 2>/dev/null || ufw status 2>/dev/null || print_warning "无法获取防火墙状态"
-    echo ""
+ssh_verify_port() {
+    local port="$1"
+    if ! ssh_config_get_all_ports | grep -Fxq "$port"; then
+        ui_error "sshd 当前生效配置没有端口 $port。"
+        ui_info "当前生效端口：$(ssh_config_get_all_ports | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
+        return 1
+    fi
+    if ssh_port_is_listening "$port"; then
+        return 0
+    fi
+    ui_error "sshd 配置包含端口 $port，但系统没有检测到该端口监听。"
+    if sys_command_exists ss; then
+        ss -lntH 2>/dev/null | sed -n '1,20p' || true
+    elif sys_command_exists netstat; then
+        netstat -lnt 2>/dev/null | sed -n '1,20p' || true
+    fi
+    return 1
 }
 
-print_test_instructions() {
-    print_info "[9/10] 下一步：测试密钥登录"
-    echo ""
-    
-    echo -e "${RED}╔════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${RED}║  ⚠  重要提示：请保持当前终端窗口不要关闭！           ║${NC}"
-    echo -e "${RED}╚════════════════════════════════════════════════════════╝${NC}"
-    echo ""
-    
-    echo -e "${GREEN}请在新的终端窗口中测试以下命令：${NC}"
-    echo ""
-    
-    # 根据网络栈类型显示对应的连接命令
-    if [[ -n "$IPV4_ADDR" ]] && [[ "$STACK_TYPE" != "ipv6" ]]; then
-        echo -e "  ${BLUE}[IPv4 连接]${NC}"
-        echo "  ssh -p $NEW_SSH_PORT $SSH_USER@$IPV4_ADDR"
+ssh_ufw_ensure_rule() {
+    local port="$1"
+    ufw_is_installed || return 1
+    if ufw status 2>/dev/null | grep -Eq "[[:space:]]$port/tcp[[:space:]]+(ALLOW|LIMIT)"; then
+        return 0
     fi
-    
-    if [[ -n "$IPV6_ADDR" ]] && [[ "$STACK_TYPE" != "ipv4" ]]; then
-        echo -e "  ${BLUE}[IPv6 连接]${NC}"
-        echo "  ssh -p $NEW_SSH_PORT $SSH_USER@[$IPV6_ADDR]"
-    fi
-    
-    echo ""
-    echo -e "${YELLOW}后续优化建议：${NC}"
-    echo ""
-    echo -e "${YELLOW}1. 确认密钥登录成功后，关闭密码登录：${NC}"
-    echo "   sudo sed -i 's/^PasswordAuthentication.*/PasswordAuthentication no/' $SSHD_CONFIG"
-    echo "   sudo systemctl restart $SSH_SERVICE"
-    echo ""
-    
-    echo -e "${YELLOW}2. 确认新端口正常后，移除旧端口（可选）：${NC}"
-    echo "   sudo sed -i '/^Port $CURRENT_SSH_PORT/d' $SSHD_CONFIG"
-    echo "   sudo ufw delete allow $CURRENT_SSH_PORT/tcp"
-    echo "   sudo systemctl restart $SSH_SERVICE"
-    echo ""
-    
-    echo -e "${YELLOW}3. 云服务器用户必须操作：${NC}"
-    echo -e "   ${RED}在云平台安全组/防火墙规则中放行端口: $NEW_SSH_PORT${NC}"
-    echo ""
-    
-    echo -e "${GREEN}UFW 常用管理命令：${NC}"
-    echo "  ufw status numbered              # 查看防火墙规则（带编号）"
-    echo "  ufw delete <编号>                # 删除指定编号的规则"
-    echo "  ufw enable                       # 启用防火墙"
-    echo "  ufw disable                      # 禁用防火墙"
-    echo "  ufw reload                       # 重新加载规则"
-    echo ""
-    
-    echo -e "${GREEN}SSH 服务管理命令：${NC}"
-    echo "  systemctl status $SSH_SERVICE    # 查看服务状态"
-    echo "  systemctl restart $SSH_SERVICE   # 重启服务"
-    echo "  journalctl -u $SSH_SERVICE -f    # 查看实时日志"
-    echo ""
+    ufw allow "$port/tcp" comment "SSH"
 }
 
-# ========== 错误恢复函数 ==========
-cleanup_on_error() {
-    local exit_code=$?
-    
+ssh_config_set_ports() {
+    local old_port="$1" new_port="$2"
+    ssh_config_ensure || return 1
+    local file
+    while IFS= read -r file; do
+        [[ -f "$file" ]] || continue
+        sed -i -E 's/^([[:space:]]*)Port[[:space:]]+[0-9]+([[:space:]]*)$/\1# Managed by ufwssh: previous Port\2/' "$file" || return 1
+    done < <(ssh_config_port_files)
+    printf '\n# Managed by ufwssh\nPort %s\nPort %s\n' "$old_port" "$new_port" >> "$SSHD_CONFIG"
+    ssh_config_test
+}
+
+ssh_config_remove_port() {
+    local port="$1"
+    ssh_config_ensure || return 1
+    local file
+    while IFS= read -r file; do
+        [[ -f "$file" ]] || continue
+        sed -i -E "/^[[:space:]]*Port[[:space:]]+$port[[:space:]]*$/d" "$file" || return 1
+        sed -i -E "/^[[:space:]]*# Managed by ufwssh: previous Port[[:space:]]+$port[[:space:]]*$/d" "$file" || return 1
+    done < <(ssh_config_port_files)
+}
+
+# ============================================================
+# 7. UFW 业务层
+# ============================================================
+
+ufw_show_rules() {
+    ufw_is_installed || { ui_error "UFW 尚未安装。"; return 1; }
     echo ""
-    print_error "脚本执行出错 (退出码: $exit_code)"
-    print_warning "正在尝试安全恢复..."
-    
-    # 恢复 SSH 配置（如果有备份）
-    if [[ -f "$BACKUP_FILE" ]] && [[ -f "$SSHD_CONFIG" ]]; then
-        print_info "恢复 SSH 配置备份..."
-        if cp "$BACKUP_FILE" "$SSHD_CONFIG"; then
-            print_success "SSH 配置已恢复"
-        else
-            print_error "SSH 配置恢复失败"
-        fi
+    ufw status verbose
+    echo ""
+    ufw status numbered
+}
+
+ufw_add_rule() {
+    ufw_is_installed || { ui_error "UFW 尚未安装。"; return 1; }
+    echo "1) allow  2) limit  3) deny  4) reject  0) 返回"
+
+    local type port protocol
+    read -r -p "规则类型: " type
+    case "$type" in
+        1) type="allow" ;;
+        2) type="limit" ;;
+        3) type="deny" ;;
+        4) type="reject" ;;
+        0) return 0 ;;
+        *) ui_error "无效选择。"; return 1 ;;
+    esac
+
+    read -r -p "端口（例如 80、443、8000:8010）: " port
+    [[ -n "$port" ]] || { ui_error "端口不能为空。"; return 1; }
+
+    echo "1) tcp  2) udp  3) tcp+udp  4) all"
+    read -r -p "协议 [默认 1]: " protocol
+    [[ -n "$protocol" ]] || protocol=1
+
+    case "$protocol" in
+        1) ufw "$type" "$port/tcp" ;;
+        2) ufw "$type" "$port/udp" ;;
+        3) ufw "$type" "$port/tcp" && ufw "$type" "$port/udp" ;;
+        4) ufw "$type" "$port" ;;
+        *) ui_error "无效协议。"; return 1 ;;
+    esac
+}
+
+ufw_delete_rule() {
+    ufw_is_installed || { ui_error "UFW 尚未安装。"; return 1; }
+    ufw status numbered
+    echo ""
+    local input token numbers=()
+    read -r -p "要删除的规则编号（空格或逗号分隔，如 1,3,5）: " input
+    [[ -n "$input" ]] || { ui_error "未输入规则编号。"; return 1; }
+
+    input="${input//,/ }"
+    if [[ ! "$input" =~ ^[0-9[:space:]]+$ ]]; then
+        ui_error "规则编号只能使用数字、空格或逗号。"
+        return 1
     fi
-    
-    # 尝试重启 SSH 服务
-    print_info "尝试重启 SSH 服务..."
-    if [[ -n "$SSH_SERVICE" ]]; then
-        if systemctl restart "$SSH_SERVICE" 2>/dev/null; then
-            print_success "$SSH_SERVICE 服务已重启"
-        else
-            print_warning "使用 $SSH_SERVICE 重启失败，尝试备选方案..."
-            # 尝试所有可能的SSH服务名
-            for svc in ssh sshd; do
-                if systemctl restart "$svc" 2>/dev/null; then
-                    print_success "使用 $svc 重启成功"
-                    break
-                fi
-            done
-        fi
-    else
-        # SSH_SERVICE 为空，尝试所有可能
-        for svc in ssh sshd; do
-            if systemctl restart "$svc" 2>/dev/null; then
-                print_success "使用 $svc 重启成功"
-                break
+    for token in $input; do
+        [[ "$token" =~ ^[0-9]+$ ]] || { ui_error "无效规则编号：$token"; return 1; }
+        (( token > 0 )) || { ui_error "规则编号必须大于 0。"; return 1; }
+        numbers+=( "$token" )
+    done
+
+    echo "将删除规则：${numbers[*]}"
+    ui_confirm "确定删除以上 UFW 规则？" || return 0
+
+    local i j tmp n
+    for ((i=0; i<${#numbers[@]}; i++)); do
+        for ((j=i+1; j<${#numbers[@]}; j++)); do
+            if (( numbers[i] < numbers[j] )); then
+                tmp="${numbers[i]}"
+                numbers[i]="${numbers[j]}"
+                numbers[j]="$tmp"
             fi
         done
-    fi
-    
-    # 确保 SSH 服务运行
-    if ! systemctl is-active --quiet ssh 2>/dev/null && ! systemctl is-active --quiet sshd 2>/dev/null; then
-        print_error "所有 SSH 服务均未运行！请手动检查系统状态"
-    fi
-    
-    print_warning "备份文件位置: ${BACKUP_FILE:-未创建}"
-    print_warning "请检查系统状态，必要时手动恢复"
-    
-    exit $exit_code
+    done
+
+    for n in "${numbers[@]}"; do
+        if ! ufw --force delete "$n"; then
+            ui_warning "删除规则 #$n 失败，继续处理其余规则。"
+        fi
+    done
 }
 
-# ========== 主函数 ==========
+ufw_change_defaults() {
+    ufw_is_installed || { ui_error "UFW 尚未安装。"; return 1; }
+    local incoming outgoing
+    echo "默认入站：1) deny  2) allow"
+    read -r -p "选择 [默认 1]: " incoming
+    [[ -n "$incoming" ]] || incoming=1
+    echo "默认出站：1) allow  2) deny"
+    read -r -p "选择 [默认 1]: " outgoing
+    [[ -n "$outgoing" ]] || outgoing=1
+
+    case "$incoming" in
+        1) ufw default deny incoming ;;
+        2) ufw default allow incoming ;;
+        *) ui_error "入站策略无效。"; return 1 ;;
+    esac
+    case "$outgoing" in
+        1) ufw default allow outgoing ;;
+        2) ufw default deny outgoing ;;
+        *) ui_error "出站策略无效。"; return 1 ;;
+    esac
+}
+
+ufw_enable_safely() {
+    ufw_is_installed || { ui_error "UFW 尚未安装。"; return 1; }
+    local port
+    while IFS= read -r port; do
+        [[ -n "$port" ]] || continue
+        if ! ssh_ufw_ensure_rule "$port"; then
+            ui_error "无法确保 SSH $port/tcp 已放行，拒绝启用 UFW。"
+            return 1
+        fi
+    done < <(ssh_config_get_all_ports)
+    ufw --force enable
+}
+
+ufw_reset() {
+    ufw_is_installed || { ui_error "UFW 尚未安装。"; return 1; }
+    ui_warning "这会删除所有 UFW 规则并关闭 UFW。"
+    ui_confirm "确定重置 UFW？" || return 0
+    ufw --force reset
+}
+
+# ============================================================
+# 8. SSH 密钥/安全业务层
+# ============================================================
+
+ssh_user_default() {
+    local sudo_user
+    sudo_user="$(printenv SUDO_USER 2>/dev/null || true)"
+    if [[ -n "$sudo_user" ]] && id "$sudo_user" >/dev/null 2>&1; then
+        DEFAULT_SSH_USER="$sudo_user"
+    else
+        DEFAULT_SSH_USER="root"
+    fi
+}
+
+ssh_key_normalize() {
+    local key="$1" decoded_type
+    key="$(printf '%s' "$key" | tr -d '\r\n')"
+    if [[ "$key" =~ ^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp[0-9]+|sk-ssh-ed25519@openssh.com|sk-ecdsa-sha2-nistp256@openssh.com)[[:space:]]+([^[:space:]]+)([[:space:]].*)?$ ]]; then
+        printf '%s\n' "$key"
+        return 0
+    fi
+    if [[ "$key" =~ ^[A-Za-z0-9+/]+={0,2}$ ]]; then
+        decoded_type="$(printf '%s' "$key" | base64 -d 2>/dev/null | grep -a -o -m1 -E 'ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp[0-9]+|sk-ssh-ed25519@openssh.com|sk-ecdsa-sha2-nistp256@openssh.com' || true)"
+        case "$decoded_type" in
+            ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp*|sk-ssh-ed25519@openssh.com|sk-ecdsa-sha2-nistp256@openssh.com)
+                printf '%s %s\n' "$decoded_type" "$key"
+                return 0 ;;
+        esac
+    fi
+    return 1
+}
+
+ssh_key_configure() {
+    ssh_is_installed || { ui_error "SSH 尚未安装。"; return 1; }
+    local target_user="$DEFAULT_SSH_USER"
+    echo "当前目标用户：$target_user"
+    local selected
+    read -r -p "输入其他本地用户名（直接 Enter 保持）: " selected
+    if [[ -n "$selected" ]]; then
+        id "$selected" >/dev/null 2>&1 || { ui_error "用户不存在。"; return 1; }
+        target_user="$selected"
+    fi
+
+    local home_dir ssh_dir auth_keys public_key normalized
+    home_dir="$(getent passwd "$target_user" | cut -d: -f6 2>/dev/null || true)"
+    [[ -n "$home_dir" ]] || home_dir="/root"
+    ssh_dir="$home_dir/.ssh"
+    auth_keys="$ssh_dir/authorized_keys"
+    echo "支持完整 OpenSSH 公钥，例如：ssh-ed25519 AAAA..."
+    echo "也支持仅粘贴 base64 密钥主体，例如：AAAA..."
+    read -r -p "请粘贴 SSH 公钥: " public_key
+    normalized="$(ssh_key_normalize "$public_key")" || {
+        ui_error "公钥格式无法识别，请粘贴有效的 OpenSSH 公钥。"
+        return 1
+    }
+
+    if sys_command_exists ssh-keygen; then
+        local tmp_key
+        tmp_key="$(mktemp)"
+        printf '%s\n' "$normalized" > "$tmp_key"
+        if ! ssh-keygen -lf "$tmp_key" >/dev/null 2>&1; then
+            rm -f "$tmp_key"
+            ui_error "公钥内容校验失败。"
+            return 1
+        fi
+        rm -f "$tmp_key"
+    fi
+
+    mkdir -p "$ssh_dir" || return 1
+    chmod 700 "$ssh_dir" || return 1
+    if [[ -f "$auth_keys" ]]; then
+        cp -a "$auth_keys" "$auth_keys.bak.$(date +%Y%m%d%H%M%S)" || return 1
+    fi
+    printf '%s\n' "$normalized" >> "$auth_keys" || return 1
+    chmod 600 "$auth_keys" || return 1
+    if [[ "$target_user" != "root" ]]; then
+        chown -R "$target_user" "$ssh_dir" || return 1
+    fi
+    ui_success "公钥已写入 $auth_keys"
+    ui_info "识别结果：$(printf '%s' "$normalized" | awk '{print $1}')"
+}
+
+ssh_optimize_security() {
+    ssh_is_installed || { ui_error "SSH 尚未安装。"; return 1; }
+    ssh_config_ensure || return 1
+    ssh_config_ensure_include || return 1
+
+    local backup security_conf
+    backup="$(ssh_config_backup)" || return 1
+    security_conf="$SSHD_CONFIG_DIR/99-ufwssh-security.conf"
+    mkdir -p "$SSHD_CONFIG_DIR"
+
+    cat > "$security_conf" <<'EOF'
+# Managed by ufwssh
+PubkeyAuthentication yes
+PermitEmptyPasswords no
+MaxAuthTries 5
+X11Forwarding no
+ChallengeResponseAuthentication no
+KbdInteractiveAuthentication no
+KerberosAuthentication no
+GSSAPIAuthentication no
+EOF
+
+    if ! ssh_config_test || ! ssh_restart; then
+        rm -f "$security_conf"
+        ssh_config_restore_backup "$backup" || true
+        ssh_restart >/dev/null 2>&1 || true
+        ui_error "SSH 安全配置失败，已回滚。"
+        return 1
+    fi
+    ui_success "SSH 基础安全配置已应用。"
+}
+
+# ============================================================
+# 9. 安装业务层
+# ============================================================
+
+pkg_debian_install() {
+    local package="${1:-}" backup profile
+    [[ -n "$package" ]] || { ui_error "未指定 Debian/Ubuntu 软件包。"; return 1; }
+    sys_command_exists apt-get || { ui_error "未找到 apt-get。"; return 1; }
+    ui_info "刷新 Debian/Ubuntu 软件源..."
+    apt-get update
+    if src_debian_package_available "$package"; then
+        DEBIAN_FRONTEND=noninteractive apt-get install -y "$package"
+        return $?
+    fi
+    ui_warning "当前 APT 源无法提供 $package，开始尝试官方源和备用镜像。"
+    backup="$(src_backup)" || { ui_error "无法创建 APT 软件源备份，停止自动换源。"; return 1; }
+    for profile in official tuna; do
+        if src_debian_try_profile "$profile" "$package"; then
+            ui_success "已找到 $package：$profile"
+            if DEBIAN_FRONTEND=noninteractive apt-get install -y "$package"; then
+                return 0
+            fi
+            ui_warning "$profile 已找到 $package，但安装失败，继续尝试其他源。"
+        fi
+    done
+    ui_error "无法从当前源、官方源或备用镜像安装 $package。"
+    src_restore_backup "$backup"
+    return 1
+}
+
+pkg_alpine_install() {
+    local package="${1:-}" branch backup profile
+    [[ -n "$package" ]] || { ui_error "未指定 Alpine 软件包。"; return 1; }
+
+    if src_alpine_refresh; then
+        if src_alpine_install_from_repos "$package"; then
+            return 0
+        fi
+    fi
+
+    branch="$(src_alpine_version_branch)"
+    [[ -n "$branch" ]] || { ui_error "无法确定 Alpine 稳定仓库分支。"; return 1; }
+
+    backup="$(src_backup)" || {
+        ui_error "无法创建 APK 软件源备份，停止自动换源。"
+        return 1
+    }
+
+    ui_warning "当前 Alpine 源无法提供 $package，切换官方源：stable main/community + edge main/community。"
+    src_alpine_write_official "$branch"
+    if src_alpine_refresh && src_alpine_install_from_repos "$package"; then
+        return 0
+    fi
+
+    ui_warning "官方源安装失败，切换 TUNA：stable main/community + edge main/community。"
+    src_alpine_write_tuna "$branch"
+    if src_alpine_refresh && src_alpine_install_from_repos "$package"; then
+        return 0
+    fi
+
+    ui_error "无法从当前源、官方源或 TUNA 源安装 $package。"
+    src_restore_backup "$backup"
+    return 1
+}
+
+install_ssh() {
+    case "$OS_TYPE" in
+        debian)
+            ui_info "Debian/Ubuntu：安装 OpenSSH Server..."
+            if ! ssh_is_installed; then
+                pkg_debian_install openssh-server || return 1
+            fi
+            ssh_detect_service
+            [[ -n "$SSH_SERVICE" ]] || { ui_error "无法检测 SSH 服务。"; return 1; }
+            mkdir -p "$SSHD_CONFIG_DIR"
+            ssh-keygen -A >/dev/null 2>&1 || true
+            ssh_is_running || ssh_start || return 1
+            ssh_enable >/dev/null 2>&1 || ui_warning "无法设置 SSH 开机自启。"
+            ui_success "Debian/Ubuntu SSH 安装/修复完成。"
+            ;;
+        alpine)
+            ui_info "Alpine Linux：安装 OpenSSH..."
+            if ! ssh_is_installed; then
+                pkg_alpine_install openssh || return 1
+            fi
+            SSH_SERVICE="sshd"
+            mkdir -p "$SSHD_CONFIG_DIR"
+            ssh-keygen -A >/dev/null 2>&1 || true
+            ssh_is_running || ssh_start || return 1
+            ssh_enable >/dev/null 2>&1 || ui_warning "无法设置 sshd 开机自启。"
+            ui_success "Alpine SSH 安装/修复完成（OpenRC）。"
+            ;;
+        *) ui_error "当前系统不支持 SSH 安装。"; return 1 ;;
+    esac
+}
+
+install_ufw() {
+    case "$OS_TYPE" in
+        debian)
+            ui_info "Debian/Ubuntu：安装 UFW..."
+            if ! ufw_is_installed; then
+                pkg_debian_install ufw || return 1
+            fi
+            ufw_configure_ipv6
+            ui_success "Debian/Ubuntu UFW 安装/修复完成。"
+            ;;
+        alpine)
+            ui_info "Alpine Linux：安装 UFW..."
+            if ufw_is_installed; then
+                ufw_configure_ipv6
+                ui_success "Alpine UFW 已安装。"
+                return 0
+            fi
+            pkg_alpine_install ufw || return 1
+            ufw_configure_ipv6
+            ui_success "Alpine UFW 安装完成。"
+            ;;
+        *) ui_error "当前系统不支持 UFW 安装。"; return 1 ;;
+    esac
+}
+
+install_all() {
+    ui_info "开始安装/修复 SSH + UFW..."
+    install_ssh || return 1
+    install_ufw || return 1
+    ui_success "SSH + UFW 安装/修复完成。"
+}
+
+# ============================================================
+# 10. 软件源业务层
+# ============================================================
+
+src_repair_debian() {
+    local backup profile
+    backup="$(src_backup)" || { ui_error "无法创建 APT 软件源备份。"; return 1; }
+    for profile in official tuna; do
+        if src_debian_try_profile "$profile" openssh-server ufw; then
+            ui_success "APT 软件源已切换并验证成功：$profile"
+            echo "备份：$backup"
+            return 0
+        fi
+    done
+    ui_error "官方源与备用镜像均无法提供所需软件包，恢复原 APT 配置。"
+    src_restore_backup "$backup"
+    return 1
+}
+
+src_repair_alpine() {
+    local branch backup profile
+    branch="$(src_alpine_version_branch)"
+    [[ -n "$branch" ]] || { ui_error "无法从 Alpine 版本 $OS_VERSION 推导稳定仓库分支。"; return 1; }
+    backup="$(src_backup)" || { ui_error "无法创建 APK 软件源备份。"; return 1; }
+    for profile in official tuna; do
+        if src_alpine_try_profile "$profile" "$branch" openssh ufw; then
+            ui_success "APK 软件源已切换并验证成功：$profile / $branch"
+            echo "备份：$backup"
+            return 0
+        fi
+    done
+    ui_error "官方源与备用镜像均无法提供所需软件包，恢复原 APK 配置。"
+    src_restore_backup "$backup"
+    return 1
+}
+
+src_repair() {
+    case "$OS_TYPE" in
+        debian) src_repair_debian ;;
+        alpine) src_repair_alpine ;;
+        *) ui_error "当前系统不支持软件源自动修复。"; return 1 ;;
+    esac
+}
+
+src_switch_alpine_tuna() {
+    local branch backup
+    branch="$(src_alpine_version_branch)"
+    [[ -n "$branch" ]] || { ui_error "无法从 Alpine 版本 $OS_VERSION 推导稳定仓库分支。"; return 1; }
+    backup="$(src_backup)" || { ui_error "无法创建 APK 软件源备份。"; return 1; }
+    if src_alpine_try_profile tuna "$branch" openssh ufw; then
+        ui_success "APK 已切换到清华 TUNA 镜像：$branch"
+        echo "备份：$backup"
+        return 0
+    fi
+    ui_error "TUNA 镜像无法提供所需软件包，恢复原 APK 配置。"
+    src_restore_backup "$backup"
+    return 1
+}
+
+src_switch_debian_tuna() {
+    local backup
+    backup="$(src_backup)" || { ui_error "无法创建 APT 软件源备份。"; return 1; }
+    if src_debian_try_profile tuna openssh-server ufw; then
+        ui_success "APT 已切换到清华 TUNA 镜像。"
+        echo "备份：$backup"
+        return 0
+    fi
+    ui_error "TUNA 镜像无法提供所需软件包，恢复原 APT 配置。"
+    src_restore_backup "$backup"
+    return 1
+}
+
+src_show_status() {
+    ui_print_banner
+    echo "========== 软件源状态 =========="
+    case "$OS_TYPE" in
+        debian)
+            echo "APT 软件源文件："
+            if [[ -f /etc/apt/sources.list ]]; then
+                echo "  /etc/apt/sources.list"
+                sed 's/^/    /' /etc/apt/sources.list
+            fi
+            local file
+            while IFS= read -r file; do
+                [[ -n "$file" ]] || continue
+                echo "  $file"
+                sed 's/^/    /' "$file"
+            done < <(src_debian_files)
+            echo ""
+            src_debian_package_available openssh-server && ui_success "APT：openssh-server 可用。" || ui_warning "APT：openssh-server 当前不可用。"
+            src_debian_package_available ufw && ui_success "APT：ufw 可用。" || ui_warning "APT：ufw 当前不可用。"
+            ;;
+        alpine)
+            echo "APK 软件源："
+            if [[ -f /etc/apk/repositories ]]; then
+                sed 's/^/  /' /etc/apk/repositories
+            else
+                echo "  /etc/apk/repositories（不存在）"
+            fi
+            echo ""
+            src_alpine_package_available openssh && ui_success "APK：openssh 可用。" || ui_warning "APK：openssh 当前不可用。"
+            src_alpine_package_available ufw && ui_success "APK：ufw 可用。" || ui_warning "APK：ufw 当前不可用。"
+            ;;
+        *) ui_error "未知系统。" ;;
+    esac
+    echo ""
+    echo "最近备份：$(src_backup_latest 2>/dev/null || echo '无')"
+}
+
+# ============================================================
+# 11. 状态展示层
+# ============================================================
+
+ui_show_component_status() {
+    ssh_detect_service
+    local port
+    port="$(ssh_config_get_port)"
+
+    echo -e "${CYAN}系统信息${NC}"
+    echo "  系统       : $OS_NAME $OS_VERSION"
+    echo "  架构       : $(uname -m)"
+    echo "  服务管理器 : $(sys_service_manager)"
+    echo ""
+    echo -e "${CYAN}组件状态${NC}"
+
+    if ssh_is_installed; then
+        if ssh_is_running; then
+            echo -e "  SSH        : $GREEN● 已安装 / 运行中$NC"
+        else
+            echo -e "  SSH        : $YELLOW● 已安装 / 未运行$NC"
+        fi
+        echo "  SSH 服务   : $SSH_SERVICE"
+        echo "  开机自启   : $(ssh_is_enabled && echo '是' || echo '否')"
+        echo "  SSH 端口   : $port"
+    else
+        echo -e "  SSH        : $YELLOW○ 未安装$NC"
+    fi
+
+    echo "  UFW        : $(ufw_status_text)"
+    echo ""
+}
+
+ui_show_detailed_status() {
+    ui_print_banner
+    ui_show_component_status
+    echo -e "${CYAN}SSH 监听${NC}"
+    if sys_command_exists ss; then
+        ss -lntp 2>/dev/null || true
+    else
+        echo "  未安装 ss。"
+    fi
+    echo ""
+    echo -e "${CYAN}UFW 规则${NC}"
+    if ufw_is_installed; then
+        ufw status verbose
+        echo ""
+        ufw status numbered
+    else
+        echo "  UFW 未安装。"
+    fi
+}
+
+# ============================================================
+# 12. 菜单层
+# ============================================================
+
+menu_install() {
+    local choice
+    while true; do
+        ui_print_banner
+        echo "========== 组件安装 =========="
+        echo "系统：$OS_NAME $OS_VERSION"
+        echo "SSH：$(ssh_status_text)"
+        echo "UFW：$(ufw_status_text)"
+        echo ""
+        echo "  1) 安装/修复 SSH"
+        echo "  2) 安装/修复 UFW"
+        echo "  3) 安装/修复 SSH + UFW"
+        echo "  0) 返回"
+        echo "------------------------------"
+        read -r -p "请选择: " choice
+        case "$choice" in
+            1) install_ssh; ui_pause ;;
+            2) install_ufw; ui_pause ;;
+            3) install_all; ui_pause ;;
+            0) return 0 ;;
+            *) ui_error "无效选择。" ;;
+        esac
+    done
+}
+
+menu_source() {
+    local choice
+    while true; do
+        ui_print_banner
+        echo "========== 软件源管理 =========="
+        echo "系统：$OS_NAME $OS_VERSION"
+        echo ""
+        echo "  1) 检测当前软件源"
+        echo "  2) 自动修复（官方源 → 备用镜像）"
+        if [[ "$OS_TYPE" == "alpine" ]]; then
+            echo "  3) 切换 Alpine 清华 TUNA 镜像"
+        else
+            echo "  3) 切换 Debian/Ubuntu 清华 TUNA 镜像"
+        fi
+        echo "  4) 恢复最近一次备份"
+        echo "  0) 返回"
+        echo "--------------------------------"
+        read -r -p "请选择: " choice
+        case "$choice" in
+            1) src_show_status; ui_pause ;;
+            2) src_repair; ui_pause ;;
+            3) if [[ "$OS_TYPE" == "alpine" ]]; then src_switch_alpine_tuna; else src_switch_debian_tuna; fi; ui_pause ;;
+            4) src_restore_backup; ui_pause ;;
+            0) return 0 ;;
+            *) ui_error "无效选择。" ;;
+        esac
+    done
+}
+
+menu_ssh_port() {
+    local choice
+    while true; do
+        ui_print_banner
+        echo "========== SSH 端口管理 =========="
+        echo "服务：$SSH_SERVICE"
+        echo "当前端口：$(ssh_config_get_port)"
+        echo ""
+        echo "  1) 修改 SSH 端口"
+        echo "  2) 查看当前端口"
+        echo "  3) 恢复默认端口 22"
+        echo "  4) 测试 SSH 配置"
+        echo "  5) 重启 SSH"
+        echo "  0) 返回"
+        echo "----------------------------------"
+        read -r -p "请选择: " choice
+        case "$choice" in
+            1) ssh_change_port; ui_pause ;;
+            2)
+                echo "当前端口：$(ssh_config_get_port)"
+                if sys_command_exists ss; then
+                    ss -lntp 2>/dev/null | grep -E ":$(ssh_config_get_port)([[:space:]]|$)" || true
+                fi
+                ui_pause
+                ;;
+            3) ssh_restore_default_port; ui_pause ;;
+            4) ssh_config_test; ui_pause ;;
+            5) ssh_restart && ui_success "SSH 已重启。" || ui_error "SSH 重启失败。"; ui_pause ;;
+            0) return 0 ;;
+            *) ui_error "无效选择。" ;;
+        esac
+    done
+}
+
+menu_ufw() {
+    local choice
+    while true; do
+        ui_print_banner
+        echo "========== UFW 防火墙管理 =========="
+        echo "状态：$(ufw_status_text)"
+        echo ""
+        if ufw_is_installed; then
+            ufw status | head -5 || true
+        fi
+        echo ""
+        echo "  1) 查看详细规则"
+        echo "  2) 添加规则"
+        echo "  3) 删除规则"
+        echo "  4) 修改默认策略"
+        echo "  5) 启用 UFW（自动保护 SSH）"
+        echo "  6) 禁用 UFW"
+        echo "  7) 重载 UFW"
+        echo "  8) 重置 UFW"
+        echo "  0) 返回"
+        echo "------------------------------------"
+        read -r -p "请选择: " choice
+        case "$choice" in
+            1) ufw_show_rules; ui_pause ;;
+            2) ufw_add_rule; ui_pause ;;
+            3) ufw_delete_rule; ui_pause ;;
+            4) ufw_change_defaults; ui_pause ;;
+            5) ufw_enable_safely; ui_pause ;;
+            6) ui_confirm "确定禁用 UFW？" && ufw disable; ui_pause ;;
+            7) ufw reload; ui_pause ;;
+            8) ufw_reset; ui_pause ;;
+            0) return 0 ;;
+            *) ui_error "无效选择。" ;;
+        esac
+    done
+}
+
+menu_ssh_service() {
+    local choice
+    while true; do
+        ui_print_banner
+        ssh_detect_service
+        echo "========== SSH 服务管理 =========="
+        echo "服务：$SSH_SERVICE"
+        echo "状态：$(ssh_status_text)"
+        echo ""
+        echo "  1) 启动 SSH"
+        echo "  2) 停止 SSH"
+        echo "  3) 重启 SSH"
+        echo "  4) 设置开机自启"
+        echo "  5) 取消开机自启"
+        echo "  6) 配置 SSH 公钥"
+        echo "  7) 应用 SSH 基础安全配置"
+        echo "  0) 返回"
+        echo "----------------------------------"
+        read -r -p "请选择: " choice
+        case "$choice" in
+            1) ssh_start && ui_success "SSH 已启动。" || ui_error "SSH 启动失败。"; ui_pause ;;
+            2) ssh_stop && ui_success "SSH 已停止。" || ui_error "SSH 停止失败。"; ui_pause ;;
+            3) ssh_restart && ui_success "SSH 已重启。" || ui_error "SSH 重启失败。"; ui_pause ;;
+            4) ssh_enable && ui_success "SSH 已设置开机自启。" || ui_error "设置失败。"; ui_pause ;;
+            5) ssh_disable && ui_success "SSH 已取消开机自启。" || ui_error "取消失败。"; ui_pause ;;
+            6) ssh_key_configure; ui_pause ;;
+            7) ssh_optimize_security; ui_pause ;;
+            0) return 0 ;;
+            *) ui_error "无效选择。" ;;
+        esac
+    done
+}
+
+menu_main() {
+    local choice
+    while true; do
+        ui_print_banner
+        ui_show_component_status
+        echo "------------------------------------------------------------"
+        echo "  1) 安装 SSH + UFW"
+        echo "  2) 软件源管理"
+        echo "  3) SSH 端口管理"
+        echo "  4) UFW 防火墙规则管理"
+        echo "  5) SSH 服务管理"
+        echo "  6) 查看详细状态"
+        echo "  7) 重置 UFW"
+        echo "  0) 退出"
+        echo "------------------------------------------------------------"
+        read -r -p "请选择: " choice
+        case "$choice" in
+            1) menu_install ;;
+            2) menu_source ;;
+            3) menu_ssh_port ;;
+            4) menu_ufw ;;
+            5) menu_ssh_service ;;
+            6) ui_show_detailed_status; ui_pause ;;
+            7) ufw_reset; ui_pause ;;
+            0) return 0 ;;
+            *) ui_error "无效选择。" ;;
+        esac
+    done
+}
+
+# ============================================================
+# 13. SSH 端口变更业务（依赖 6/7/8 层，放在菜单前）
+# ============================================================
+
+ssh_change_port() {
+    ssh_is_installed || { ui_error "SSH 尚未安装。"; return 1; }
+    local old_port new_port backup
+    old_port="$(ssh_config_get_port)"
+    echo "当前 SSH 有效端口：$old_port"
+    read -r -p "新的 SSH 端口（1-65535）: " new_port
+    if ! [[ "$new_port" =~ ^[0-9]+$ ]] || (( new_port < 1 || new_port > 65535 )); then
+        ui_error "端口号无效。"
+        return 1
+    fi
+    [[ "$new_port" == "$old_port" ]] && { ui_warning "端口没有变化。"; return 0; }
+    if ssh_port_is_listening "$new_port"; then
+        ui_error "端口 $new_port 已被占用。"
+        return 1
+    fi
+
+    backup="$(ssh_config_backup)" || { ui_error "无法备份 SSH 配置。"; return 1; }
+    if ufw_is_installed && ! ssh_ufw_ensure_rule "$new_port"; then
+        ui_error "UFW 无法放行新端口，停止操作。"
+        return 1
+    fi
+
+    if ! ssh_config_set_ports "$old_port" "$new_port"; then
+        ssh_config_restore_backup "$backup" || true
+        return 1
+    fi
+    if ! ssh_restart; then
+        ui_error "SSH 重启失败，恢复配置。"
+        ssh_config_restore_backup "$backup" || true
+        ssh_restart >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    sleep 1
+    if ! ssh_verify_port "$new_port"; then
+        ui_error "新端口未监听，恢复配置。"
+        ssh_config_restore_backup "$backup" || true
+        ssh_restart >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    ui_success "SSH 已实际监听 $old_port 和 $new_port。"
+    ui_warning "请先在另一个终端测试：ssh -p $new_port <用户>@<服务器IP>"
+    if ui_confirm "确认新端口可登录后，是否移除旧端口 $old_port？"; then
+        backup="$(ssh_config_backup)" || return 1
+        if ! ssh_config_remove_port "$old_port"; then
+            ssh_config_restore_backup "$backup" || true
+            ssh_restart >/dev/null 2>&1 || true
+            ui_error "移除旧端口配置失败，已恢复。"
+            return 1
+        fi
+        if ssh_config_test && ssh_restart; then
+            if ufw_is_installed; then
+                ufw delete allow "$old_port/tcp" >/dev/null 2>&1 || true
+            fi
+            ui_success "旧 SSH 端口 $old_port 已移除。"
+        else
+            ssh_config_restore_backup "$backup" || true
+            ssh_restart >/dev/null 2>&1 || true
+            ui_error "移除旧端口失败，已恢复。"
+            return 1
+        fi
+    else
+        ui_info "保留旧端口 $old_port。"
+    fi
+}
+
+ssh_restore_default_port() {
+    local current backup
+    current="$(ssh_config_get_port)"
+    [[ "$current" == "$DEFAULT_SSH_PORT" ]] && { ui_info "当前已经是 22 端口。"; return 0; }
+
+    backup="$(ssh_config_backup)" || return 1
+    if ufw_is_installed && ! ssh_ufw_ensure_rule "$DEFAULT_SSH_PORT"; then
+        ui_error "无法放行 22/tcp。"
+        return 1
+    fi
+    if ! ssh_config_set_ports "$current" "$DEFAULT_SSH_PORT" || ! ssh_restart; then
+        ssh_config_restore_backup "$backup" || true
+        ssh_restart >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    sleep 1
+    if ! ssh_verify_port "$DEFAULT_SSH_PORT"; then
+        ui_error "22 端口未监听，恢复配置。"
+        ssh_config_restore_backup "$backup" || true
+        ssh_restart >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    ui_success "SSH 已切换到 22，原端口 $current 暂时保留。"
+    if ui_confirm "确认 22 登录正常后，是否移除旧端口 $current？"; then
+        backup="$(ssh_config_backup)" || return 1
+        if ! ssh_config_remove_port "$current"; then
+            ssh_config_restore_backup "$backup" || true
+            ssh_restart >/dev/null 2>&1 || true
+            ui_error "移除旧端口失败，已恢复。"
+            return 1
+        fi
+        if ssh_config_test && ssh_restart; then
+            if ufw_is_installed; then
+                ufw delete allow "$current/tcp" >/dev/null 2>&1 || true
+            fi
+            ui_success "旧端口已移除。"
+        else
+            ssh_config_restore_backup "$backup" || true
+            ssh_restart >/dev/null 2>&1 || true
+            ui_error "移除旧端口失败，已恢复。"
+            return 1
+        fi
+    fi
+}
+
+# ============================================================
+# 14. 入口
+# ============================================================
+
 main() {
-    # 设置错误陷阱
-    trap cleanup_on_error ERR
-    
-    print_banner
-    
-    # 系统检查
-    check_root
-    check_ssh_service
-    
-    # 用户配置
-    configure_port
-    configure_stack
-    
-    # 环境检查
-    check_network
-    
-    # 安装和配置组件
-    install_ufw
-    check_sshd_config
-    
-    # 核心配置（顺序不能改变！）
-    # 1. 先配置防火墙规则（在UFW启用前添加所有必要规则）
-    configure_ufw_rules_safely
-    # 2. 再修改SSH端口（此时防火墙已配置好，不会断连）
-    modify_ssh_port
-    
-    # 安全配置
-    configure_ssh_key
-    verify_ssh_key
-    optimize_ssh_security
-    
-    # 输出信息
-    print_summary
-    print_test_instructions
-    
-    print_success "所有配置已完成！请按照上述指引测试新连接。"
+    sys_check_root || exit 1
+    sys_detect_os || exit 1
+    ssh_user_default
+    ssh_detect_service
+    menu_main
 }
 
-# ========== 脚本入口 ==========
-if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-    main "$@"
-fi
+main "$@"
