@@ -14,7 +14,7 @@ BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
-SCRIPT_VERSION="v4.0"
+SCRIPT_VERSION="v4.1"
 SSHD_CONFIG="/etc/ssh/sshd_config"
 SSHD_CONFIG_DIR="/etc/ssh/sshd_config.d"
 UFW_DEFAULT="/etc/default/ufw"
@@ -197,8 +197,7 @@ ufw_status_text() {
         echo "已安装 / 已启用"
     else
         echo "已安装 / 未启用"
-    fi
-}
+    fi}
 configure_ufw_ipv6() {
     is_ufw_installed || return 0
     mkdir -p "$(dirname "$UFW_DEFAULT")"
@@ -216,39 +215,29 @@ configure_ufw_ipv6() {
 # ==================== Debian 安装模块 ====================
 
 debian_prepare_apt() {
-    command_exists apt-get || {
-        print_error "未找到 apt-get。"
-        return 1
-    }
-
+    command_exists apt-get || { print_error "未找到 apt-get。"; return 1; }
     print_info "刷新 Debian/Ubuntu 软件源..."
     apt-get update
 }
 
-debian_package_available() {
-    local package="$1"
-    command_exists apt-cache || return 1
-
-    local policy
-    policy="$(apt-cache policy "$package" 2>/dev/null || true)"
-    if printf '%s\n' "$policy" | grep -Eq '^[[:space:]]*Candidate:[[:space:]]+[^ (]'; then
-        return 0
-    fi
-
-    print_error "Debian/Ubuntu 当前软件源没有可用的 $package 安装候选版本。"
-    print_warning "请检查 /etc/apt/sources.list 和 /etc/apt/sources.list.d/ 中的软件源。"
-    return 1
-}
-
 debian_install_package() {
-    local package="$1"
-
-    if ! debian_prepare_apt; then
-        print_warning "apt 软件源刷新失败，继续检查现有本地软件包索引..."
+    local package="$1" backup profile
+    if debian_prepare_apt && debian_package_available "$package"; then
+        DEBIAN_FRONTEND=noninteractive apt-get install -y "$package"
+        return $?
     fi
-
-    debian_package_available "$package" || return 1
-    DEBIAN_FRONTEND=noninteractive apt-get install -y "$package"
+    print_warning "当前 APT 源无法提供 $package，开始尝试官方源和备用镜像。"
+    backup="$(source_backup)" || { print_error "无法创建 APT 软件源备份，停止自动换源。"; return 1; }
+    for profile in official tuna; do
+        if debian_try_source_profile "$profile" "$package"; then
+            print_success "已找到 $package：$profile"
+            if DEBIAN_FRONTEND=noninteractive apt-get install -y "$package"; then return 0; fi
+            print_warning "$profile 已找到 $package，但安装失败，继续尝试其他源。"
+        fi
+    done
+    print_error "无法从当前源、官方源或备用镜像安装 $package。"
+    restore_source_backup "$backup"
+    return 1
 }
 
 install_debian_ssh() {
@@ -321,32 +310,62 @@ alpine_refresh_repositories() {
     apk update
 }
 
+alpine_enable_community() {
+    command_exists apk || { print_error "未找到 apk。"; return 1; }
+    [[ -f /etc/apk/repositories ]] || { print_error "未找到 /etc/apk/repositories。"; return 1; }
+    if grep -Eq '^[[:space:]]*[^#[:space:]].*/community([[:space:]]*)$' /etc/apk/repositories; then return 0; fi
+    local community_repo=""
+    community_repo="$(awk '
+        /^[[:space:]]*#/ { next }
+        /^[[:space:]]*[^[:space:]]/ {
+            url=$0
+            sub(/[[:space:]]+$/, "", url)
+            if (url ~ /\/main$/) { sub(/\/main$/, "/community", url); print url; exit }
+        }
+    ' /etc/apk/repositories)"
+    if [[ -n "$community_repo" ]]; then
+        printf '%s\n' "$community_repo" >> /etc/apk/repositories
+        print_success "已启用 Alpine community 仓库：$community_repo"
+        return 0
+    fi
+    print_warning "无法从现有仓库自动推导 community 地址。"
+    return 1
+}
+
 alpine_package_available() {
     local package="$1"
-    apk policy "$package" 2>/dev/null | grep -Eq '^[[:alnum:]_.+~-]+-[0-9]'
+    apk policy "$package" 2>/dev/null | grep -Eq '^[^[:space:]].*-[0-9][^:]*:'
 }
 
 alpine_install_package() {
-    local package="$1"
-
-    if ! alpine_refresh_repositories; then
-        print_warning "apk update 失败，继续检查现有软件包索引..."
+    local package="$1" branch backup profile
+    if alpine_refresh_repositories && alpine_package_available "$package"; then
+        apk add --no-cache "$package"
+        return $?
     fi
-
     if ! alpine_package_available "$package"; then
-        print_warning "当前 Alpine 软件源没有 $package，尝试启用 community..."
-        if alpine_enable_community; then
-            alpine_refresh_repositories || return 1
+        print_warning "当前 Alpine 源无法提供 $package，尝试启用 community..."
+        alpine_enable_community >/dev/null 2>&1 || true
+        alpine_refresh_repositories >/dev/null 2>&1 || true
+    fi
+    if alpine_package_available "$package"; then
+        apk add --no-cache "$package"
+        return $?
+    fi
+    branch="$(alpine_version_branch)"
+    [[ -n "$branch" ]] || { print_error "无法确定 Alpine 稳定仓库分支。"; return 1; }
+    print_warning "当前 Alpine 源无法提供 $package，开始尝试官方源和备用镜像。"
+    backup="$(source_backup)" || { print_error "无法创建 APK 软件源备份，停止自动换源。"; return 1; }
+    for profile in official tuna; do
+        if alpine_try_source_profile "$profile" "$branch" "$package"; then
+            print_success "已找到 $package：$profile / $branch"
+            if apk add --no-cache "$package"; then return 0; fi
+            print_warning "$profile 已找到 $package，但安装失败，继续尝试其他源。"
         fi
-    fi
-
-    if ! alpine_package_available "$package"; then
-        print_error "当前 Alpine 软件源仍没有可用的 $package 安装包。"
-        print_warning "请检查 /etc/apk/repositories 后重试。"
-        return 1
-    fi
-
-    apk add --no-cache "$package"
+    done
+    print_error "无法从当前源、官方源或备用镜像安装 $package。"
+    restore_source_backup "$backup"
+    return 1
 }
 
 install_alpine_ssh() {
@@ -379,37 +398,49 @@ install_alpine_ufw() {
 # ==================== 软件源管理层 ====================
 
 SOURCE_BACKUP_ROOT="/etc/ufwssh/source-backups"
+DEBIAN_MANAGED_SOURCE="/etc/apt/sources.list.d/ufwssh-official.sources"
+DEBIAN_MANAGED_LEGACY_SOURCE="/etc/apt/sources.list.d/ufwssh-official.list"
+ALPINE_MANAGED_SOURCE="/etc/apk/repositories"
 
 get_distro_id() {
     [[ -r /etc/os-release ]] || return 1
     . /etc/os-release
-    echo "\${ID:-}"
+    printf '%s\n' "$ID"
 }
 
 get_distro_codename() {
     local codename=""
-    [[ -r /etc/os-release ]] && . /etc/os-release && codename="\${VERSION_CODENAME:-}"
-    [[ -n "$codename" ]] || command_exists lsb_release && codename="$(lsb_release -cs 2>/dev/null || true)"
-    echo "$codename"
+    if [[ -r /etc/os-release ]]; then
+        . /etc/os-release
+        codename="$VERSION_CODENAME"
+        [[ -z "$codename" ]] && codename="$UBUNTU_CODENAME"
+    fi
+    if [[ -z "$codename" ]] && command_exists lsb_release; then
+        codename="$(lsb_release -cs 2>/dev/null || true)"
+    fi
+    printf '%s\n' "$codename"
 }
 
 source_backup() {
-    local backup_dir="$SOURCE_BACKUP_ROOT/$(date +%Y%m%d%H%M%S)"
-    mkdir -p "$backup_dir" || return 1
+    local backup_dir
+    mkdir -p "$SOURCE_BACKUP_ROOT" || return 1
+    backup_dir="$(mktemp -d "$SOURCE_BACKUP_ROOT/backup.XXXXXX")" || return 1
     case "$OS_TYPE" in
         debian)
-            [[ -f /etc/apt/sources.list ]] && cp -a /etc/apt/sources.list "$backup_dir/sources.list"
-            [[ -d /etc/apt/sources.list.d ]] && cp -a /etc/apt/sources.list.d "$backup_dir/sources.list.d"
+            if [[ -e /etc/apt/sources.list ]]; then cp -a /etc/apt/sources.list "$backup_dir/sources.list"; else : > "$backup_dir/sources.list.missing"; fi
+            if [[ -d /etc/apt/sources.list.d ]]; then cp -a /etc/apt/sources.list.d "$backup_dir/sources.list.d"; else : > "$backup_dir/sources.list.d.missing"; fi
             ;;
-        alpine) [[ -f /etc/apk/repositories ]] && cp -a /etc/apk/repositories "$backup_dir/repositories" ;;
-        *) return 1 ;;
+        alpine)
+            if [[ -e /etc/apk/repositories ]]; then cp -a /etc/apk/repositories "$backup_dir/repositories"; else : > "$backup_dir/repositories.missing"; fi
+            ;;
+        *) rm -rf "$backup_dir"; return 1 ;;
     esac
     echo "$backup_dir"
 }
 
 source_backup_latest() {
     [[ -d "$SOURCE_BACKUP_ROOT" ]] || return 1
-    find "$SOURCE_BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1 | cut -d' ' -f2-
+    ls -dt "$SOURCE_BACKUP_ROOT"/backup.* 2>/dev/null | head -1
 }
 
 debian_source_files() {
@@ -417,51 +448,92 @@ debian_source_files() {
     find /etc/apt/sources.list.d -maxdepth 1 -type f \( -name '*.list' -o -name '*.sources' \) -print 2>/dev/null
 }
 
+debian_apt_supports_deb822() {
+    local major="" minor=""
+    read -r major minor _ < <(apt-get --version 2>/dev/null | awk 'NR==1 {split($2,v,"."); print v[1],v[2]}')
+    [[ -n "$major" && "$major" =~ ^[0-9]+$ ]] || return 1
+    [[ -n "$minor" && "$minor" =~ ^[0-9]+$ ]] || minor=0
+    (( major > 1 || (major == 1 && minor >= 1) ))
+}
+
 debian_disable_existing_sources() {
     local file
     while IFS= read -r file; do
-        [[ -n "$file" ]] && mv "$file" "$file.ufwssh-disabled"
+        [[ -n "$file" ]] || continue
+        case "$file" in
+            "$DEBIAN_MANAGED_SOURCE"|"$DEBIAN_MANAGED_LEGACY_SOURCE") continue ;;
+        esac
+        mv "$file" "$file.ufwssh-disabled"
     done < <(debian_source_files)
 }
 
 debian_write_sources() {
-    local distro codename
+    local profile="official"
+    [[ $# -gt 0 ]] && profile="$1"
+    local distro codename base_uri security_uri components
     distro="$(get_distro_id)"
     codename="$(get_distro_codename)"
     [[ -n "$codename" ]] || { print_error "无法检测 Debian/Ubuntu 发行版代号。"; return 1; }
-    debian_disable_existing_sources
-    case "$distro" in
-        debian)
-            cat > /etc/apt/sources.list <<EOF
-deb https://deb.debian.org/debian $codename main contrib non-free non-free-firmware
-deb https://deb.debian.org/debian $codename-updates main contrib non-free non-free-firmware
-deb https://security.debian.org/debian-security $codename-security main contrib non-free non-free-firmware
-EOF
-            ;;
-        ubuntu)
-            cat > /etc/apt/sources.list <<EOF
-deb https://archive.ubuntu.com/ubuntu $codename main restricted universe multiverse
-deb https://archive.ubuntu.com/ubuntu $codename-updates main restricted universe multiverse
-deb https://security.ubuntu.com/ubuntu $codename-security main restricted universe multiverse
-EOF
-            ;;
-        *) print_error "当前发行版 $distro 不属于 Debian/Ubuntu，拒绝修改 APT 软件源。"; return 1 ;;
+
+    case "$distro:$profile" in
+        debian:official) base_uri="https://deb.debian.org/debian"; security_uri="https://security.debian.org/debian-security"; components="main contrib non-free non-free-firmware" ;;
+        debian:tuna) base_uri="https://mirrors.tuna.tsinghua.edu.cn/debian"; security_uri="https://mirrors.tuna.tsinghua.edu.cn/debian-security"; components="main contrib non-free non-free-firmware" ;;
+        ubuntu:official) base_uri="https://archive.ubuntu.com/ubuntu"; security_uri="https://security.ubuntu.com/ubuntu"; components="main restricted universe multiverse" ;;
+        ubuntu:tuna) base_uri="https://mirrors.tuna.tsinghua.edu.cn/ubuntu"; security_uri="https://mirrors.tuna.tsinghua.edu.cn/ubuntu"; components="main restricted universe multiverse" ;;
+        *) print_error "不支持的 APT 软件源配置：$distro / $profile"; return 1 ;;
     esac
+
+    mkdir -p /etc/apt/sources.list.d
+    debian_disable_existing_sources
+    rm -f "$DEBIAN_MANAGED_SOURCE" "$DEBIAN_MANAGED_LEGACY_SOURCE"
+    if debian_apt_supports_deb822; then
+        cat > "$DEBIAN_MANAGED_SOURCE" <<EOF
+Types: deb
+URIs: $base_uri
+Suites: $codename $codename-updates
+Components: $components
+Signed-By: /usr/share/keyrings/$distro-archive-keyring.gpg
+
+Types: deb
+URIs: $security_uri
+Suites: $codename-security
+Components: $components
+Signed-By: /usr/share/keyrings/$distro-archive-keyring.gpg
+EOF
+    else
+        cat > "$DEBIAN_MANAGED_LEGACY_SOURCE" <<EOF
+deb $base_uri $codename $components
+deb $base_uri $codename-updates $components
+deb $security_uri $codename-security $components
+EOF
+    fi
 }
 
-debian_source_status() {
-    echo "APT 软件源文件："
-    [[ -f /etc/apt/sources.list ]] && { echo "  /etc/apt/sources.list"; sed 's/^/    /' /etc/apt/sources.list; } || echo "  /etc/apt/sources.list（不存在）"
-    local file
-    while IFS= read -r file; do
-        [[ -n "$file" ]] || continue
-        echo "  $file"
-        sed 's/^/    /' "$file"
-    done < <(debian_source_files)
-    echo ""
-    apt-cache policy openssh-server 2>/dev/null | grep -Eq '^[[:space:]]*Candidate:[[:space:]]+[^ (]' &&
-        print_success "APT 当前可以提供 openssh-server。" ||
-        print_warning "APT 当前无法确认 openssh-server 有可用候选版本。"
+debian_package_available() {
+    local package="$1" policy candidate
+    command_exists apt-cache || return 1
+    policy="$(apt-cache policy "$package" 2>/dev/null || true)"
+    candidate="$(printf '%s\n' "$policy" | awk -F': ' '/^[[:space:]]*Candidate:/ {print $2; exit}')"
+    [[ -n "$candidate" && "$candidate" != "(none)" ]]
+}
+
+debian_packages_available() {
+    local package
+    for package in "$@"; do debian_package_available "$package" || return 1; done
+    return 0
+}
+
+debian_refresh_and_check() {
+    print_info "刷新 APT 软件包索引..."
+    apt-get update || { print_warning "APT update 失败。"; return 1; }
+    debian_packages_available "$@" || { print_warning "当前 APT 源刷新成功，但目标软件包没有可用候选版本。"; return 1; }
+}
+
+debian_try_source_profile() {
+    local profile="$1"; shift
+    print_info "尝试 Debian/Ubuntu $profile 软件源..."
+    debian_write_sources "$profile" || return 1
+    debian_refresh_and_check "$@"
 }
 
 alpine_version_branch() {
@@ -472,7 +544,7 @@ alpine_version_branch() {
 
 alpine_write_repositories() {
     local branch="$1"
-    cat > /etc/apk/repositories <<EOF
+    cat > "$ALPINE_MANAGED_SOURCE" <<EOF
 https://dl-cdn.alpinelinux.org/alpine/$branch/main
 https://dl-cdn.alpinelinux.org/alpine/$branch/community
 EOF
@@ -480,33 +552,48 @@ EOF
 
 alpine_write_tuna_repositories() {
     local branch="$1"
-    cat > /etc/apk/repositories <<EOF
+    cat > "$ALPINE_MANAGED_SOURCE" <<EOF
 https://mirrors.tuna.tsinghua.edu.cn/alpine/$branch/main
 https://mirrors.tuna.tsinghua.edu.cn/alpine/$branch/community
 EOF
 }
 
-alpine_source_status() {
-    echo "APK 软件源："
-    [[ -f /etc/apk/repositories ]] && sed 's/^/  /' /etc/apk/repositories || echo "  /etc/apk/repositories（不存在）"
-    echo ""
-    apk policy openssh 2>/dev/null | grep -Eq '^[[:alnum:]_.+~-]+-[0-9]' &&
-        print_success "当前仓库可以提供 openssh。" ||
-        print_warning "当前仓库无法确认 openssh 可用。"
+alpine_package_available() {
+    local package="$1"
+    apk policy "$package" 2>/dev/null | grep -Eq '^[^[:space:]].*-[0-9][^:]*:'
+}
+
+alpine_packages_available() {
+    local package
+    for package in "$@"; do alpine_package_available "$package" || return 1; done
+    return 0
+}
+
+alpine_refresh_and_check() {
+    print_info "刷新 APK 软件包索引..."
+    apk update || { print_warning "APK update 失败。"; return 1; }
+    alpine_packages_available "$@" || { print_warning "当前 APK 源刷新成功，但目标软件包没有可用版本。"; return 1; }
+}
+
+alpine_try_source_profile() {
+    local profile="$1" branch="$2"; shift 2
+    case "$profile" in official) alpine_write_repositories "$branch" ;; tuna) alpine_write_tuna_repositories "$branch" ;; *) return 1 ;; esac
+    print_info "尝试 Alpine $profile 软件源：$branch"
+    alpine_refresh_and_check "$@"
 }
 
 restore_source_backup() {
-    local backup_dir="\${1:-}"
+    local backup_dir=""
+    [[ $# -gt 0 ]] && backup_dir="$1"
     [[ -n "$backup_dir" && -d "$backup_dir" ]] || backup_dir="$(source_backup_latest 2>/dev/null || true)"
     [[ -n "$backup_dir" && -d "$backup_dir" ]] || { print_error "没有可恢复的软件源备份。"; return 1; }
     case "$OS_TYPE" in
         debian)
-            [[ -f "$backup_dir/sources.list" ]] && cp -a "$backup_dir/sources.list" /etc/apt/sources.list
-            [[ -d "$backup_dir/sources.list.d" ]] && { rm -rf /etc/apt/sources.list.d; cp -a "$backup_dir/sources.list.d" /etc/apt/sources.list.d; }
+            if [[ -f "$backup_dir/sources.list" ]]; then rm -f /etc/apt/sources.list; cp -a "$backup_dir/sources.list" /etc/apt/sources.list; elif [[ -f "$backup_dir/sources.list.missing" ]]; then rm -f /etc/apt/sources.list; fi
+            if [[ -d "$backup_dir/sources.list.d" ]]; then rm -rf /etc/apt/sources.list.d; cp -a "$backup_dir/sources.list.d" /etc/apt/sources.list.d; elif [[ -f "$backup_dir/sources.list.d.missing" ]]; then rm -rf /etc/apt/sources.list.d; mkdir -p /etc/apt/sources.list.d; fi
             ;;
         alpine)
-            [[ -f "$backup_dir/repositories" ]] || { print_error "备份中没有 repositories 文件。"; return 1; }
-            cp -a "$backup_dir/repositories" /etc/apk/repositories
+            if [[ -f "$backup_dir/repositories" ]]; then cp -a "$backup_dir/repositories" /etc/apk/repositories; elif [[ -f "$backup_dir/repositories.missing" ]]; then rm -f /etc/apk/repositories; fi
             ;;
         *) return 1 ;;
     esac
@@ -514,48 +601,45 @@ restore_source_backup() {
 }
 
 repair_debian_sources() {
-    local backup
+    local backup profile
     backup="$(source_backup)" || { print_error "无法创建 APT 软件源备份。"; return 1; }
-    debian_write_sources || { restore_source_backup "$backup" >/dev/null 2>&1 || true; return 1; }
-    print_info "已切换到 Debian/Ubuntu 官方软件源，正在刷新 APT..."
-    if apt-get update; then
-        print_success "APT 软件源修复成功。"
-        echo "备份：$backup"
-        return 0
-    fi
-    print_error "APT 软件源刷新失败，正在恢复修改前的配置。"
+    for profile in official tuna; do
+        if debian_try_source_profile "$profile" openssh-server ufw; then print_success "APT 软件源已切换并验证成功：$profile"; echo "备份：$backup"; return 0; fi
+    done
+    print_error "官方源与备用镜像均无法提供所需软件包，恢复原 APT 配置。"
     restore_source_backup "$backup"
     return 1
 }
 
 repair_alpine_sources() {
-    local branch backup
-    branch="$(alpine_version_branch)" || { print_error "无法从 Alpine 版本 $OS_VERSION 推导稳定仓库分支。"; return 1; }
+    local branch backup profile
+    branch="$(alpine_version_branch)"
+    [[ -n "$branch" ]] || { print_error "无法从 Alpine 版本 $OS_VERSION 推导稳定仓库分支。"; return 1; }
     backup="$(source_backup)" || { print_error "无法创建 APK 软件源备份。"; return 1; }
-    alpine_write_repositories "$branch"
-    print_info "已切换到 Alpine 官方仓库：$branch，正在刷新 APK..."
-    if apk update; then
-        print_success "APK 软件源修复成功。"
-        echo "备份：$backup"
-        return 0
-    fi
-    print_error "APK 软件源刷新失败，正在恢复修改前的配置。"
+    for profile in official tuna; do
+        if alpine_try_source_profile "$profile" "$branch" openssh ufw; then print_success "APK 软件源已切换并验证成功：$profile / $branch"; echo "备份：$backup"; return 0; fi
+    done
+    print_error "官方源与备用镜像均无法提供所需软件包，恢复原 APK 配置。"
     restore_source_backup "$backup"
     return 1
 }
 
 switch_alpine_tuna_sources() {
     local branch backup
-    branch="$(alpine_version_branch)" || { print_error "无法从 Alpine 版本 $OS_VERSION 推导稳定仓库分支。"; return 1; }
+    branch="$(alpine_version_branch)"
+    [[ -n "$branch" ]] || { print_error "无法从 Alpine 版本 $OS_VERSION 推导稳定仓库分支。"; return 1; }
     backup="$(source_backup)" || { print_error "无法创建 APK 软件源备份。"; return 1; }
-    alpine_write_tuna_repositories "$branch"
-    print_info "已切换到清华 TUNA Alpine 镜像：$branch"
-    if apk update; then
-        print_success "APK 镜像源切换成功。"
-        echo "备份：$backup"
-        return 0
-    fi
-    print_error "镜像源刷新失败，正在恢复修改前的配置。"
+    if alpine_try_source_profile tuna "$branch" openssh ufw; then print_success "APK 已切换到清华 TUNA 镜像：$branch"; echo "备份：$backup"; return 0; fi
+    print_error "TUNA 镜像无法提供所需软件包，恢复原 APK 配置。"
+    restore_source_backup "$backup"
+    return 1
+}
+
+switch_debian_tuna_sources() {
+    local backup
+    backup="$(source_backup)" || { print_error "无法创建 APT 软件源备份。"; return 1; }
+    if debian_try_source_profile tuna openssh-server ufw; then print_success "APT 已切换到清华 TUNA 镜像。"; echo "备份：$backup"; return 0; fi
+    print_error "TUNA 镜像无法提供所需软件包，恢复原 APT 配置."
     restore_source_backup "$backup"
     return 1
 }
@@ -572,8 +656,22 @@ show_source_status() {
     print_banner
     echo "========== 软件源状态 =========="
     case "$OS_TYPE" in
-        debian) debian_source_status ;;
-        alpine) alpine_source_status ;;
+        debian)
+            echo "APT 软件源文件："
+            [[ -f /etc/apt/sources.list ]] && { echo "  /etc/apt/sources.list"; sed 's/^/    /' /etc/apt/sources.list; }
+            local file
+            while IFS= read -r file; do [[ -n "$file" ]] || continue; echo "  $file"; sed 's/^/    /' "$file"; done < <(debian_source_files)
+            echo ""
+            debian_package_available openssh-server && print_success "APT：openssh-server 可用。" || print_warning "APT：openssh-server 当前不可用。"
+            debian_package_available ufw && print_success "APT：ufw 可用。" || print_warning "APT：ufw 当前不可用。"
+            ;;
+        alpine)
+            echo "APK 软件源："
+            [[ -f /etc/apk/repositories ]] && sed 's/^/  /' /etc/apk/repositories || echo "  /etc/apk/repositories（不存在）"
+            echo ""
+            alpine_package_available openssh && print_success "APK：openssh 可用。" || print_warning "APK：openssh 当前不可用."
+            alpine_package_available ufw && print_success "APK：ufw 可用。" || print_warning "APK：ufw 当前不可用."
+            ;;
         *) print_error "未知系统。" ;;
     esac
     echo ""
@@ -587,8 +685,8 @@ source_menu() {
         echo "系统：$OS_NAME $OS_VERSION"
         echo ""
         echo "  1) 检测当前软件源"
-        echo "  2) 自动修复软件源（官方源）"
-        [[ "$OS_TYPE" == "alpine" ]] && echo "  3) 切换 Alpine 清华 TUNA 镜像" || echo "  3) 重置为 Debian/Ubuntu 官方源"
+        echo "  2) 自动修复（官方源 → 备用镜像）"
+        if [[ "$OS_TYPE" == "alpine" ]]; then echo "  3) 切换 Alpine 清华 TUNA 镜像"; else echo "  3) 切换 Debian/Ubuntu 清华 TUNA 镜像"; fi
         echo "  4) 恢复最近一次备份"
         echo "  0) 返回"
         echo "--------------------------------"
@@ -597,46 +695,12 @@ source_menu() {
         case "$choice" in
             1) show_source_status; pause_menu ;;
             2) repair_sources; pause_menu ;;
-            3) [[ "$OS_TYPE" == "alpine" ]] && switch_alpine_tuna_sources || repair_debian_sources; pause_menu ;;
+            3) if [[ "$OS_TYPE" == "alpine" ]]; then switch_alpine_tuna_sources; else switch_debian_tuna_sources; fi; pause_menu ;;
             4) restore_source_backup; pause_menu ;;
             0) return 0 ;;
             *) print_error "无效选择。" ;;
         esac
     done
-}
-
-# ==================== 统一安装入口 ====================
-
-install_ssh() {
-    case "$OS_TYPE" in
-        debian) install_debian_ssh ;;
-        alpine) install_alpine_ssh ;;
-        *) print_error "未知系统。"; return 1 ;;
-    esac
-}
-install_ufw() {
-    case "$OS_TYPE" in
-        debian) install_debian_ufw ;;
-        alpine) install_alpine_ufw ;;
-        *) print_error "未知系统。"; return 1 ;;
-    esac
-}
-install_all() {
-    local ssh_ok=true
-    local ufw_ok=true
-    echo ""
-    print_info "当前系统：$OS_NAME $OS_VERSION"
-    install_ssh || ssh_ok=false
-    echo ""
-    install_ufw || ufw_ok=false
-    echo ""
-    if $ssh_ok && $ufw_ok; then
-        print_success "SSH + UFW 安装/修复完成。"
-        print_warning "UFW 安装后不会自动启用，请先确认规则。"
-    else
-        print_error "安装流程未全部成功。"
-        return 1
-    fi
 }
 
 # ==================== SSH 配置层 ====================
@@ -797,7 +861,6 @@ restore_default_ssh_port() {
     local current backup
     current="$(get_ssh_port)"
     [[ "$current" == "$DEFAULT_SSH_PORT" ]] && { print_info "当前已经是 22 端口。"; return 0; }
-
     backup="$(backup_sshd_config)" || return 1
     if is_ufw_installed && ! ensure_ufw_ssh_rule "$DEFAULT_SSH_PORT"; then
         print_error "无法放行 22/tcp。"
@@ -997,8 +1060,7 @@ EOF
         cp -a "$backup" "$SSHD_CONFIG"
         restart_ssh >/dev/null 2>&1 || true
         print_error "SSH 安全配置失败，已回滚。"
-        return 1
-    fi
+        return 1    fi
     print_success "SSH 基础安全配置已应用。"
 }
 
@@ -1198,23 +1260,3 @@ main_menu() {
             3) ssh_port_menu ;;
             4) ufw_menu ;;
             5) ssh_service_menu ;;
-            6) show_detailed_status; pause_menu ;;
-            7) reset_ufw; pause_menu ;;
-            0) echo "已退出。"; return 0 ;;
-            *) print_error "无效选择，请输入 0-7。" ;;
-        esac
-    done
-}
-
-main() {
-    check_root || exit 1
-    detect_os || exit 1
-    get_target_ssh_user
-    detect_ssh_service
-    # 启动阶段只做只读检测，不自动安装、启用 UFW 或修改 SSH。
-    main_menu
-}
-
-if [[ "$0" == "$BASH_SOURCE" ]]; then
-    main "$@"
-fi
