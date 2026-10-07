@@ -1,61 +1,40 @@
 #!/bin/bash
 #
-# UFW + SSH 交互式管理工具 v4.7
+# UFW + SSH 交互式管理工具 v4.8
 # Debian/Ubuntu: apt + systemd
 # Alpine Linux:  apk + OpenRC
 #
+# v4.8 变更：
+#   - 组件安装菜单新增“快捷安装与配置”（菜单 4）
+#     步骤：装 SSH → 装 UFW → 改端口 → 配公钥 → 关密码 → 同步规则 → 启用 UFW
+#     每步可跳过；只做编排，所有操作调已有函数
+#     关闭密码登录前强制检查公钥，无公钥则拒绝
+#     端口/公钥/关密码失败继续，SSH/UFW 安装/同步/启用失败中止
+#     结束后显示总结
+#
 # v4.7 变更：
 #   - 新增“密码登录开关”（SSH 服务管理 → 8）
-#     关闭后 PasswordAuthentication no，仅允许公钥登录
-#     独立文件 /etc/ssh/sshd_config.d/98-ufwssh-password-auth.conf
-#     关闭前检查至少一个用户有 authorized_keys
-#     关闭前必须确认，失败回滚
 #   - ssh_optimize_security 用 $OS_TYPE 判断 Kerberos/GSSAPI
-#     Alpine 的 openssh 不认这两个选项，不再写入，避免 warning
 #
 # v4.6.1 修复：
-#   - 脚本开头显式设置 PATH，确保 /sbin /usr/sbin 可见
-#   - ssh_port_is_listening 改用 /proc/net/tcp 检测，不依赖 ss/netstat
+#   - 脚本开头显式设置 PATH
+#   - ssh_port_is_listening 改用 /proc/net/tcp
 #
 # v4.6 变更：
-#   - 新增“删除 SSH 端口”功能（菜单 3 → SSH 端口管理 → 4）
-#   - 不允许删到 0 个端口（至少保留 1 个）
-#   - 删除前确认（可能断连）
-#   - 删除后 UFW 规则跟随删除
-#   - 删除后 verify 剩余端口全部生效，失败回滚
-#   - menu_ssh_port 编号顺延：4 删除端口，5 测试配置，6 重启 SSH
-#
-# v4.5 架构：
-#   - SSH 端口配置引入“显式管理块”
-#   - 用户原有 Port 行首次注释为 "# ufwssh: original Port N"
-#   - 唯一真相来源：ssh_config_ports_effective (sshd -T)
-#   - UFW 规则跟随管理块，ssh_ufw_sync 统一同步
-#   - ssh_change_port / ssh_restore_default_port 为“管理块整体替换”
-#
-# v4.4 变更：
-#   - SSH 端口显示改为“全部端口”
-#   - UFW 规则适配多端口
-#   - ssh_config_ensure_include 去重
-#   - src_alpine_install_from_repos 优先 stable
-#   - apt-get update 失败继续安装
-#
-# v4.3 变更：
-#   - SSH 规则由 allow 改为 limit
-#   - 旧 allow 规则先删再 limit
-#   - ufw_show_rules 只显示 verbose
+#   - 新增“删除 SSH 端口”（菜单 3 → 4）
+#   - 不允许删到 0 个端口
+#   - 删除前确认，失败回滚
 #
 
 set -uo pipefail
 
-# 显式设置 PATH，确保 /sbin /usr/sbin 可见
-# （Alpine 上 doas/su 执行时 PATH 可能不含 /sbin）
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
 
 # ============================================================
 # 0. 常量
 # ============================================================
 
-SCRIPT_VERSION="v4.7"
+SCRIPT_VERSION="v4.8"
 SSHD_CONFIG="/etc/ssh/sshd_config"
 SSHD_CONFIG_DIR="/etc/ssh/sshd_config.d"
 UFW_DEFAULT="/etc/default/ufw"
@@ -691,8 +670,6 @@ ssh_config_restore_backup() {
     fi
 }
 
-# 端口监听检测：优先 /proc/net/tcp（不依赖 ss/netstat，不依赖 PATH）
-# 回退 ss / netstat（在 /proc 不可读的环境）
 ssh_port_is_listening() {
     local port="$1"
     local hex_port
@@ -1228,7 +1205,6 @@ ssh_restore_default_port() {
     fi
 }
 
-# 删除指定 SSH 端口（至少保留 1 个）
 ssh_remove_port() {
     ssh_is_installed || { ui_error "SSH 尚未安装。"; return 1; }
 
@@ -1452,8 +1428,6 @@ ChallengeResponseAuthentication no
 KbdInteractiveAuthentication no
 EOF
 
-    # 仅 Debian/Ubuntu 的 openssh 编译带 Kerberos / GSSAPI 支持
-    # Alpine 的 openssh 不认这两个选项，写了会 warning
     if [[ "$OS_TYPE" == "debian" ]]; then
         cat >> "$SECURITY_CONF" <<'EOF'
 KerberosAuthentication no
@@ -1471,10 +1445,6 @@ EOF
     ui_success "SSH 基础安全配置已应用。"
 }
 
-# ---- 密码登录开关 ----
-
-# 读取当前 PasswordAuthentication 状态
-# 返回 0 = 已开启（yes），1 = 已关闭（no）
 ssh_password_auth_is_enabled() {
     ssh_is_installed || return 1
     local value
@@ -1482,8 +1452,6 @@ ssh_password_auth_is_enabled() {
     [[ "$value" == "yes" ]]
 }
 
-# 检查至少一个用户有 authorized_keys
-# 返回 0 = 有，1 = 无
 ssh_password_auth_has_pubkey() {
     local user home auth_keys
     local -a users=()
@@ -1492,7 +1460,6 @@ ssh_password_auth_has_pubkey() {
     if [[ -n "${DEFAULT_SSH_USER:-}" && "$DEFAULT_SSH_USER" != "root" ]]; then
         users+=( "$DEFAULT_SSH_USER" )
     fi
-    # 扫描 /home/*
     if [[ -d /home ]]; then
         local d
         for d in /home/*; do
@@ -1513,8 +1480,6 @@ ssh_password_auth_has_pubkey() {
     return 1
 }
 
-# 设置密码登录
-# $1 = yes / no
 ssh_password_auth_set() {
     local enabled="$1"
     ssh_is_installed || { ui_error "SSH 尚未安装。"; return 1; }
@@ -1553,7 +1518,6 @@ EOF
 
     sleep 1
 
-    # verify
     local actual
     actual="$(sshd -T 2>/dev/null | awk '$1 == "passwordauthentication" {print $2; exit}')"
     if [[ "$actual" != "$enabled" ]]; then
@@ -1567,7 +1531,6 @@ EOF
     return 0
 }
 
-# 密码登录开关菜单
 ssh_password_auth_menu() {
     ssh_is_installed || { ui_error "SSH 尚未安装。"; return 1; }
 
@@ -1766,6 +1729,106 @@ install_all() {
     ui_success "SSH + UFW 安装/修复完成。"
 }
 
+# ---- 快捷安装与配置 ----
+
+install_quick_summary() {
+    echo ""
+    ui_success "========== 快捷安装完成 =========="
+    echo "  SSH 端口   : $(ssh_config_ports_text)"
+    if ssh_password_auth_is_enabled; then
+        echo -e "  密码登录   : ${GREEN}已开启$NC"
+    else
+        echo -e "  密码登录   : ${RED}已关闭$NC"
+    fi
+    echo "  UFW        : $(ufw_status_text)"
+    if ufw_is_installed; then
+        echo ""
+        echo "  SSH 规则："
+        ufw status 2>/dev/null | grep -E '/tcp.*(LIMIT|ALLOW).*# SSH' | sed 's/^/    /' || true
+    fi
+}
+
+install_quick_init() {
+    ui_print_banner
+    echo "========== 快捷安装与配置 =========="
+    echo ""
+    echo "即将执行："
+    echo "  1. 安装/修复 SSH"
+    echo "  2. 安装/修复 UFW"
+    echo "  3. 修改 SSH 端口（可选）"
+    echo "  4. 配置 SSH 公钥（可选）"
+    echo "  5. 关闭密码登录（可选，需已配公钥）"
+    echo "  6. 同步 SSH UFW 规则（limit）"
+    echo "  7. 启用 UFW"
+    echo ""
+    ui_confirm "继续？" || return 0
+
+    echo ""
+    echo "[1/7] 安装/修复 SSH..."
+    if ! install_ssh; then
+        ui_error "SSH 安装失败，中止。"
+        return 1
+    fi
+
+    echo ""
+    echo "[2/7] 安装/修复 UFW..."
+    if ! install_ufw; then
+        ui_error "UFW 安装失败，中止。"
+        return 1
+    fi
+
+    echo ""
+    echo "[3/7] 修改 SSH 端口..."
+    if ui_confirm "      是否修改 SSH 端口？"; then
+        ssh_change_port || ui_warning "      端口修改失败，继续后续步骤。"
+    else
+        echo "      跳过。"
+    fi
+
+    echo ""
+    echo "[4/7] 配置 SSH 公钥..."
+    if ui_confirm "      是否配置 SSH 公钥？"; then
+        ssh_key_configure || ui_warning "      公钥配置失败，继续后续步骤。"
+    else
+        echo "      跳过。"
+    fi
+
+    echo ""
+    echo "[5/7] 关闭密码登录..."
+    if ui_confirm "      是否关闭密码登录？"; then
+        if ! ssh_password_auth_has_pubkey; then
+            ui_error "      未检测到任何用户配置了 SSH 公钥。"
+            ui_info "      关闭密码登录后你将无法登录，跳过。"
+        else
+            if ssh_password_auth_set "no"; then
+                ui_success "      密码登录已关闭。"
+            else
+                ui_warning "      关闭失败，保持现状。"
+            fi
+        fi
+    else
+        echo "      跳过。"
+    fi
+
+    echo ""
+    echo "[6/7] 同步 SSH UFW 规则..."
+    if ! ssh_ufw_sync; then
+        ui_error "同步失败，中止。"
+        return 1
+    fi
+    ui_success "      同步完成。"
+
+    echo ""
+    echo "[7/7] 启用 UFW..."
+    if ! ufw_enable_safely; then
+        ui_error "启用 UFW 失败，中止。"
+        return 1
+    fi
+    ui_success "      UFW 已启用。"
+
+    install_quick_summary
+}
+
 # ============================================================
 # 11. 软件源业务层
 # ============================================================
@@ -1949,6 +2012,7 @@ menu_install() {
         echo "  1) 安装/修复 SSH"
         echo "  2) 安装/修复 UFW"
         echo "  3) 安装/修复 SSH + UFW"
+        echo "  4) 快捷安装与配置"
         echo "  0) 返回"
         echo "------------------------------"
         read -r -p "请选择: " choice
@@ -1956,6 +2020,7 @@ menu_install() {
             1) install_ssh; ui_pause ;;
             2) install_ufw; ui_pause ;;
             3) install_all; ui_pause ;;
+            4) install_quick_init; ui_pause ;;
             0) return 0 ;;
             *) ui_error "无效选择。" ;;
         esac
