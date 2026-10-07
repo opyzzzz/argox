@@ -215,11 +215,46 @@ configure_ufw_ipv6() {
 
 # ==================== Debian 安装模块 ====================
 
+debian_prepare_apt() {
+    command_exists apt-get || {
+        print_error "未找到 apt-get。"
+        return 1
+    }
+
+    print_info "刷新 Debian/Ubuntu 软件源..."
+    apt-get update
+}
+
+debian_package_available() {
+    local package="$1"
+    command_exists apt-cache || return 1
+
+    local policy
+    policy="$(apt-cache policy "$package" 2>/dev/null || true)"
+    if printf '%s\n' "$policy" | grep -Eq '^[[:space:]]*Candidate:[[:space:]]+[^ (]'; then
+        return 0
+    fi
+
+    print_error "Debian/Ubuntu 当前软件源没有可用的 $package 安装候选版本。"
+    print_warning "请检查 /etc/apt/sources.list 和 /etc/apt/sources.list.d/ 中的软件源。"
+    return 1
+}
+
+debian_install_package() {
+    local package="$1"
+
+    if ! debian_prepare_apt; then
+        print_warning "apt 软件源刷新失败，继续检查现有本地软件包索引..."
+    fi
+
+    debian_package_available "$package" || return 1
+    DEBIAN_FRONTEND=noninteractive apt-get install -y "$package"
+}
+
 install_debian_ssh() {
     print_info "Debian/Ubuntu：安装 OpenSSH Server..."
     if ! is_ssh_installed; then
-        apt-get update || return 1
-        DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server || return 1
+        debian_install_package openssh-server || return 1
     fi
     detect_ssh_service
     [[ -n "$SSH_SERVICE" ]] || { print_error "无法检测 SSH 服务。"; return 1; }
@@ -233,8 +268,7 @@ install_debian_ssh() {
 install_debian_ufw() {
     print_info "Debian/Ubuntu：安装 UFW..."
     if ! is_ufw_installed; then
-        apt-get update || return 1
-        DEBIAN_FRONTEND=noninteractive apt-get install -y ufw || return 1
+        debian_install_package ufw || return 1
     fi
     configure_ufw_ipv6
     print_success "Debian/Ubuntu UFW 安装/修复完成。"
@@ -242,10 +276,83 @@ install_debian_ufw() {
 
 # ==================== Alpine 安装模块 ====================
 
+alpine_enable_community() {
+    command_exists apk || {
+        print_error "未找到 apk。"
+        return 1
+    }
+
+    [[ -f /etc/apk/repositories ]] || {
+        print_error "未找到 /etc/apk/repositories。"
+        return 1
+    }
+
+    if grep -Eq '^[[:space:]]*[^#[:space:]].*/community([[:space:]]*)$' /etc/apk/repositories; then
+        return 0
+    fi
+
+    local community_repo=""
+    community_repo="$(awk '
+        /^[[:space:]]*#/ { next }
+        /^[[:space:]]*[^[:space:]]/ {
+            url=$0
+            sub(/[[:space:]]+$/, "", url)
+            if (url ~ /\/main$/) {
+                sub(/\/main$/, "/community", url)
+                print url
+                exit
+            }
+        }
+    ' /etc/apk/repositories)"
+
+    if [[ -n "$community_repo" ]]; then
+        cp -a /etc/apk/repositories "/etc/apk/repositories.bak.$(date +%Y%m%d%H%M%S)"
+        printf '%s\n' "$community_repo" >> /etc/apk/repositories
+        print_success "已自动启用 Alpine community 仓库：$community_repo"
+        return 0
+    fi
+
+    print_warning "无法从现有仓库自动推导 community 地址。"
+    return 1
+}
+
+alpine_refresh_repositories() {
+    print_info "刷新 Alpine 软件源..."
+    apk update
+}
+
+alpine_package_available() {
+    local package="$1"
+    apk policy "$package" 2>/dev/null | grep -Eq '^[[:alnum:]_.+~-]+-[0-9]'
+}
+
+alpine_install_package() {
+    local package="$1"
+
+    if ! alpine_refresh_repositories; then
+        print_warning "apk update 失败，继续检查现有软件包索引..."
+    fi
+
+    if ! alpine_package_available "$package"; then
+        print_warning "当前 Alpine 软件源没有 $package，尝试启用 community..."
+        if alpine_enable_community; then
+            alpine_refresh_repositories || return 1
+        fi
+    fi
+
+    if ! alpine_package_available "$package"; then
+        print_error "当前 Alpine 软件源仍没有可用的 $package 安装包。"
+        print_warning "请检查 /etc/apk/repositories 后重试。"
+        return 1
+    fi
+
+    apk add --no-cache "$package"
+}
+
 install_alpine_ssh() {
     print_info "Alpine Linux：安装 OpenSSH..."
     if ! is_ssh_installed; then
-        apk add --no-cache openssh || return 1
+        alpine_install_package openssh || return 1
     fi
     SSH_SERVICE="sshd"
     mkdir -p "$SSHD_CONFIG_DIR"
@@ -263,14 +370,7 @@ install_alpine_ufw() {
         return 0
     fi
 
-    apk update || return 1
-    if ! apk policy ufw 2>/dev/null | grep -q '^ufw-'; then
-        print_error "当前 Alpine 软件源未提供 UFW 包。"
-        print_warning "请确认已启用 community 仓库后重试。"
-        return 1
-    fi
-
-    apk add --no-cache ufw || return 1
+    alpine_install_package ufw || return 1
     configure_ufw_ipv6
     print_success "Alpine UFW 安装完成。"
 }
