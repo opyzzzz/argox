@@ -557,47 +557,6 @@ alpine_version_branch() {
     printf '%s\n' "$version" | sed -n 's/^\([0-9]\+\.[0-9]\+\).*/v\1/p'
 }
 
-alpine_write_repositories() {
-    local branch="$1"
-    mkdir -p "$(dirname "$ALPINE_MANAGED_SOURCE")" || return 1
-    cat > "$ALPINE_MANAGED_SOURCE" <<EOF
-https://dl-cdn.alpinelinux.org/alpine/$branch/main
-https://dl-cdn.alpinelinux.org/alpine/$branch/community
-EOF
-}
-
-alpine_write_tuna_repositories() {
-    local branch="$1"
-    mkdir -p "$(dirname "$ALPINE_MANAGED_SOURCE")" || return 1
-    cat > "$ALPINE_MANAGED_SOURCE" <<EOF
-https://mirrors.tuna.tsinghua.edu.cn/alpine/$branch/main
-https://mirrors.tuna.tsinghua.edu.cn/alpine/$branch/community
-EOF
-}
-
-alpine_package_available() {
-    local package="$1"
-    apk policy "$package" 2>/dev/null | grep -Eq '^[^[:space:]].*-[0-9][^:]*:'
-}
-
-alpine_packages_available() {
-    local package
-    for package in "$@"; do alpine_package_available "$package" || return 1; done
-    return 0
-}
-
-alpine_refresh_and_check() {
-    print_info "刷新 APK 软件包索引..."
-    apk update || { print_warning "APK update 失败。"; return 1; }
-    alpine_packages_available "$@" || { print_warning "当前 APK 源刷新成功，但目标软件包没有可用版本。"; return 1; }
-}
-
-alpine_try_source_profile() {
-    local profile="$1" branch="$2"; shift 2
-    case "$profile" in official) alpine_write_repositories "$branch" ;; tuna) alpine_write_tuna_repositories "$branch" ;; *) return 1 ;; esac
-    print_info "尝试 Alpine $profile 软件源：$branch"
-    alpine_refresh_and_check "$@"
-}
 
 restore_source_backup() {
     local backup_dir=""
@@ -806,26 +765,6 @@ ssh_port_config_files() {
         [[ -f "$file" ]] || continue
         printf '%s\n' "$file"
     done
-}
-get_ssh_port() {
-    CURRENT_SSH_PORT="$DEFAULT_SSH_PORT"
-    if ! is_ssh_installed; then echo "$CURRENT_SSH_PORT"; return 0; fi
-    ensure_sshd_config
-    if command_exists sshd; then
-        local port
-        port="$(sshd -T 2>/dev/null | awk '$1 == "port" {print $2; exit}')"
-        if [[ "$port" =~ ^[0-9]+$ ]]; then CURRENT_SSH_PORT="$port"; echo "$CURRENT_SSH_PORT"; return 0; fi
-    fi
-    local config_port
-    config_port="$(grep -E '^[[:space:]]*Port[[:space:]]+[0-9]+' "$SSHD_CONFIG" 2>/dev/null | awk '{print $2}' | head -1)"
-    [[ "$config_port" =~ ^[0-9]+$ ]] && CURRENT_SSH_PORT="$config_port"
-    echo "$CURRENT_SSH_PORT"
-}
-test_sshd_config() {
-    command_exists sshd || { print_error "未找到 sshd。"; return 1; }
-    local output
-    if output="$(sshd -t 2>&1)"; then print_success "SSH 配置语法检查通过。"; return 0; fi
-    print_error "SSH 配置检查失败：$output"; return 1
 }
 port_is_listening() {
     local port="$1"
