@@ -1,15 +1,21 @@
 #!/bin/bash
 #
-# UFW + SSH 交互式管理工具 v4.6.1
+# UFW + SSH 交互式管理工具 v4.7
 # Debian/Ubuntu: apt + systemd
 # Alpine Linux:  apk + OpenRC
 #
+# v4.7 变更：
+#   - 新增“密码登录开关”（SSH 服务管理 → 8）
+#     关闭后 PasswordAuthentication no，仅允许公钥登录
+#     独立文件 /etc/ssh/sshd_config.d/98-ufwssh-password-auth.conf
+#     关闭前检查至少一个用户有 authorized_keys
+#     关闭前必须确认，失败回滚
+#   - ssh_optimize_security 用 $OS_TYPE 判断 Kerberos/GSSAPI
+#     Alpine 的 openssh 不认这两个选项，不再写入，避免 warning
+#
 # v4.6.1 修复：
 #   - 脚本开头显式设置 PATH，确保 /sbin /usr/sbin 可见
-#     （解决 Alpine 上 doas/su 执行时 PATH 缺失导致 ss/ufw/sshd 找不到）
 #   - ssh_port_is_listening 改用 /proc/net/tcp 检测，不依赖 ss/netstat
-#     （解决 busybox/iproute2 差异、PATH 缺失导致的误判）
-#   - menu_ssh_port 查看端口保留 ss，但 PATH 已保障
 #
 # v4.6 变更：
 #   - 新增“删除 SSH 端口”功能（菜单 3 → SSH 端口管理 → 4）
@@ -49,7 +55,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH
 # 0. 常量
 # ============================================================
 
-SCRIPT_VERSION="v4.6.1"
+SCRIPT_VERSION="v4.7"
 SSHD_CONFIG="/etc/ssh/sshd_config"
 SSHD_CONFIG_DIR="/etc/ssh/sshd_config.d"
 UFW_DEFAULT="/etc/default/ufw"
@@ -58,6 +64,9 @@ DEFAULT_SSH_PORT=22
 MANAGED_BLOCK_BEGIN="# >>> ufwssh managed ports >>>"
 MANAGED_BLOCK_END="# <<< ufwssh managed ports <<<"
 ORIGINAL_PORT_PREFIX="# ufwssh: original Port"
+
+PASSWORD_AUTH_CONF="$SSHD_CONFIG_DIR/98-ufwssh-password-auth.conf"
+SECURITY_CONF="$SSHD_CONFIG_DIR/99-ufwssh-security.conf"
 
 SOURCE_BACKUP_ROOT="/etc/ufwssh/source-backups"
 SSH_BACKUP_ROOT="/etc/ufwssh/ssh-backups"
@@ -689,7 +698,6 @@ ssh_port_is_listening() {
     local hex_port
     hex_port="$(printf '%04X' "$port")"
 
-    # 主检测：/proc/net/tcp + /proc/net/tcp6
     if [[ -r /proc/net/tcp || -r /proc/net/tcp6 ]]; then
         if awk -v hex="$hex_port" '
             NR > 1 && $4 == "0A" {
@@ -700,11 +708,9 @@ ssh_port_is_listening() {
         ' /proc/net/tcp /proc/net/tcp6 2>/dev/null; then
             return 0
         fi
-        # /proc 可读且明确未监听 → 直接返回 1，不再回退
         return 1
     fi
 
-    # 回退：/proc 不可读时用 ss / netstat
     if sys_command_exists ss; then
         ss -lnt 2>/dev/null | awk 'NR>1 {print $4}' | grep -Eq "(^|:)$port$|\]:$port$" && return 0
     fi
@@ -1432,32 +1438,202 @@ ssh_optimize_security() {
     ssh_config_ensure || return 1
     ssh_config_ensure_include || return 1
 
-    local backup security_conf
+    local backup
     backup="$(ssh_config_backup)" || return 1
-    security_conf="$SSHD_CONFIG_DIR/99-ufwssh-security.conf"
     mkdir -p "$SSHD_CONFIG_DIR"
 
-    cat > "$security_conf" <<'EOF'
+    cat > "$SECURITY_CONF" <<'EOF'
 # Managed by ufwssh
 PubkeyAuthentication yes
 PermitEmptyPasswords no
 MaxAuthTries 5
 X11Forwarding no
-# ChallengeResponseAuthentication 在新版 OpenSSH 已弃用，保留兼容旧版本
 ChallengeResponseAuthentication no
 KbdInteractiveAuthentication no
+EOF
+
+    # 仅 Debian/Ubuntu 的 openssh 编译带 Kerberos / GSSAPI 支持
+    # Alpine 的 openssh 不认这两个选项，写了会 warning
+    if [[ "$OS_TYPE" == "debian" ]]; then
+        cat >> "$SECURITY_CONF" <<'EOF'
 KerberosAuthentication no
 GSSAPIAuthentication no
 EOF
+    fi
 
     if ! ssh_config_test || ! ssh_restart; then
-        rm -f "$security_conf"
+        rm -f "$SECURITY_CONF"
         ssh_config_restore_backup "$backup" || true
         ssh_restart >/dev/null 2>&1 || true
         ui_error "SSH 安全配置失败，已回滚。"
         return 1
     fi
     ui_success "SSH 基础安全配置已应用。"
+}
+
+# ---- 密码登录开关 ----
+
+# 读取当前 PasswordAuthentication 状态
+# 返回 0 = 已开启（yes），1 = 已关闭（no）
+ssh_password_auth_is_enabled() {
+    ssh_is_installed || return 1
+    local value
+    value="$(sshd -T 2>/dev/null | awk '$1 == "passwordauthentication" {print $2; exit}')"
+    [[ "$value" == "yes" ]]
+}
+
+# 检查至少一个用户有 authorized_keys
+# 返回 0 = 有，1 = 无
+ssh_password_auth_has_pubkey() {
+    local user home auth_keys
+    local -a users=()
+
+    users+=( "root" )
+    if [[ -n "${DEFAULT_SSH_USER:-}" && "$DEFAULT_SSH_USER" != "root" ]]; then
+        users+=( "$DEFAULT_SSH_USER" )
+    fi
+    # 扫描 /home/*
+    if [[ -d /home ]]; then
+        local d
+        for d in /home/*; do
+            [[ -d "$d" ]] || continue
+            users+=( "$(basename "$d")" )
+        done
+    fi
+
+    for user in "${users[@]}"; do
+        id "$user" >/dev/null 2>&1 || continue
+        home="$(getent passwd "$user" | cut -d: -f6 2>/dev/null || true)"
+        [[ -n "$home" ]] || continue
+        auth_keys="$home/.ssh/authorized_keys"
+        if [[ -s "$auth_keys" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# 设置密码登录
+# $1 = yes / no
+ssh_password_auth_set() {
+    local enabled="$1"
+    ssh_is_installed || { ui_error "SSH 尚未安装。"; return 1; }
+
+    [[ "$enabled" == "yes" || "$enabled" == "no" ]] || {
+        ui_error "内部错误：无效参数 $enabled"
+        return 1
+    }
+
+    ssh_config_ensure || return 1
+    ssh_config_ensure_include || return 1
+    mkdir -p "$SSHD_CONFIG_DIR" || return 1
+
+    local backup
+    backup="$(ssh_config_backup)" || { ui_error "无法备份 SSH 配置。"; return 1; }
+
+    cat > "$PASSWORD_AUTH_CONF" <<EOF
+# Managed by ufwssh
+PasswordAuthentication $enabled
+EOF
+
+    if ! ssh_config_test; then
+        rm -f "$PASSWORD_AUTH_CONF"
+        ssh_config_restore_backup "$backup" || true
+        ui_error "SSH 配置语法检查失败，已恢复。"
+        return 1
+    fi
+
+    if ! ssh_restart; then
+        rm -f "$PASSWORD_AUTH_CONF"
+        ssh_config_restore_backup "$backup" || true
+        ssh_restart >/dev/null 2>&1 || true
+        ui_error "SSH 重启失败，已恢复。"
+        return 1
+    fi
+
+    sleep 1
+
+    # verify
+    local actual
+    actual="$(sshd -T 2>/dev/null | awk '$1 == "passwordauthentication" {print $2; exit}')"
+    if [[ "$actual" != "$enabled" ]]; then
+        rm -f "$PASSWORD_AUTH_CONF"
+        ssh_config_restore_backup "$backup" || true
+        ssh_restart >/dev/null 2>&1 || true
+        ui_error "密码登录设置未生效（当前：$actual），已恢复。"
+        return 1
+    fi
+
+    return 0
+}
+
+# 密码登录开关菜单
+ssh_password_auth_menu() {
+    ssh_is_installed || { ui_error "SSH 尚未安装。"; return 1; }
+
+    while true; do
+        local status
+        if ssh_password_auth_is_enabled; then
+            status="${GREEN}已开启$NC"
+        else
+            status="${RED}已关闭$NC"
+        fi
+
+        ui_print_banner
+        echo "========== 密码登录开关 =========="
+        echo -e "当前状态：$status"
+        echo ""
+        echo "  说明："
+        echo "    开启：允许用密码登录（PasswordAuthentication yes）"
+        echo "    关闭：仅允许公钥登录（PasswordAuthentication no）"
+        echo ""
+        echo "  1) 开启密码登录"
+        echo "  2) 关闭密码登录"
+        echo "  0) 返回"
+        echo "----------------------------------"
+        local choice
+        read -r -p "请选择: " choice
+        case "$choice" in
+            1)
+                if ssh_password_auth_is_enabled; then
+                    ui_info "密码登录已经是开启状态。"
+                    ui_pause
+                    continue
+                fi
+                if ui_confirm "确定开启密码登录？"; then
+                    if ssh_password_auth_set "yes"; then
+                        ui_success "密码登录已开启。"
+                    fi
+                fi
+                ui_pause
+                ;;
+            2)
+                if ! ssh_password_auth_is_enabled; then
+                    ui_info "密码登录已经是关闭状态。"
+                    ui_pause
+                    continue
+                fi
+                if ! ssh_password_auth_has_pubkey; then
+                    ui_error "未检测到任何用户配置了 SSH 公钥。"
+                    ui_info "关闭密码登录后你将无法登录。"
+                    ui_info "请先用「配置 SSH 公钥」添加公钥。"
+                    ui_pause
+                    continue
+                fi
+                ui_warning "关闭密码登录后，仅允许公钥登录。"
+                ui_warning "请确保你已配置公钥并能正常登录。"
+                if ui_confirm "确定关闭密码登录？"; then
+                    if ssh_password_auth_set "no"; then
+                        ui_success "密码登录已关闭，仅允许公钥登录。"
+                        ui_info "如断连，请用公钥重新连接。"
+                    fi
+                fi
+                ui_pause
+                ;;
+            0) return 0 ;;
+            *) ui_error "无效选择。" ;;
+        esac
+    done
 }
 
 # ============================================================
@@ -1724,6 +1900,11 @@ ui_show_component_status() {
         echo "  SSH 服务   : $SSH_SERVICE"
         echo "  开机自启   : $(ssh_is_enabled && echo '是' || echo '否')"
         echo "  SSH 端口   : $ports_text"
+        if ssh_password_auth_is_enabled; then
+            echo -e "  密码登录   : ${GREEN}已开启$NC"
+        else
+            echo -e "  密码登录   : ${RED}已关闭$NC"
+        fi
     else
         echo -e "  SSH        : $YELLOW○ 未安装$NC"
     fi
@@ -1913,6 +2094,7 @@ menu_ssh_service() {
         echo "  5) 取消开机自启"
         echo "  6) 配置 SSH 公钥"
         echo "  7) 应用 SSH 基础安全配置"
+        echo "  8) 密码登录开关"
         echo "  0) 返回"
         echo "----------------------------------"
         read -r -p "请选择: " choice
@@ -1924,6 +2106,7 @@ menu_ssh_service() {
             5) ssh_disable && ui_success "SSH 已取消开机自启。" || ui_error "取消失败。"; ui_pause ;;
             6) ssh_key_configure; ui_pause ;;
             7) ssh_optimize_security; ui_pause ;;
+            8) ssh_password_auth_menu ;;
             0) return 0 ;;
             *) ui_error "无效选择。" ;;
         esac
