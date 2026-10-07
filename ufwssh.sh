@@ -1,14 +1,34 @@
 #!/bin/bash
 #
-# UFW + SSH 交互式管理工具 v4.3
+# UFW + SSH 交互式管理工具 v4.5
 # Debian/Ubuntu: apt + systemd
 # Alpine Linux:  apk + OpenRC
 #
+# v4.5 架构变更：
+#   - SSH 端口配置引入“显式管理块”：
+#       # >>> ufwssh managed ports >>>
+#       Port N
+#       # <<< ufwssh managed ports <<<
+#   - 用户原有 Port 行首次被注释为 "# ufwssh: original Port N"，永不改动
+#   - 删除“主端口”概念：ssh_config_get_port 移除
+#   - 唯一真相来源：ssh_config_ports_effective (sshd -T)
+#   - 新增 ssh_config_ports_in_block / managed_write / managed_remove
+#   - UFW 规则引入 ssh_ufw_sync()，跟随管理块而非 effective
+#   - ssh_ufw_detect_limit_ports / detect_allow_ports 兼容 v4 与 v6
+#   - ssh_change_port / ssh_restore_default_port 改为“管理块整体替换”
+#   - 删除 ssh_ufw_ensure_rule / ssh_ufw_remove_rule（遍历版）
+#
+# v4.4 变更：
+#   - SSH 端口显示改为“全部端口”
+#   - UFW 规则适配多端口
+#   - ssh_config_ensure_include 去重
+#   - src_alpine_install_from_repos 优先 stable
+#   - apt-get update 失败继续安装
+#
 # v4.3 变更：
-#   - SSH 规则由 allow 改为 limit（缓解暴力破解）
-#   - 已存在 allow 规则时先删除再 limit，避免叠加
-#   - 旧端口清理同时尝试 delete limit / delete allow
-#   - ufw_show_rules 只显示 verbose，去除重复
+#   - SSH 规则由 allow 改为 limit
+#   - 旧 allow 规则先删再 limit
+#   - ufw_show_rules 只显示 verbose
 #
 # v4.2 修复清单：
 #   - 消除 alpine_packages_available 嵌套定义
@@ -17,9 +37,7 @@
 #   - Alpine 确保 sshd_config 含 Include sshd_config.d/*.conf
 #   - detect_ssh_service Alpine grep -qx -> grep -qw
 #   - configure_ssh_key chown 仅改属主
-#   - 补 KbdInteractiveAuthentication no
 #   - remove_ssh_port 清理历史注释
-#   - get_ssh_port 返回主端口，新增 get_all_ssh_ports
 #   - debian_disable_existing_sources 打印被禁用文件
 #   - SSH_USER 拆为 DEFAULT_SSH_USER + 局部 target_user
 #   - 菜单 choice 全部 local
@@ -32,17 +50,20 @@ set -uo pipefail
 # 0. 常量
 # ============================================================
 
-SCRIPT_VERSION="v4.3"
+SCRIPT_VERSION="v4.5"
 SSHD_CONFIG="/etc/ssh/sshd_config"
 SSHD_CONFIG_DIR="/etc/ssh/sshd_config.d"
 UFW_DEFAULT="/etc/default/ufw"
 DEFAULT_SSH_PORT=22
 
+MANAGED_BLOCK_BEGIN="# >>> ufwssh managed ports >>>"
+MANAGED_BLOCK_END="# <<< ufwssh managed ports <<<"
+ORIGINAL_PORT_PREFIX="# ufwssh: original Port"
+
 SOURCE_BACKUP_ROOT="/etc/ufwssh/source-backups"
 SSH_BACKUP_ROOT="/etc/ufwssh/ssh-backups"
 DEBIAN_MANAGED_SOURCE="/etc/apt/sources.list.d/ufwssh-official.sources"
 DEBIAN_MANAGED_LEGACY_SOURCE="/etc/apt/sources.list.d/ufwssh-official.list"
-ALPINE_MANAGED_SOURCE="/etc/apk/repositories"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -57,7 +78,6 @@ OS_NAME=""
 OS_VERSION=""
 SSH_SERVICE=""
 DEFAULT_SSH_USER="root"
-CURRENT_SSH_PORT="$DEFAULT_SSH_PORT"
 
 # ============================================================
 # 1. 基础工具层
@@ -504,18 +524,26 @@ src_alpine_packages_available() {
 
 src_alpine_install_from_repos() {
     local package="$1"
+
+    if src_alpine_package_available "$package"; then
+        ui_info "从 Alpine stable main/community 安装 $package..."
+        apk add --no-cache "$package"
+        return 0
+    fi
+
     if [[ "$package" == "ufw" ]] && src_alpine_edge_package_available "$package" "edge-community"; then
         ui_info "从 Alpine edge/community 安装 $package..."
         apk add --no-cache "$package@edge-community"
-    elif [[ "$package" == "openssl" ]] && src_alpine_edge_package_available "$package" "edge"; then
+        return 0
+    fi
+
+    if [[ "$package" == "openssl" ]] && src_alpine_edge_package_available "$package" "edge"; then
         ui_info "从 Alpine edge/main 安装 $package..."
         apk add --no-cache "$package@edge"
-    elif src_alpine_package_available "$package"; then
-        ui_info "从 Alpine stable main/community 安装 $package..."
-        apk add --no-cache "$package"
-    else
-        return 1
+        return 0
     fi
+
+    return 1
 }
 
 src_alpine_version_branch() {
@@ -538,7 +566,7 @@ src_alpine_try_profile() {
 }
 
 # ============================================================
-# 6. SSH 配置业务层
+# 6. SSH 端口配置读写（管理块）
 # ============================================================
 
 ssh_config_ensure() {
@@ -573,34 +601,57 @@ ssh_config_ensure_include() {
     mv "$tmp" "$SSHD_CONFIG"
 }
 
-ssh_config_get_port() {
-    CURRENT_SSH_PORT="$DEFAULT_SSH_PORT"
-    if ! ssh_is_installed; then
-        echo "$CURRENT_SSH_PORT"
-        return 0
-    fi
-    ssh_config_ensure
-    if sys_command_exists sshd; then
-        local port
-        port="$(sshd -T 2>/dev/null | awk '$1 == "port" {print $2; exit}')"
-        if [[ "$port" =~ ^[0-9]+$ ]]; then
-            CURRENT_SSH_PORT="$port"
-            echo "$CURRENT_SSH_PORT"
+ssh_config_port_files() {
+    printf '%s\n' "$SSHD_CONFIG"
+    [[ -d "$SSHD_CONFIG_DIR" ]] || return 0
+    local file
+    for file in "$SSHD_CONFIG_DIR"/*.conf; do
+        [[ -f "$file" ]] || continue
+        printf '%s\n' "$file"
+    done
+}
+
+# 唯一真相来源：sshd -T 解析出的全部生效端口（去重、保序）
+ssh_config_ports_effective() {
+    if ssh_is_installed && sys_command_exists sshd; then
+        local ports
+        ports="$(sshd -T 2>/dev/null | awk '$1 == "port" {print $2}' | awk '!seen[$0]++')"
+        if [[ -n "$ports" ]]; then
+            printf '%s\n' "$ports"
             return 0
         fi
     fi
-    local config_port
-    config_port="$(grep -E '^[[:space:]]*Port[[:space:]]+[0-9]+' "$SSHD_CONFIG" 2>/dev/null | awk '{print $2}' | head -1)"
-    [[ "$config_port" =~ ^[0-9]+$ ]] && CURRENT_SSH_PORT="$config_port"
-    echo "$CURRENT_SSH_PORT"
+    printf '%s\n' "$DEFAULT_SSH_PORT"
 }
 
-ssh_config_get_all_ports() {
-    if ssh_is_installed && sys_command_exists sshd; then
-        sshd -T 2>/dev/null | awk '$1 == "port" {print $2}'
-        return 0
-    fi
-    echo "$DEFAULT_SSH_PORT"
+# 管理块内端口
+ssh_config_ports_in_block() {
+    local file in_block=0 line port
+    while IFS= read -r file; do
+        [[ -f "$file" ]] || continue
+        while IFS= read -r line; do
+            if [[ "$line" == "$MANAGED_BLOCK_BEGIN" ]]; then
+                in_block=1
+                continue
+            fi
+            if [[ "$line" == "$MANAGED_BLOCK_END" ]]; then
+                in_block=0
+                continue
+            fi
+            if (( in_block == 1 )) && [[ "$line" =~ ^Port[[:space:]]+([0-9]+)[[:space:]]*$ ]]; then
+                port="${BASH_REMATCH[1]}"
+                printf '%s\n' "$port"
+            fi
+        done < "$file"
+    done < <(ssh_config_port_files) | awk '!seen[$0]++'
+}
+
+# 显示用
+ssh_config_ports_text() {
+    local text
+    text="$(ssh_config_ports_effective | paste -sd, - 2>/dev/null || true)"
+    [[ -n "$text" ]] || text="$DEFAULT_SSH_PORT"
+    echo "$text"
 }
 
 ssh_config_test() {
@@ -640,16 +691,6 @@ ssh_config_restore_backup() {
     fi
 }
 
-ssh_config_port_files() {
-    printf '%s\n' "$SSHD_CONFIG"
-    [[ -d "$SSHD_CONFIG_DIR" ]] || return 0
-    local file
-    for file in "$SSHD_CONFIG_DIR"/*.conf; do
-        [[ -f "$file" ]] || continue
-        printf '%s\n' "$file"
-    done
-}
-
 ssh_port_is_listening() {
     local port="$1"
     if sys_command_exists ss; then
@@ -663,9 +704,9 @@ ssh_port_is_listening() {
 
 ssh_verify_port() {
     local port="$1"
-    if ! ssh_config_get_all_ports | grep -Fxq "$port"; then
+    if ! ssh_config_ports_effective | grep -Fxq "$port"; then
         ui_error "sshd 当前生效配置没有端口 $port。"
-        ui_info "当前生效端口：$(ssh_config_get_all_ports | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
+        ui_info "当前生效端口：$(ssh_config_ports_text)"
         return 1
     fi
     if ssh_port_is_listening "$port"; then
@@ -680,55 +721,203 @@ ssh_verify_port() {
     return 1
 }
 
-# SSH 规则：优先使用 limit，已存在 allow 时先删除再 limit
-ssh_ufw_ensure_rule() {
-    local port="$1"
-    ufw_is_installed || return 1
+# 注释管理块外的用户 Port 行（只做一次）
+ssh_config_ports_original_comment() {
+    local file line port changed=0
+    while IFS= read -r file; do
+        [[ -f "$file" ]] || continue
+        while IFS= read -r line; do
+            # 跳过管理块标记
+            [[ "$line" == "$MANAGED_BLOCK_BEGIN" ]] && continue
+            [[ "$line" == "$MANAGED_BLOCK_END" ]] && continue
+            # 跳过已注释的 original
+            [[ "$line" == "$ORIGINAL_PORT_PREFIX"* ]] && continue
+            # 跳过已注释的普通行
+            [[ "$line" =~ ^[[:space:]]*# ]] && continue
+            if [[ "$line" =~ ^([[:space:]]*)Port[[:space:]]+([0-9]+)([[:space:]]*)$ ]]; then
+                port="${BASH_REMATCH[2]}"
+                changed=1
+            fi
+        done < "$file"
+    done < <(ssh_config_port_files)
+    (( changed == 0 )) && return 0
 
-    if ufw status 2>/dev/null | grep -Eq "[[:space:]]$port/tcp[[:space:]]+LIMIT"; then
-        return 0
-    fi
-
-    if ufw status 2>/dev/null | grep -Eq "[[:space:]]$port/tcp[[:space:]]+ALLOW"; then
-        ufw --force delete allow "$port/tcp" >/dev/null 2>&1 || true
-    fi
-
-    ufw limit "$port/tcp" comment "SSH"
+    # 二次遍历执行替换（管理块内的 Port 不动）
+    while IFS= read -r file; do
+        [[ -f "$file" ]] || continue
+        awk -v begin="$MANAGED_BLOCK_BEGIN" -v end="$MANAGED_BLOCK_END" -v prefix="$ORIGINAL_PORT_PREFIX" '
+            BEGIN { in_block=0 }
+            $0 == begin { in_block=1; print; next }
+            $0 == end { in_block=0; print; next }
+            in_block == 1 { print; next }
+            /^[[:space:]]*Port[[:space:]]+[0-9]+[[:space:]]*$/ {
+                line=$0
+                # 提取前导空白与端口号
+                match(line, /^[[:space:]]*/); lead=substr(line, 1, RLENGTH)
+                match(line, /Port[[:space:]]+[0-9]+/); body=substr(line, RSTART, RLENGTH)
+                print lead prefix " " substr(body, 6)
+                next
+            }
+            { print }
+        ' "$file" > "$file.tmp" && mv "$file.tmp" "$file" || {
+            rm -f "$file.tmp"
+            return 1
+        }
+    done < <(ssh_config_port_files)
+    return 0
 }
 
-ssh_ufw_remove_rule() {
-    local port="$1"
-    ufw_is_installed || return 0
-    ufw --force delete limit "$port/tcp" >/dev/null 2>&1 || true
-    ufw --force delete allow "$port/tcp" >/dev/null 2>&1 || true
-}
-
-ssh_config_set_ports() {
-    local old_port="$1" new_port="$2"
-    ssh_config_ensure || return 1
+# 删除管理块（整块）
+ssh_config_ports_managed_remove() {
     local file
     while IFS= read -r file; do
         [[ -f "$file" ]] || continue
-        sed -i -E 's/^([[:space:]]*)Port[[:space:]]+[0-9]+([[:space:]]*)$/\1# Managed by ufwssh: previous Port\2/' "$file" || return 1
+        if grep -qF "$MANAGED_BLOCK_BEGIN" "$file"; then
+            awk -v begin="$MANAGED_BLOCK_BEGIN" -v end="$MANAGED_BLOCK_END" '
+                BEGIN { in_block=0 }
+                $0 == begin { in_block=1; next }
+                $0 == end { in_block=0; next }
+                in_block == 1 { next }
+                { print }
+            ' "$file" > "$file.tmp" && mv "$file.tmp" "$file" || {
+                rm -f "$file.tmp"
+                return 1
+            }
+        fi
     done < <(ssh_config_port_files)
-    printf '\n# Managed by ufwssh\nPort %s\nPort %s\n' "$old_port" "$new_port" >> "$SSHD_CONFIG"
+    return 0
+}
+
+# 写入管理块（整块替换，只写主文件）
+ssh_config_ports_managed_write() {
+    local port
+    [[ $# -gt 0 ]] || { ui_error "管理块写入：未指定端口。"; return 1; }
+
+    ssh_config_ports_managed_remove || return 1
+
+    {
+        printf '%s\n' "$MANAGED_BLOCK_BEGIN"
+        for port in "$@"; do
+            [[ "$port" =~ ^[0-9]+$ ]] || continue
+            printf 'Port %s\n' "$port"
+        done
+        printf '%s\n' "$MANAGED_BLOCK_END"
+    } >> "$SSHD_CONFIG" || return 1
+
     ssh_config_test
-}
-
-ssh_config_remove_port() {
-    local port="$1"
-    ssh_config_ensure || return 1
-    local file
-    while IFS= read -r file; do
-        [[ -f "$file" ]] || continue
-        sed -i -E "/^[[:space:]]*Port[[:space:]]+$port[[:space:]]*$/d" "$file" || return 1
-        sed -i -E "/^[[:space:]]*# Managed by ufwssh: previous Port[[:space:]]+$port[[:space:]]*$/d" "$file" || return 1
-    done < <(ssh_config_port_files)
 }
 
 # ============================================================
 # 7. UFW 业务层
 # ============================================================
+
+# 解析 ufw status，得到本脚本管理的 LIMIT 端口（兼容 v4 与 v6）
+ssh_ufw_detect_limit_ports() {
+    ufw_is_installed || return 0
+    ufw status 2>/dev/null | awk '
+        /# SSH$/ {
+            for (i=1; i<=NF; i++) {
+                if ($i ~ /LIMIT/) {
+                    for (j=1; j<=NF; j++) {
+                        if ($j ~ /^[0-9]+\/tcp$/) {
+                            split($j, a, "/")
+                            print a[1]
+                            break
+                        }
+                    }
+                    break
+                }
+            }
+        }
+    ' | awk '!seen[$0]++'
+}
+
+ssh_ufw_detect_allow_ports() {
+    ufw_is_installed || return 0
+    ufw status 2>/dev/null | awk '
+        /# SSH$/ {
+            for (i=1; i<=NF; i++) {
+                if ($i ~ /ALLOW/) {
+                    for (j=1; j<=NF; j++) {
+                        if ($j ~ /^[0-9]+\/tcp$/) {
+                            split($j, a, "/")
+                            print a[1]
+                            break
+                        }
+                    }
+                    break
+                }
+            }
+        }
+    ' | awk '!seen[$0]++'
+}
+
+ssh_ufw_ensure_rule_one() {
+    local port="$1"
+    ufw_is_installed || return 1
+
+    if ufw status 2>/dev/null | grep -Eq "[[:space:]]$port/tcp([[:space:]]+\(v6\))?[[:space:]]+LIMIT"; then
+        return 0
+    fi
+
+    if ufw status 2>/dev/null | grep -Eq "[[:space:]]$port/tcp([[:space:]]+\(v6\))?[[:space:]]+ALLOW"; then
+        ufw delete allow "$port/tcp" >/dev/null 2>&1 || true
+    fi
+
+    ufw limit "$port/tcp" comment "SSH"
+}
+
+ssh_ufw_remove_rule_one() {
+    local port="$1"
+    ufw_is_installed || return 0
+    ufw delete limit "$port/tcp" >/dev/null 2>&1 || true
+    ufw delete allow "$port/tcp" >/dev/null 2>&1 || true
+}
+
+# 同步：目标 = 管理块；若管理块为空，用 effective；若 effective 为空，用 22
+ssh_ufw_sync() {
+    ufw_is_installed || return 1
+
+    local target_port current_port
+    local -a target=() current=()
+
+    while IFS= read -r target_port; do
+        [[ -n "$target_port" ]] || continue
+        target+=( "$target_port" )
+    done < <(ssh_config_ports_in_block)
+
+    if (( ${#target[@]} == 0 )); then
+        while IFS= read -r target_port; do
+            [[ -n "$target_port" ]] || continue
+            target+=( "$target_port" )
+        done < <(ssh_config_ports_effective)
+    fi
+
+    if (( ${#target[@]} == 0 )); then
+        target=( "$DEFAULT_SSH_PORT" )
+    fi
+
+    while IFS= read -r current_port; do
+        [[ -n "$current_port" ]] || continue
+        current+=( "$current_port" )
+    done < <(ssh_ufw_detect_limit_ports)
+
+    local p found
+    for p in "${target[@]}"; do
+        ssh_ufw_ensure_rule_one "$p" || return 1
+    done
+
+    for p in "${current[@]}"; do
+        found=0
+        local t
+        for t in "${target[@]}"; do
+            [[ "$p" == "$t" ]] && { found=1; break; }
+        done
+        (( found == 0 )) && ssh_ufw_remove_rule_one "$p"
+    done
+
+    return 0
+}
 
 ufw_show_rules() {
     ufw_is_installed || { ui_error "UFW 尚未安装。"; return 1; }
@@ -833,14 +1022,7 @@ ufw_change_defaults() {
 
 ufw_enable_safely() {
     ufw_is_installed || { ui_error "UFW 尚未安装。"; return 1; }
-    local port
-    while IFS= read -r port; do
-        [[ -n "$port" ]] || continue
-        if ! ssh_ufw_ensure_rule "$port"; then
-            ui_error "无法确保 SSH $port/tcp 已放行，拒绝启用 UFW。"
-            return 1
-        fi
-    done < <(ssh_config_get_all_ports)
+    ssh_ufw_sync || { ui_error "无法同步 SSH UFW 规则，拒绝启用 UFW。"; return 1; }
     ufw --force enable
 }
 
@@ -852,7 +1034,196 @@ ufw_reset() {
 }
 
 # ============================================================
-# 8. SSH 密钥/安全业务层
+# 8. SSH 端口变更业务
+# ============================================================
+
+ssh_change_port() {
+    ssh_is_installed || { ui_error "SSH 尚未安装。"; return 1; }
+
+    local -a before=()
+    local p
+    while IFS= read -r p; do
+        [[ -n "$p" ]] || continue
+        before+=( "$p" )
+    done < <(ssh_config_ports_effective)
+
+    echo "当前 SSH 端口：$(ssh_config_ports_text)"
+
+    local new_port
+    read -r -p "新的 SSH 端口（1-65535）: " new_port
+    if ! [[ "$new_port" =~ ^[0-9]+$ ]] || (( new_port < 1 || new_port > 65535 )); then
+        ui_error "端口号无效。"
+        return 1
+    fi
+
+    # 若新端口已在 before 中，无需变更
+    for p in "${before[@]}"; do
+        [[ "$p" == "$new_port" ]] && { ui_warning "端口 $new_port 已在监听，无需变更。"; return 0; }
+    done
+
+    if ssh_port_is_listening "$new_port"; then
+        ui_error "端口 $new_port 已被占用。"
+        return 1
+    fi
+
+    local backup
+    backup="$(ssh_config_backup)" || { ui_error "无法备份 SSH 配置。"; return 1; }
+
+    if ufw_is_installed && ! ssh_ufw_ensure_rule_one "$new_port"; then
+        ui_error "UFW 无法放行新端口，停止操作。"
+        ssh_config_restore_backup "$backup" || true
+        return 1
+    fi
+
+    if ! ssh_config_ports_original_comment; then
+        ui_error "无法注释原有 Port 行，恢复配置。"
+        ssh_config_restore_backup "$backup" || true
+        return 1
+    fi
+
+    if ! ssh_config_ports_managed_write "$new_port"; then
+        ui_error "写入管理块失败，恢复配置。"
+        ssh_config_restore_backup "$backup" || true
+        return 1
+    fi
+
+    if ! ssh_restart; then
+        ui_error "SSH 重启失败，恢复配置。"
+        ssh_config_restore_backup "$backup" || true
+        ssh_restart >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    sleep 1
+    if ! ssh_verify_port "$new_port"; then
+        ui_error "新端口未监听，恢复配置。"
+        ssh_config_restore_backup "$backup" || true
+        ssh_restart >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    ui_success "SSH 已实际监听：$(ssh_config_ports_text)"
+    ui_warning "请先在另一个终端测试：ssh -p $new_port <用户>@<服务器IP>"
+
+    # 询问是否保留旧端口
+    local -a kept=()
+    for p in "${before[@]}"; do
+        [[ "$p" == "$new_port" ]] && continue
+        kept+=( "$p" )
+    done
+
+    if (( ${#kept[@]} > 0 )); then
+        if ui_confirm "确认新端口可登录后，是否保留旧端口 ${kept[*]}？"; then
+            local -a all=( "$new_port" "${kept[@]}" )
+            if ! ssh_config_ports_managed_write "${all[@]}"; then
+                ui_error "写入管理块失败，恢复配置。"
+                ssh_config_restore_backup "$backup" || true
+                ssh_restart >/dev/null 2>&1 || true
+                return 1
+            fi
+            if ! ssh_config_test || ! ssh_restart; then
+                ssh_config_restore_backup "$backup" || true
+                ssh_restart >/dev/null 2>&1 || true
+                ui_error "应用保留端口失败，已恢复。"
+                return 1
+            fi
+            ui_success "已保留旧端口：$(ssh_config_ports_text)"
+        else
+            for p in "${kept[@]}"; do
+                ssh_ufw_remove_rule_one "$p"
+            done
+            ui_success "旧端口已从 UFW 规则中移除。"
+        fi
+    fi
+}
+
+ssh_restore_default_port() {
+    ssh_is_installed || { ui_error "SSH 尚未安装。"; return 1; }
+
+    local -a before=()
+    local p
+    while IFS= read -r p; do
+        [[ -n "$p" ]] || continue
+        before+=( "$p" )
+    done < <(ssh_config_ports_effective)
+
+    if (( ${#before[@]} == 1 )) && [[ "${before[0]}" == "$DEFAULT_SSH_PORT" ]]; then
+        ui_info "当前已经是 22 端口。"
+        return 0
+    fi
+
+    local backup
+    backup="$(ssh_config_backup)" || return 1
+
+    if ufw_is_installed && ! ssh_ufw_ensure_rule_one "$DEFAULT_SSH_PORT"; then
+        ui_error "无法放行 22/tcp。"
+        ssh_config_restore_backup "$backup" || true
+        return 1
+    fi
+
+    if ! ssh_config_ports_original_comment; then
+        ui_error "无法注释原有 Port 行，恢复配置。"
+        ssh_config_restore_backup "$backup" || true
+        return 1
+    fi
+
+    if ! ssh_config_ports_managed_write "$DEFAULT_SSH_PORT"; then
+        ui_error "写入管理块失败，恢复配置。"
+        ssh_config_restore_backup "$backup" || true
+        return 1
+    fi
+
+    if ! ssh_restart; then
+        ui_error "SSH 重启失败，恢复配置。"
+        ssh_config_restore_backup "$backup" || true
+        ssh_restart >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    sleep 1
+    if ! ssh_verify_port "$DEFAULT_SSH_PORT"; then
+        ui_error "22 端口未监听，恢复配置。"
+        ssh_config_restore_backup "$backup" || true
+        ssh_restart >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    ui_success "SSH 已切换到 22，当前端口：$(ssh_config_ports_text)"
+    ui_warning "请先在另一个终端测试：ssh -p 22 <用户>@<服务器IP>"
+
+    local -a kept=()
+    for p in "${before[@]}"; do
+        [[ "$p" == "$DEFAULT_SSH_PORT" ]] && continue
+        kept+=( "$p" )
+    done
+
+    if (( ${#kept[@]} > 0 )); then
+        if ui_confirm "确认 22 登录正常后，是否保留旧端口 ${kept[*]}？"; then
+            local -a all=( "$DEFAULT_SSH_PORT" "${kept[@]}" )
+            if ! ssh_config_ports_managed_write "${all[@]}"; then
+                ssh_config_restore_backup "$backup" || true
+                ssh_restart >/dev/null 2>&1 || true
+                ui_error "写入管理块失败，已恢复。"
+                return 1
+            fi
+            if ! ssh_config_test || ! ssh_restart; then
+                ssh_config_restore_backup "$backup" || true
+                ssh_restart >/dev/null 2>&1 || true
+                ui_error "应用保留端口失败，已恢复。"
+                return 1
+            fi
+            ui_success "已保留旧端口：$(ssh_config_ports_text)"
+        else
+            for p in "${kept[@]}"; do
+                ssh_ufw_remove_rule_one "$p"
+            done
+            ui_success "旧端口已从 UFW 规则中移除。"
+        fi
+    fi
+}
+
+# ============================================================
+# 9. SSH 密钥/安全业务层
 # ============================================================
 
 ssh_user_default() {
@@ -949,6 +1320,7 @@ PubkeyAuthentication yes
 PermitEmptyPasswords no
 MaxAuthTries 5
 X11Forwarding no
+# ChallengeResponseAuthentication 在新版 OpenSSH 已弃用，保留兼容旧版本
 ChallengeResponseAuthentication no
 KbdInteractiveAuthentication no
 KerberosAuthentication no
@@ -966,7 +1338,7 @@ EOF
 }
 
 # ============================================================
-# 9. 安装业务层
+# 10. 安装业务层
 # ============================================================
 
 pkg_debian_install() {
@@ -974,7 +1346,9 @@ pkg_debian_install() {
     [[ -n "$package" ]] || { ui_error "未指定 Debian/Ubuntu 软件包。"; return 1; }
     sys_command_exists apt-get || { ui_error "未找到 apt-get。"; return 1; }
     ui_info "刷新 Debian/Ubuntu 软件源..."
-    apt-get update
+    if ! apt-get update; then
+        ui_warning "APT update 失败，继续尝试安装（可能使用旧索引）。"
+    fi
     if src_debian_package_available "$package"; then
         DEBIAN_FRONTEND=noninteractive apt-get install -y "$package"
         return $?
@@ -1094,7 +1468,7 @@ install_all() {
 }
 
 # ============================================================
-# 10. 软件源业务层
+# 11. 软件源业务层
 # ============================================================
 
 src_repair_debian() {
@@ -1203,13 +1577,13 @@ src_show_status() {
 }
 
 # ============================================================
-# 11. 状态展示层
+# 12. 状态展示层
 # ============================================================
 
 ui_show_component_status() {
     ssh_detect_service
-    local port
-    port="$(ssh_config_get_port)"
+    local ports_text
+    ports_text="$(ssh_config_ports_text)"
 
     echo -e "${CYAN}系统信息${NC}"
     echo "  系统       : $OS_NAME $OS_VERSION"
@@ -1226,7 +1600,7 @@ ui_show_component_status() {
         fi
         echo "  SSH 服务   : $SSH_SERVICE"
         echo "  开机自启   : $(ssh_is_enabled && echo '是' || echo '否')"
-        echo "  SSH 端口   : $port"
+        echo "  SSH 端口   : $ports_text"
     else
         echo -e "  SSH        : $YELLOW○ 未安装$NC"
     fi
@@ -1252,120 +1626,6 @@ ui_show_detailed_status() {
         ufw status numbered
     else
         echo "  UFW 未安装。"
-    fi
-}
-
-# ============================================================
-# 12. SSH 端口变更业务
-# ============================================================
-
-ssh_change_port() {
-    ssh_is_installed || { ui_error "SSH 尚未安装。"; return 1; }
-    local old_port new_port backup
-    old_port="$(ssh_config_get_port)"
-    echo "当前 SSH 有效端口：$old_port"
-    read -r -p "新的 SSH 端口（1-65535）: " new_port
-    if ! [[ "$new_port" =~ ^[0-9]+$ ]] || (( new_port < 1 || new_port > 65535 )); then
-        ui_error "端口号无效。"
-        return 1
-    fi
-    [[ "$new_port" == "$old_port" ]] && { ui_warning "端口没有变化。"; return 0; }
-    if ssh_port_is_listening "$new_port"; then
-        ui_error "端口 $new_port 已被占用。"
-        return 1
-    fi
-
-    backup="$(ssh_config_backup)" || { ui_error "无法备份 SSH 配置。"; return 1; }
-    if ufw_is_installed && ! ssh_ufw_ensure_rule "$new_port"; then
-        ui_error "UFW 无法放行新端口，停止操作。"
-        return 1
-    fi
-
-    if ! ssh_config_set_ports "$old_port" "$new_port"; then
-        ssh_config_restore_backup "$backup" || true
-        return 1
-    fi
-    if ! ssh_restart; then
-        ui_error "SSH 重启失败，恢复配置。"
-        ssh_config_restore_backup "$backup" || true
-        ssh_restart >/dev/null 2>&1 || true
-        return 1
-    fi
-
-    sleep 1
-    if ! ssh_verify_port "$new_port"; then
-        ui_error "新端口未监听，恢复配置。"
-        ssh_config_restore_backup "$backup" || true
-        ssh_restart >/dev/null 2>&1 || true
-        return 1
-    fi
-
-    ui_success "SSH 已实际监听 $old_port 和 $new_port。"
-    ui_warning "请先在另一个终端测试：ssh -p $new_port <用户>@<服务器IP>"
-    if ui_confirm "确认新端口可登录后，是否移除旧端口 $old_port？"; then
-        backup="$(ssh_config_backup)" || return 1
-        if ! ssh_config_remove_port "$old_port"; then
-            ssh_config_restore_backup "$backup" || true
-            ssh_restart >/dev/null 2>&1 || true
-            ui_error "移除旧端口配置失败，已恢复。"
-            return 1
-        fi
-        if ssh_config_test && ssh_restart; then
-            ssh_ufw_remove_rule "$old_port"
-            ui_success "旧 SSH 端口 $old_port 已移除。"
-        else
-            ssh_config_restore_backup "$backup" || true
-            ssh_restart >/dev/null 2>&1 || true
-            ui_error "移除旧端口失败，已恢复。"
-            return 1
-        fi
-    else
-        ui_info "保留旧端口 $old_port。"
-    fi
-}
-
-ssh_restore_default_port() {
-    local current backup
-    current="$(ssh_config_get_port)"
-    [[ "$current" == "$DEFAULT_SSH_PORT" ]] && { ui_info "当前已经是 22 端口。"; return 0; }
-
-    backup="$(ssh_config_backup)" || return 1
-    if ufw_is_installed && ! ssh_ufw_ensure_rule "$DEFAULT_SSH_PORT"; then
-        ui_error "无法放行 22/tcp。"
-        return 1
-    fi
-    if ! ssh_config_set_ports "$current" "$DEFAULT_SSH_PORT" || ! ssh_restart; then
-        ssh_config_restore_backup "$backup" || true
-        ssh_restart >/dev/null 2>&1 || true
-        return 1
-    fi
-
-    sleep 1
-    if ! ssh_verify_port "$DEFAULT_SSH_PORT"; then
-        ui_error "22 端口未监听，恢复配置。"
-        ssh_config_restore_backup "$backup" || true
-        ssh_restart >/dev/null 2>&1 || true
-        return 1
-    fi
-
-    ui_success "SSH 已切换到 22，原端口 $current 暂时保留。"
-    if ui_confirm "确认 22 登录正常后，是否移除旧端口 $current？"; then
-        backup="$(ssh_config_backup)" || return 1
-        if ! ssh_config_remove_port "$current"; then
-            ssh_config_restore_backup "$backup" || true
-            ssh_restart >/dev/null 2>&1 || true
-            ui_error "移除旧端口失败，已恢复。"
-            return 1
-        fi
-        if ssh_config_test && ssh_restart; then
-            ssh_ufw_remove_rule "$current"
-            ui_success "旧端口已移除。"
-        else
-            ssh_config_restore_backup "$backup" || true
-            ssh_restart >/dev/null 2>&1 || true
-            ui_error "移除旧端口失败，已恢复。"
-            return 1
-        fi
     fi
 }
 
@@ -1428,12 +1688,13 @@ menu_source() {
 }
 
 menu_ssh_port() {
-    local choice
+    local choice ports_text
     while true; do
+        ports_text="$(ssh_config_ports_text)"
         ui_print_banner
         echo "========== SSH 端口管理 =========="
         echo "服务：$SSH_SERVICE"
-        echo "当前端口：$(ssh_config_get_port)"
+        echo "当前端口：$ports_text"
         echo ""
         echo "  1) 修改 SSH 端口"
         echo "  2) 查看当前端口"
@@ -1446,10 +1707,16 @@ menu_ssh_port() {
         case "$choice" in
             1) ssh_change_port; ui_pause ;;
             2)
-                echo "当前端口：$(ssh_config_get_port)"
-                if sys_command_exists ss; then
-                    ss -lntp 2>/dev/null | grep -E ":$(ssh_config_get_port)([[:space:]]|$)" || true
-                fi
+                echo "当前端口：$(ssh_config_ports_text)"
+                echo ""
+                echo "监听情况："
+                local port
+                while IFS= read -r port; do
+                    [[ -n "$port" ]] || continue
+                    if sys_command_exists ss; then
+                        ss -lntp 2>/dev/null | grep -E ":${port}([[:space:]]|$)" || echo "  端口 $port 未监听"
+                    fi
+                done < <(ssh_config_ports_effective)
                 ui_pause
                 ;;
             3) ssh_restore_default_port; ui_pause ;;
@@ -1506,6 +1773,7 @@ menu_ssh_service() {
         echo "========== SSH 服务管理 =========="
         echo "服务：$SSH_SERVICE"
         echo "状态：$(ssh_status_text)"
+        echo "端口：$(ssh_config_ports_text)"
         echo ""
         echo "  1) 启动 SSH"
         echo "  2) 停止 SSH"
