@@ -267,49 +267,98 @@ install_debian_ufw() {
 
 # ==================== Alpine 安装模块 ====================
 
-alpine_enable_community() {
-    command_exists apk || {
-        print_error "未找到 apk。"
-        return 1
-    }
-
-    [[ -f /etc/apk/repositories ]] || {
-        print_error "未找到 /etc/apk/repositories。"
-        return 1
-    }
-
-    if grep -Eq '^[[:space:]]*[^#[:space:]].*/community([[:space:]]*)$' /etc/apk/repositories; then
-        return 0
-    fi
-
-    local community_repo=""
-    community_repo="$(awk '
-        /^[[:space:]]*#/ { next }
-        /^[[:space:]]*[^[:space:]]/ {
-            url=$0
-            sub(/[[:space:]]+$/, "", url)
-            if (url ~ /\/main$/) {
-                sub(/\/main$/, "/community", url)
-                print url
-                exit
-            }
-        }
-    ' /etc/apk/repositories)"
-
-    if [[ -n "$community_repo" ]]; then
-        cp -a /etc/apk/repositories "/etc/apk/repositories.bak.$(date +%Y%m%d%H%M%S)"
-        printf '%s\n' "$community_repo" >> /etc/apk/repositories
-        print_success "已自动启用 Alpine community 仓库：$community_repo"
-        return 0
-    fi
-
-    print_warning "无法从现有仓库自动推导 community 地址。"
-    return 1
+alpine_write_repositories() {
+    local branch="$1"
+    cat > /etc/apk/repositories <<EOF
+https://dl-cdn.alpinelinux.org/alpine/$branch/main
+https://dl-cdn.alpinelinux.org/alpine/$branch/community
+@edge https://dl-cdn.alpinelinux.org/alpine/edge/main
+@edge-community https://dl-cdn.alpinelinux.org/alpine/edge/community
+EOF
 }
 
-alpine_refresh_repositories() {
-    print_info "刷新 Alpine 软件源..."
-    apk update
+alpine_write_tuna_repositories() {
+    local branch="$1"
+    cat > /etc/apk/repositories <<EOF
+https://mirrors.tuna.tsinghua.edu.cn/alpine/$branch/main
+https://mirrors.tuna.tsinghua.edu.cn/alpine/$branch/community
+@edge https://mirrors.tuna.tsinghua.edu.cn/alpine/edge/main
+@edge-community https://mirrors.tuna.tsinghua.edu.cn/alpine/edge/community
+EOF
+}
+
+alpine_enable_community() {
+    command_exists apk || { print_error "未找到 apk。"; return 1; }
+    [[ -f /etc/apk/repositories ]] || { print_error "未找到 /etc/apk/repositories。"; return 1; }
+    grep -Eq '(^|[[:space:]])[^#[:space:]]+/community([[:space:]]*)$' /etc/apk/repositories
+}
+
+alpine_package_available() {
+    local package="$1"
+    apk policy "$package" 2>/dev/null | grep -Eq '^[[:space:]]*[^[:space:]]+'
+}
+
+alpine_edge_package_available() {
+    local package="$1"
+    apk policy "$package@edge-community" 2>/dev/null | grep -Eq '^[[:space:]]*[^[:space:]]+'
+}
+
+alpine_refresh_and_check() {
+    local package="$1"
+    alpine_refresh_repositories || return 1
+    alpine_package_available "$package"
+}
+
+alpine_refresh_edge_and_check() {
+    local package="$1"
+    alpine_refresh_repositories || return 1
+    alpine_edge_package_available "$package"
+}
+
+alpine_install_package() {
+    local package="$1" branch backup
+
+    if [[ "$package" == "ufw" ]]; then
+        if alpine_refresh_edge_and_check "$package"; then
+            print_info "从官方 Alpine edge/community 安装 $package..."
+            apk add --no-cache "$package@edge-community" && return 0
+        fi
+        print_warning "edge/community 无法提供 $package，尝试稳定 community。"
+    elif alpine_refresh_and_check "$package"; then
+        apk add --no-cache "$package" && return 0
+    fi
+
+    if ! alpine_package_available "$package"; then
+        print_warning "当前 Alpine 源无法提供 $package，开始修复软件源。"
+    fi
+
+    branch="$(alpine_version_branch)"
+    [[ -n "$branch" ]] || { print_error "无法确定 Alpine 稳定仓库分支。"; return 1; }
+
+    print_warning "切换到官方 Alpine 源：稳定 main/community + edge main/community。"
+    backup="$(source_backup)" || { print_error "无法创建 APK 软件源备份。"; return 1; }
+    alpine_write_repositories "$branch"
+    if alpine_refresh_repositories; then
+        if [[ "$package" == "ufw" ]] && alpine_edge_package_available "$package"; then
+            apk add --no-cache "$package@edge-community" && return 0
+        elif alpine_package_available "$package"; then
+            apk add --no-cache "$package" && return 0
+        fi
+    fi
+
+    print_warning "官方源安装失败，尝试 TUNA：稳定 main/community + edge main/community。"
+    alpine_write_tuna_repositories "$branch"
+    if alpine_refresh_repositories; then
+        if [[ "$package" == "ufw" ]] && alpine_edge_package_available "$package"; then
+            apk add --no-cache "$package@edge-community" && return 0
+        elif alpine_package_available "$package"; then
+            apk add --no-cache "$package" && return 0
+        fi
+    fi
+
+    print_error "无法从 Alpine 稳定源或 edge 源安装 $package。"
+    restore_source_backup "$backup"
+    return 1
 }
 
 alpine_package_available() {
