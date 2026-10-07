@@ -267,6 +267,12 @@ install_debian_ufw() {
 
 # ==================== Alpine 安装模块 ====================
 
+alpine_refresh_repositories() {
+    command_exists apk || { print_error "未找到 apk。"; return 1; }
+    print_info "刷新 Alpine 软件源..."
+    apk update
+}
+
 alpine_write_repositories() {
     local branch="$1"
     cat > /etc/apk/repositories <<EOF
