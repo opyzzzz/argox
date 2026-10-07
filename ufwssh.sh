@@ -568,8 +568,17 @@ alpine_try_source_profile() {
     esac
     print_info "尝试 Alpine $profile 软件源：$branch"
     alpine_refresh_repositories || return 1
+alpine_packages_available() {
+    local package
+    for package in "$@"; do
+        alpine_package_available "$package" || return 1
+    done
+    return 0
+}
+
     alpine_packages_available "$@"
 }
+
 
 restore_source_backup() {
     local backup_dir=""
