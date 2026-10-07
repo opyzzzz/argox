@@ -1,18 +1,21 @@
 #!/bin/bash
 #
-# UFW + SSH 交互式管理工具 v4.8.1
+# UFW + SSH 交互式管理工具 v4.8.2
 # Debian/Ubuntu: apt + systemd
 # Alpine Linux:  apk + OpenRC
 #
-# v4.8.1 修复：
-#   - 密码登录开关：改为直接修改 sshd_config 主文件
-#     （OpenSSH 实际是主文件先读、Include 后读，98-*.conf 会被覆盖）
-#     有生效行则替换第一个并注释其余；无则追加到末尾
-#   - ssh_detect_service：Debian 优先 ssh.service（sshd.service 是 alias）
+# v4.8.2 修复：
+#   - 密码登录开关：改用 Match All 块覆盖全局（写入 sshd_config 主文件末尾）
+#     根因：sshd_config.d/00-*.conf 字母序最靠前，其 PasswordAuthentication 覆盖一切
+#     Match All 块是最终覆盖，不受 first-match wins 限制
+#     同时清理主文件里已有的裸 PasswordAuthentication 行（注释为 original）
+#   - 管理块标记：MANAGED_PW_BEGIN / MANAGED_PW_END
+#
+# v4.8.1 变更：
+#   - 密码登录开关：改为直接修改 sshd_config 主文件（已废弃，改用 Match All）
+#   - ssh_detect_service：Debian 优先 ssh.service
 #   - ssh_change_port / ssh_key_configure：支持空输入跳过
 #   - install_quick_init：直接调函数，不再二次询问
-#     开头提示流程 + 一次确认，之后每步只打印进度
-#     步骤 5 自动判断：有公钥关闭密码登录，无公钥跳过
 #
 # v4.8 变更：
 #   - 新增“快捷安装与配置”（菜单 4）
@@ -38,7 +41,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH
 # 0. 常量
 # ============================================================
 
-SCRIPT_VERSION="v4.8.1"
+SCRIPT_VERSION="v4.8.2"
 SSHD_CONFIG="/etc/ssh/sshd_config"
 SSHD_CONFIG_DIR="/etc/ssh/sshd_config.d"
 UFW_DEFAULT="/etc/default/ufw"
@@ -46,8 +49,10 @@ DEFAULT_SSH_PORT=22
 
 MANAGED_BLOCK_BEGIN="# >>> ufwssh managed ports >>>"
 MANAGED_BLOCK_END="# <<< ufwssh managed ports <<<"
+MANAGED_PW_BEGIN="# >>> ufwssh managed password auth >>>"
+MANAGED_PW_END="# <<< ufwssh managed password auth <<<"
 ORIGINAL_PORT_PREFIX="# ufwssh: original Port"
-PASSWORD_AUTH_MARKER="# Managed by ufwssh: PasswordAuthentication"
+ORIGINAL_PW_PREFIX="# ufwssh: original PasswordAuthentication"
 
 SECURITY_CONF="$SSHD_CONFIG_DIR/99-ufwssh-security.conf"
 
@@ -165,8 +170,6 @@ ssh_detect_service() {
     SSH_SERVICE=""
     case "$OS_TYPE" in
         debian)
-            # Debian 12 主 unit 是 ssh.service，sshd.service 是 alias
-            # 优先 ssh.service，没有则回退 sshd.service
             if systemctl list-unit-files 2>/dev/null | grep -q '^ssh\.service'; then
                 SSH_SERVICE="ssh"
             elif systemctl list-unit-files 2>/dev/null | grep -q '^sshd\.service'; then
@@ -1459,7 +1462,7 @@ EOF
     ui_success "SSH 基础安全配置已应用。"
 }
 
-# ---- 密码登录开关（直接改主文件） ----
+# ---- 密码登录开关（Match All 块） ----
 
 ssh_password_auth_is_enabled() {
     ssh_is_installed || return 1
@@ -1496,7 +1499,69 @@ ssh_password_auth_has_pubkey() {
     return 1
 }
 
-# 直接修改 sshd_config 主文件的 PasswordAuthentication
+# 删除主文件里已有的 ufwssh 密码管理块
+ssh_password_auth_block_remove() {
+    if grep -qF "$MANAGED_PW_BEGIN" "$SSHD_CONFIG"; then
+        awk -v begin="$MANAGED_PW_BEGIN" -v end="$MANAGED_PW_END" '
+            BEGIN { in_block=0 }
+            $0 == begin { in_block=1; next }
+            $0 == end { in_block=0; next }
+            in_block == 1 { next }
+            { print }
+        ' "$SSHD_CONFIG" > "$SSHD_CONFIG.tmp" && mv "$SSHD_CONFIG.tmp" "$SSHD_CONFIG" || {
+            rm -f "$SSHD_CONFIG.tmp"
+            return 1
+        }
+    fi
+    return 0
+}
+
+# 注释主文件里已有的裸 PasswordAuthentication 行
+ssh_password_auth_original_comment() {
+    local changed=0
+
+    # 第一遍：检查是否有需要注释的行
+    while IFS= read -r line; do
+        [[ "$line" == "$ORIGINAL_PW_PREFIX"* ]] && continue
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        if [[ "$line" =~ ^[[:space:]]*PasswordAuthentication[[:space:]]+ ]]; then
+            changed=1
+            break
+        fi
+    done < "$SSHD_CONFIG"
+    (( changed == 0 )) && return 0
+
+    # 第二遍：注释生效行
+    awk -v prefix="$ORIGINAL_PW_PREFIX" '
+        /^[[:space:]]*PasswordAuthentication[[:space:]]+/ {
+            line=$0
+            match(line, /^[[:space:]]*/); lead=substr(line, 1, RLENGTH)
+            print lead prefix " " substr(line, RLENGTH+1)
+            next
+        }
+        { print }
+    ' "$SSHD_CONFIG" > "$SSHD_CONFIG.tmp" && mv "$SSHD_CONFIG.tmp" "$SSHD_CONFIG" || {
+        rm -f "$SSHD_CONFIG.tmp"
+        return 1
+    }
+    return 0
+}
+
+# 写入 Match All 块
+ssh_password_auth_write_block() {
+    local enabled="$1"
+
+    {
+        printf '\n%s\n' "$MANAGED_PW_BEGIN"
+        printf 'Match All\n'
+        printf '    PasswordAuthentication %s\n' "$enabled"
+        printf '%s\n' "$MANAGED_PW_END"
+    } >> "$SSHD_CONFIG" || return 1
+
+    return 0
+}
+
+# 设置密码登录
 # $1 = yes / no
 ssh_password_auth_set() {
     local enabled="$1"
@@ -1512,46 +1577,35 @@ ssh_password_auth_set() {
     local backup
     backup="$(ssh_config_backup)" || { ui_error "无法备份 SSH 配置。"; return 1; }
 
-    # 判断主文件里是否已有生效的 PasswordAuthentication 行
-    if grep -qE '^[[:space:]]*PasswordAuthentication[[:space:]]+' "$SSHD_CONFIG"; then
-        # 替换第一个生效行，注释其余生效行
-        # 用 awk：第一次遇到生效行改为目标值，后续生效行注释
-        awk -v enabled="$enabled" '
-            BEGIN { done=0 }
-            /^[[:space:]]*PasswordAuthentication[[:space:]]+/ {
-                if (done == 0) {
-                    # 保留前导空白，替换值
-                    match($0, /^[[:space:]]*/)
-                    lead = substr($0, 1, RLENGTH)
-                    print lead "PasswordAuthentication " enabled
-                    done = 1
-                } else {
-                    print "#" $0
-                }
-                next
-            }
-            { print }
-        ' "$SSHD_CONFIG" > "$SSHD_CONFIG.tmp" && mv "$SSHD_CONFIG.tmp" "$SSHD_CONFIG" || {
-            rm -f "$SSHD_CONFIG.tmp"
-            ssh_config_restore_backup "$backup" || true
-            ui_error "写入 PasswordAuthentication 失败，已恢复。"
-            return 1
-        }
-    else
-        # 主文件没有生效行，追加到末尾
-        printf '\n%s\nPasswordAuthentication %s\n' "$PASSWORD_AUTH_MARKER" "$enabled" >> "$SSHD_CONFIG" || {
-            ssh_config_restore_backup "$backup" || true
-            ui_error "追加 PasswordAuthentication 失败，已恢复。"
-            return 1
-        }
+    # 1. 删除旧管理块
+    if ! ssh_password_auth_block_remove; then
+        ssh_config_restore_backup "$backup" || true
+        ui_error "删除旧管理块失败，已恢复。"
+        return 1
     fi
 
+    # 2. 注释已有的裸 PasswordAuthentication 行
+    if ! ssh_password_auth_original_comment; then
+        ssh_config_restore_backup "$backup" || true
+        ui_error "注释原有 PasswordAuthentication 行失败，已恢复。"
+        return 1
+    fi
+
+    # 3. 写入新管理块
+    if ! ssh_password_auth_write_block "$enabled"; then
+        ssh_config_restore_backup "$backup" || true
+        ui_error "写入管理块失败，已恢复。"
+        return 1
+    fi
+
+    # 4. 语法检查
     if ! ssh_config_test; then
         ssh_config_restore_backup "$backup" || true
         ui_error "SSH 配置语法检查失败，已恢复。"
         return 1
     fi
 
+    # 5. 重启
     if ! ssh_restart; then
         ssh_config_restore_backup "$backup" || true
         ssh_restart >/dev/null 2>&1 || true
@@ -1561,6 +1615,7 @@ ssh_password_auth_set() {
 
     sleep 1
 
+    # 6. 验证
     local actual
     actual="$(sshd -T 2>/dev/null | awk '$1 == "passwordauthentication" {print $2; exit}')"
     if [[ "$actual" != "$enabled" ]]; then
@@ -1770,8 +1825,6 @@ install_all() {
     install_ufw || return 1
     ui_success "SSH + UFW 安装/修复完成。"
 }
-
-# ---- 快捷安装与配置 ----
 
 install_quick_summary() {
     echo ""
