@@ -1060,7 +1060,8 @@ EOF
         cp -a "$backup" "$SSHD_CONFIG"
         restart_ssh >/dev/null 2>&1 || true
         print_error "SSH 安全配置失败，已回滚。"
-        return 1    fi
+        return 1
+    fi
     print_success "SSH 基础安全配置已应用。"
 }
 
