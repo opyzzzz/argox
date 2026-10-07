@@ -558,6 +558,19 @@ alpine_version_branch() {
 }
 
 
+alpine_try_source_profile() {
+    local profile="$1" branch="$2"
+    shift 2
+    case "$profile" in
+        official) alpine_write_repositories "$branch" ;;
+        tuna) alpine_write_tuna_repositories "$branch" ;;
+        *) return 1 ;;
+    esac
+    print_info "尝试 Alpine $profile 软件源：$branch"
+    alpine_refresh_repositories || return 1
+    alpine_packages_available "$@"
+}
+
 restore_source_backup() {
     local backup_dir=""
     [[ $# -gt 0 ]] && backup_dir="$1"
