@@ -764,147 +764,88 @@ test_sshd_config() {
 
 backup_sshd_config() {
     ensure_sshd_config || return 1
-    local backup="$SSHD_CONFIG.bak.$(date +%Y%m%d%H%M%S)"
-    cp -a "$SSHD_CONFIG" "$backup" || return 1
-    echo "$backup"
+    local backup_root backup_dir
+    backup_root="/etc/ufwssh/ssh-backups"
+    mkdir -p "$backup_root" || return 1
+    backup_dir="$(mktemp -d "$backup_root/backup.XXXXXX")" || return 1
+    cp -a "$SSHD_CONFIG" "$backup_dir/sshd_config" || { rm -rf "$backup_dir"; return 1; }
+    if [[ -d "$SSHD_CONFIG_DIR" ]]; then
+        cp -a "$SSHD_CONFIG_DIR" "$backup_dir/sshd_config.d" || { rm -rf "$backup_dir"; return 1; }
+    else
+        : > "$backup_dir/sshd_config.d.missing"
+    fi
+    echo "$backup_dir"
 }
-
+restore_sshd_config_backup() {
+    local backup="$1"
+    [[ -f "$backup/sshd_config" ]] || return 1
+    cp -a "$backup/sshd_config" "$SSHD_CONFIG" || return 1
+    if [[ -f "$backup/sshd_config.d.missing" ]]; then
+        rm -rf "$SSHD_CONFIG_DIR"
+    elif [[ -d "$backup/sshd_config.d" ]]; then
+        rm -rf "$SSHD_CONFIG_DIR"
+        cp -a "$backup/sshd_config.d" "$SSHD_CONFIG_DIR" || return 1
+    fi
+}
+ssh_port_config_files() {
+    printf '%s\n' "$SSHD_CONFIG"
+    [[ -d "$SSHD_CONFIG_DIR" ]] || return 0
+    local file
+    for file in "$SSHD_CONFIG_DIR"/*.conf; do
+        [[ -f "$file" ]] || continue
+        printf '%s\n' "$file"
+    done
+}
+get_ssh_port() {
+    CURRENT_SSH_PORT="$DEFAULT_SSH_PORT"
+    if ! is_ssh_installed; then echo "$CURRENT_SSH_PORT"; return 0; fi
+    ensure_sshd_config
+    if command_exists sshd; then
+        local port
+        port="$(sshd -T 2>/dev/null | awk '$1 == "port" {print $2; exit}')"
+        if [[ "$port" =~ ^[0-9]+$ ]]; then CURRENT_SSH_PORT="$port"; echo "$CURRENT_SSH_PORT"; return 0; fi
+    fi
+    local config_port
+    config_port="$(grep -E '^[[:space:]]*Port[[:space:]]+[0-9]+' "$SSHD_CONFIG" 2>/dev/null | awk '{print $2}' | head -1)"
+    [[ "$config_port" =~ ^[0-9]+$ ]] && CURRENT_SSH_PORT="$config_port"
+    echo "$CURRENT_SSH_PORT"
+}
+test_sshd_config() {
+    command_exists sshd || { print_error "未找到 sshd。"; return 1; }
+    local output
+    if output="$(sshd -t 2>&1)"; then print_success "SSH 配置语法检查通过。"; return 0; fi
+    print_error "SSH 配置检查失败：$output"; return 1
+}
 port_is_listening() {
     local port="$1"
     command_exists ss || return 1
-    ss -lnt 2>/dev/null | awk '{print $4}' | grep -Eq "(:|\])$port$"
+    ss -lnt 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)$port$|\]:$port$"
 }
-
 ensure_ufw_ssh_rule() {
     local port="$1"
     is_ufw_installed || return 1
-    if ufw status 2>/dev/null | grep -Eq "[[:space:]]$port/tcp[[:space:]]+(ALLOW|LIMIT)"; then
-        return 0
-    fi
+    if ufw status 2>/dev/null | grep -Eq "[[:space:]]$port/tcp[[:space:]]+(ALLOW|LIMIT)"; then return 0; fi
     ufw allow "$port/tcp" comment "SSH"
 }
-
 set_ssh_ports() {
-    local old_port="$1"
-    local new_port="$2"
+    local old_port="$1" new_port="$2"
     ensure_sshd_config || return 1
-    sed -i -E '/^[[:space:]]*Port[[:space:]]+[0-9]+[[:space:]]*$/d' "$SSHD_CONFIG"
+    local file
+    while IFS= read -r file; do
+        [[ -f "$file" ]] || continue
+        sed -i -E 's/^([[:space:]]*)Port[[:space:]]+[0-9]+([[:space:]]*)$/\1# Managed by ufwssh: previous Port\2/' "$file" || return 1
+    done < <(ssh_port_config_files)
     printf '\n# Managed by ufwssh\nPort %s\nPort %s\n' "$old_port" "$new_port" >> "$SSHD_CONFIG"
     test_sshd_config
 }
 remove_ssh_port() {
     local port="$1"
     ensure_sshd_config || return 1
-    sed -i -E "/^[[:space:]]*Port[[:space:]]+$port[[:space:]]*$/d" "$SSHD_CONFIG"
-}
-
-change_ssh_port() {
-    is_ssh_installed || { print_error "SSH 尚未安装。"; return 1; }
-    local old_port new_port backup
-    old_port="$(get_ssh_port)"
-    echo "当前 SSH 端口：$old_port"
-    read -r -p "新的 SSH 端口（1-65535）: " new_port
-
-    if ! [[ "$new_port" =~ ^[0-9]+$ ]] || (( new_port < 1 || new_port > 65535 )); then
-        print_error "端口号无效。"
-        return 1
-    fi
-    [[ "$new_port" == "$old_port" ]] && { print_warning "端口没有变化。"; return 0; }
-    if port_is_listening "$new_port"; then
-        print_error "端口 $new_port 已被占用。"
-        return 1
-    fi
-
-    backup="$(backup_sshd_config)" || { print_error "无法备份 SSH 配置。"; return 1; }
-
-    if is_ufw_installed && ! ensure_ufw_ssh_rule "$new_port"; then
-        print_error "UFW 无法放行新端口，停止操作。"
-        return 1
-    fi
-
-    if ! set_ssh_ports "$old_port" "$new_port"; then
-        cp -a "$backup" "$SSHD_CONFIG"
-        return 1
-    fi
-    if ! restart_ssh; then
-        print_error "SSH 重启失败，恢复配置。"
-        cp -a "$backup" "$SSHD_CONFIG"
-        restart_ssh >/dev/null 2>&1 || true
-        return 1
-    fi
-
-    sleep 1
-    if ! port_is_listening "$new_port"; then
-        print_error "新端口未监听，恢复配置。"
-        cp -a "$backup" "$SSHD_CONFIG"
-        restart_ssh >/dev/null 2>&1 || true
-        return 1
-    fi
-
-    print_success "SSH 已同时监听 $old_port 和 $new_port。"
-    print_warning "请在另一个终端测试：ssh -p $new_port <用户>@<服务器IP>"
-
-    if confirm_action "确认新端口可登录后，是否移除旧端口 $old_port？"; then
-        backup="$(backup_sshd_config)" || return 1
-        if ! remove_ssh_port "$old_port"; then
-            cp -a "$backup" "$SSHD_CONFIG"
-            restart_ssh >/dev/null 2>&1 || true
-            print_error "移除旧端口配置失败，已恢复。"
-            return 1
-        fi
-        if test_sshd_config && restart_ssh; then
-            if is_ufw_installed; then
-                ufw delete allow "$old_port/tcp" >/dev/null 2>&1 || true
-            fi
-            print_success "旧端口 $old_port 已移除。"
-        else
-            cp -a "$backup" "$SSHD_CONFIG"
-            restart_ssh >/dev/null 2>&1 || true
-            print_error "移除旧端口失败，已恢复。"
-            return 1
-        fi
-    else
-        print_info "保留旧端口 $old_port。"
-    fi
-}
-
-restore_default_ssh_port() {
-    local current backup
-    current="$(get_ssh_port)"
-    [[ "$current" == "$DEFAULT_SSH_PORT" ]] && { print_info "当前已经是 22 端口。"; return 0; }
-    backup="$(backup_sshd_config)" || return 1
-    if is_ufw_installed && ! ensure_ufw_ssh_rule "$DEFAULT_SSH_PORT"; then
-        print_error "无法放行 22/tcp。"
-        return 1
-    fi
-
-    if ! set_ssh_ports "$current" "$DEFAULT_SSH_PORT" || ! restart_ssh; then
-        cp -a "$backup" "$SSHD_CONFIG"
-        restart_ssh >/dev/null 2>&1 || true
-        return 1
-    fi
-
-    sleep 1
-    if ! port_is_listening "$DEFAULT_SSH_PORT"; then
-        print_error "22 端口未监听，恢复配置。"
-        cp -a "$backup" "$SSHD_CONFIG"
-        restart_ssh >/dev/null 2>&1 || true
-        return 1
-    fi
-
-    print_success "SSH 已切换到 22，原端口 $current 暂时保留。"
-    if confirm_action "确认 22 登录正常后，是否移除旧端口 $current？"; then
-        backup="$(backup_sshd_config)" || return 1
-        remove_ssh_port "$current"
-        if test_sshd_config && restart_ssh; then
-            is_ufw_installed && ufw delete allow "$current/tcp" >/dev/null 2>&1 || true
-            print_success "旧端口已移除。"
-        else
-            cp -a "$backup" "$SSHD_CONFIG"
-            restart_ssh >/dev/null 2>&1 || true
-            print_error "移除旧端口失败，已恢复。"
-        fi
-    fi
+    local file
+    while IFS= read -r file; do
+        [[ -f "$file" ]] || continue
+        sed -i -E "/^[[:space:]]*Port[[:space:]]+$port[[:space:]]*$/d" "$file" || return 1
+    done < <(ssh_port_config_files)
 }
 
 # ==================== UFW 规则管理 ====================
@@ -1010,10 +951,27 @@ get_target_ssh_user() {
     fi
 }
 
+normalize_ssh_public_key() {
+    local key="$1" decoded_type
+    key="$(printf '%s' "$key" | tr -d '\r\n')"
+    if [[ "$key" =~ ^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp[0-9]+|sk-ssh-ed25519@openssh.com|sk-ecdsa-sha2-nistp256@openssh.com)[[:space:]]+([^[:space:]]+)([[:space:]].*)?$ ]]; then
+        printf '%s\n' "$key"
+        return 0
+    fi
+    if [[ "$key" =~ ^[A-Za-z0-9+/]+={0,2}$ ]]; then
+        decoded_type="$(printf '%s' "$key" | base64 -d 2>/dev/null | grep -a -o -m1 -E 'ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp[0-9]+|sk-ssh-ed25519@openssh.com|sk-ecdsa-sha2-nistp256@openssh.com' || true)"
+        case "$decoded_type" in
+            ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp*|sk-ssh-ed25519@openssh.com|sk-ecdsa-sha2-nistp256@openssh.com)
+                printf '%s %s\n' "$decoded_type" "$key"
+                return 0 ;;
+        esac
+    fi
+    return 1
+}
+
 configure_ssh_key() {
     is_ssh_installed || { print_error "SSH 尚未安装。"; return 1; }
     get_target_ssh_user
-
     echo "当前目标用户：$SSH_USER"
     local selected
     read -r -p "输入其他本地用户名（直接 Enter 保持）: " selected
@@ -1022,28 +980,43 @@ configure_ssh_key() {
         SSH_USER="$selected"
     fi
 
-    local home_dir ssh_dir auth_keys public_key
-    home_dir="$(getent passwd "$SSH_USER" | cut -d: -f6)"
+    local home_dir ssh_dir auth_keys public_key normalized
+    home_dir="$(getent passwd "$SSH_USER" | cut -d: -f6 2>/dev/null || true)"
     [[ -n "$home_dir" ]] || home_dir="/root"
     ssh_dir="$home_dir/.ssh"
     auth_keys="$ssh_dir/authorized_keys"
-
+    echo "支持完整 OpenSSH 公钥，例如：ssh-ed25519 AAAA..."
+    echo "也支持仅粘贴 base64 密钥主体，例如：AAAA..."
     read -r -p "请粘贴 SSH 公钥: " public_key
-    public_key="$(printf '%s' "$public_key" | tr -d '\r\n')"
-
-    [[ -n "$public_key" ]] || { print_error "公钥不能为空。"; return 1; }
-    printf '%s\n' "$public_key" | grep -qE '^(ssh-rsa|ssh-ed25519|ecdsa-sha2-nistp|sk-ssh-ed25519|sk-ecdsa-sha2)-' || {
-        print_error "公钥格式无法识别。"
+    normalized="$(normalize_ssh_public_key "$public_key")" || {
+        print_error "公钥格式无法识别，请粘贴有效的 OpenSSH 公钥。"
         return 1
     }
 
-    mkdir -p "$ssh_dir"
-    chmod 700 "$ssh_dir"
-    [[ -f "$auth_keys" ]] && cp -a "$auth_keys" "$auth_keys.bak.$(date +%Y%m%d%H%M%S)"
-    printf '%s\n' "$public_key" >> "$auth_keys"
-    chmod 600 "$auth_keys"
-    [[ "$SSH_USER" == "root" ]] || chown -R "$SSH_USER:$SSH_USER" "$ssh_dir"
+    if command_exists ssh-keygen; then
+        local tmp_key
+        tmp_key="$(mktemp)"
+        printf '%s\n' "$normalized" > "$tmp_key"
+        if ! ssh-keygen -lf "$tmp_key" >/dev/null 2>&1; then
+            rm -f "$tmp_key"
+            print_error "公钥内容校验失败。"
+            return 1
+        fi
+        rm -f "$tmp_key"
+    fi
+
+    mkdir -p "$ssh_dir" || return 1
+    chmod 700 "$ssh_dir" || return 1
+    if [[ -f "$auth_keys" ]]; then
+        cp -a "$auth_keys" "$auth_keys.bak.$(date +%Y%m%d%H%M%S)" || return 1
+    fi
+    printf '%s\n' "$normalized" >> "$auth_keys" || return 1
+    chmod 600 "$auth_keys" || return 1
+    if [[ "$SSH_USER" != "root" ]]; then
+        chown -R "$SSH_USER:$SSH_USER" "$ssh_dir" || return 1
+    fi
     print_success "公钥已写入 $auth_keys"
+    print_info "识别结果：$(printf '%s' "$normalized" | awk '{print $1}')"
 }
 
 optimize_ssh_security() {
@@ -1068,7 +1041,7 @@ EOF
 
     if ! test_sshd_config || ! restart_ssh; then
         rm -f "$security_conf"
-        cp -a "$backup" "$SSHD_CONFIG"
+        restore_sshd_config_backup "$backup" || true
         restart_ssh >/dev/null 2>&1 || true
         print_error "SSH 安全配置失败，已回滚。"
         return 1
@@ -1083,12 +1056,12 @@ show_component_status() {
     local port
     port="$(get_ssh_port)"
 
-    echo -e "$CYAN系统信息$NC"
+    echo -e "${CYAN}系统信息${NC}"
     echo "  系统       : $OS_NAME $OS_VERSION"
     echo "  架构       : $(uname -m)"
     echo "  服务管理器 : $(service_manager)"
     echo ""
-    echo -e "$CYAN组件状态$NC"
+    echo -e "${CYAN}组件状态${NC}"
 
     if is_ssh_installed; then
         if is_ssh_running; then
@@ -1110,14 +1083,14 @@ show_component_status() {
 show_detailed_status() {
     print_banner
     show_component_status
-    echo -e "$CYANSSH 监听$NC"
+    echo -e "${CYAN}SSH 监听${NC}"
     if command_exists ss; then
         ss -lntp 2>/dev/null || true
     else
         echo "  未安装 ss。"
     fi
     echo ""
-    echo -e "$CYANUFW 规则$NC"
+    echo -e "${CYAN}UFW 规则${NC}"
     if is_ufw_installed; then
         ufw status verbose
         echo ""
