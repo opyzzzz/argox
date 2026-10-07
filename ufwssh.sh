@@ -1,8 +1,15 @@
 #!/bin/bash
 #
-# UFW + SSH 交互式管理工具 v4.6
+# UFW + SSH 交互式管理工具 v4.6.1
 # Debian/Ubuntu: apt + systemd
 # Alpine Linux:  apk + OpenRC
+#
+# v4.6.1 修复：
+#   - 脚本开头显式设置 PATH，确保 /sbin /usr/sbin 可见
+#     （解决 Alpine 上 doas/su 执行时 PATH 缺失导致 ss/ufw/sshd 找不到）
+#   - ssh_port_is_listening 改用 /proc/net/tcp 检测，不依赖 ss/netstat
+#     （解决 busybox/iproute2 差异、PATH 缺失导致的误判）
+#   - menu_ssh_port 查看端口保留 ss，但 PATH 已保障
 #
 # v4.6 变更：
 #   - 新增“删除 SSH 端口”功能（菜单 3 → SSH 端口管理 → 4）
@@ -34,11 +41,15 @@
 
 set -uo pipefail
 
+# 显式设置 PATH，确保 /sbin /usr/sbin 可见
+# （Alpine 上 doas/su 执行时 PATH 可能不含 /sbin）
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
+
 # ============================================================
 # 0. 常量
 # ============================================================
 
-SCRIPT_VERSION="v4.6"
+SCRIPT_VERSION="v4.6.1"
 SSHD_CONFIG="/etc/ssh/sshd_config"
 SSHD_CONFIG_DIR="/etc/ssh/sshd_config.d"
 UFW_DEFAULT="/etc/default/ufw"
@@ -671,13 +682,34 @@ ssh_config_restore_backup() {
     fi
 }
 
+# 端口监听检测：优先 /proc/net/tcp（不依赖 ss/netstat，不依赖 PATH）
+# 回退 ss / netstat（在 /proc 不可读的环境）
 ssh_port_is_listening() {
     local port="$1"
+    local hex_port
+    hex_port="$(printf '%04X' "$port")"
+
+    # 主检测：/proc/net/tcp + /proc/net/tcp6
+    if [[ -r /proc/net/tcp || -r /proc/net/tcp6 ]]; then
+        if awk -v hex="$hex_port" '
+            NR > 1 && $4 == "0A" {
+                split($2, a, ":")
+                if (toupper(a[2]) == hex) { found=1; exit }
+            }
+            END { exit(found ? 0 : 1) }
+        ' /proc/net/tcp /proc/net/tcp6 2>/dev/null; then
+            return 0
+        fi
+        # /proc 可读且明确未监听 → 直接返回 1，不再回退
+        return 1
+    fi
+
+    # 回退：/proc 不可读时用 ss / netstat
     if sys_command_exists ss; then
-        ss -lntH 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)$port$|\]:$port$" && return 0
+        ss -lnt 2>/dev/null | awk 'NR>1 {print $4}' | grep -Eq "(^|:)$port$|\]:$port$" && return 0
     fi
     if sys_command_exists netstat; then
-        netstat -lnt 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)$port$|\]:$port$" && return 0
+        netstat -lnt 2>/dev/null | awk 'NR>1 {print $4}' | grep -Eq "(^|:)$port$|\]:$port$" && return 0
     fi
     return 1
 }
@@ -1231,7 +1263,6 @@ ssh_remove_port() {
             fi
         done
         (( found == 1 )) || { ui_error "端口 $token 不在当前监听列表中。"; return 1; }
-        # 去重
         local dup=0
         local r
         for r in "${remove_list[@]}"; do
@@ -1290,7 +1321,6 @@ ssh_remove_port() {
 
     sleep 1
 
-    # 校验剩余端口全部生效
     local ok=1
     for p in "${remaining[@]}"; do
         if ! ssh_verify_port "$p"; then
@@ -1306,7 +1336,6 @@ ssh_remove_port() {
         return 1
     fi
 
-    # 删除被删端口的 UFW 规则
     local r
     for r in "${remove_list[@]}"; do
         ssh_ufw_remove_rule_one "$r"
@@ -1808,8 +1837,14 @@ menu_ssh_port() {
                 local port
                 while IFS= read -r port; do
                     [[ -n "$port" ]] || continue
-                    if sys_command_exists ss; then
-                        ss -lntp 2>/dev/null | grep -E ":${port}([[:space:]]|$)" || echo "  端口 $port 未监听"
+                    if ssh_port_is_listening "$port"; then
+                        if sys_command_exists ss; then
+                            ss -lntp 2>/dev/null | grep -E ":${port}([[:space:]]|$)" || echo "  端口 $port 已监听"
+                        else
+                            echo "  端口 $port 已监听"
+                        fi
+                    else
+                        echo "  端口 $port 未监听"
                     fi
                 done < <(ssh_config_ports_effective)
                 ui_pause
