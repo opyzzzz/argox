@@ -1,16 +1,21 @@
 #!/bin/bash
 #
-# UFW + SSH 交互式管理工具 v4.8
+# UFW + SSH 交互式管理工具 v4.8.1
 # Debian/Ubuntu: apt + systemd
 # Alpine Linux:  apk + OpenRC
 #
+# v4.8.1 修复：
+#   - 密码登录开关：改为直接修改 sshd_config 主文件
+#     （OpenSSH 实际是主文件先读、Include 后读，98-*.conf 会被覆盖）
+#     有生效行则替换第一个并注释其余；无则追加到末尾
+#   - ssh_detect_service：Debian 优先 ssh.service（sshd.service 是 alias）
+#   - ssh_change_port / ssh_key_configure：支持空输入跳过
+#   - install_quick_init：直接调函数，不再二次询问
+#     开头提示流程 + 一次确认，之后每步只打印进度
+#     步骤 5 自动判断：有公钥关闭密码登录，无公钥跳过
+#
 # v4.8 变更：
-#   - 组件安装菜单新增“快捷安装与配置”（菜单 4）
-#     步骤：装 SSH → 装 UFW → 改端口 → 配公钥 → 关密码 → 同步规则 → 启用 UFW
-#     每步可跳过；只做编排，所有操作调已有函数
-#     关闭密码登录前强制检查公钥，无公钥则拒绝
-#     端口/公钥/关密码失败继续，SSH/UFW 安装/同步/启用失败中止
-#     结束后显示总结
+#   - 新增“快捷安装与配置”（菜单 4）
 #
 # v4.7 变更：
 #   - 新增“密码登录开关”（SSH 服务管理 → 8）
@@ -23,7 +28,6 @@
 # v4.6 变更：
 #   - 新增“删除 SSH 端口”（菜单 3 → 4）
 #   - 不允许删到 0 个端口
-#   - 删除前确认，失败回滚
 #
 
 set -uo pipefail
@@ -34,7 +38,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH
 # 0. 常量
 # ============================================================
 
-SCRIPT_VERSION="v4.8"
+SCRIPT_VERSION="v4.8.1"
 SSHD_CONFIG="/etc/ssh/sshd_config"
 SSHD_CONFIG_DIR="/etc/ssh/sshd_config.d"
 UFW_DEFAULT="/etc/default/ufw"
@@ -43,8 +47,8 @@ DEFAULT_SSH_PORT=22
 MANAGED_BLOCK_BEGIN="# >>> ufwssh managed ports >>>"
 MANAGED_BLOCK_END="# <<< ufwssh managed ports <<<"
 ORIGINAL_PORT_PREFIX="# ufwssh: original Port"
+PASSWORD_AUTH_MARKER="# Managed by ufwssh: PasswordAuthentication"
 
-PASSWORD_AUTH_CONF="$SSHD_CONFIG_DIR/98-ufwssh-password-auth.conf"
 SECURITY_CONF="$SSHD_CONFIG_DIR/99-ufwssh-security.conf"
 
 SOURCE_BACKUP_ROOT="/etc/ufwssh/source-backups"
@@ -161,6 +165,8 @@ ssh_detect_service() {
     SSH_SERVICE=""
     case "$OS_TYPE" in
         debian)
+            # Debian 12 主 unit 是 ssh.service，sshd.service 是 alias
+            # 优先 ssh.service，没有则回退 sshd.service
             if systemctl list-unit-files 2>/dev/null | grep -q '^ssh\.service'; then
                 SSH_SERVICE="ssh"
             elif systemctl list-unit-files 2>/dev/null | grep -q '^sshd\.service'; then
@@ -1035,7 +1041,11 @@ ssh_change_port() {
     echo "当前 SSH 端口：$(ssh_config_ports_text)"
 
     local new_port
-    read -r -p "新的 SSH 端口（1-65535）: " new_port
+    read -r -p "新的 SSH 端口（1-65535，Enter 跳过）: " new_port
+    if [[ -z "$new_port" ]]; then
+        ui_info "跳过修改端口。"
+        return 0
+    fi
     if ! [[ "$new_port" =~ ^[0-9]+$ ]] || (( new_port < 1 || new_port > 65535 )); then
         ui_error "端口号无效。"
         return 1
@@ -1377,7 +1387,11 @@ ssh_key_configure() {
     auth_keys="$ssh_dir/authorized_keys"
     echo "支持完整 OpenSSH 公钥，例如：ssh-ed25519 AAAA..."
     echo "也支持仅粘贴 base64 密钥主体，例如：AAAA..."
-    read -r -p "请粘贴 SSH 公钥: " public_key
+    read -r -p "请粘贴 SSH 公钥（Enter 跳过）: " public_key
+    if [[ -z "$public_key" ]]; then
+        ui_info "跳过配置公钥。"
+        return 0
+    fi
     normalized="$(ssh_key_normalize "$public_key")" || {
         ui_error "公钥格式无法识别，请粘贴有效的 OpenSSH 公钥。"
         return 1
@@ -1445,6 +1459,8 @@ EOF
     ui_success "SSH 基础安全配置已应用。"
 }
 
+# ---- 密码登录开关（直接改主文件） ----
+
 ssh_password_auth_is_enabled() {
     ssh_is_installed || return 1
     local value
@@ -1480,6 +1496,8 @@ ssh_password_auth_has_pubkey() {
     return 1
 }
 
+# 直接修改 sshd_config 主文件的 PasswordAuthentication
+# $1 = yes / no
 ssh_password_auth_set() {
     local enabled="$1"
     ssh_is_installed || { ui_error "SSH 尚未安装。"; return 1; }
@@ -1490,26 +1508,51 @@ ssh_password_auth_set() {
     }
 
     ssh_config_ensure || return 1
-    ssh_config_ensure_include || return 1
-    mkdir -p "$SSHD_CONFIG_DIR" || return 1
 
     local backup
     backup="$(ssh_config_backup)" || { ui_error "无法备份 SSH 配置。"; return 1; }
 
-    cat > "$PASSWORD_AUTH_CONF" <<EOF
-# Managed by ufwssh
-PasswordAuthentication $enabled
-EOF
+    # 判断主文件里是否已有生效的 PasswordAuthentication 行
+    if grep -qE '^[[:space:]]*PasswordAuthentication[[:space:]]+' "$SSHD_CONFIG"; then
+        # 替换第一个生效行，注释其余生效行
+        # 用 awk：第一次遇到生效行改为目标值，后续生效行注释
+        awk -v enabled="$enabled" '
+            BEGIN { done=0 }
+            /^[[:space:]]*PasswordAuthentication[[:space:]]+/ {
+                if (done == 0) {
+                    # 保留前导空白，替换值
+                    match($0, /^[[:space:]]*/)
+                    lead = substr($0, 1, RLENGTH)
+                    print lead "PasswordAuthentication " enabled
+                    done = 1
+                } else {
+                    print "#" $0
+                }
+                next
+            }
+            { print }
+        ' "$SSHD_CONFIG" > "$SSHD_CONFIG.tmp" && mv "$SSHD_CONFIG.tmp" "$SSHD_CONFIG" || {
+            rm -f "$SSHD_CONFIG.tmp"
+            ssh_config_restore_backup "$backup" || true
+            ui_error "写入 PasswordAuthentication 失败，已恢复。"
+            return 1
+        }
+    else
+        # 主文件没有生效行，追加到末尾
+        printf '\n%s\nPasswordAuthentication %s\n' "$PASSWORD_AUTH_MARKER" "$enabled" >> "$SSHD_CONFIG" || {
+            ssh_config_restore_backup "$backup" || true
+            ui_error "追加 PasswordAuthentication 失败，已恢复。"
+            return 1
+        }
+    fi
 
     if ! ssh_config_test; then
-        rm -f "$PASSWORD_AUTH_CONF"
         ssh_config_restore_backup "$backup" || true
         ui_error "SSH 配置语法检查失败，已恢复。"
         return 1
     fi
 
     if ! ssh_restart; then
-        rm -f "$PASSWORD_AUTH_CONF"
         ssh_config_restore_backup "$backup" || true
         ssh_restart >/dev/null 2>&1 || true
         ui_error "SSH 重启失败，已恢复。"
@@ -1521,7 +1564,6 @@ EOF
     local actual
     actual="$(sshd -T 2>/dev/null | awk '$1 == "passwordauthentication" {print $2; exit}')"
     if [[ "$actual" != "$enabled" ]]; then
-        rm -f "$PASSWORD_AUTH_CONF"
         ssh_config_restore_backup "$backup" || true
         ssh_restart >/dev/null 2>&1 || true
         ui_error "密码登录设置未生效（当前：$actual），已恢复。"
@@ -1755,9 +1797,9 @@ install_quick_init() {
     echo "即将执行："
     echo "  1. 安装/修复 SSH"
     echo "  2. 安装/修复 UFW"
-    echo "  3. 修改 SSH 端口（可选）"
-    echo "  4. 配置 SSH 公钥（可选）"
-    echo "  5. 关闭密码登录（可选，需已配公钥）"
+    echo "  3. 修改 SSH 端口（Enter 跳过）"
+    echo "  4. 配置 SSH 公钥（Enter 跳过）"
+    echo "  5. 关闭密码登录（已配公钥则自动关闭，否则跳过）"
     echo "  6. 同步 SSH UFW 规则（limit）"
     echo "  7. 启用 UFW"
     echo ""
@@ -1779,35 +1821,23 @@ install_quick_init() {
 
     echo ""
     echo "[3/7] 修改 SSH 端口..."
-    if ui_confirm "      是否修改 SSH 端口？"; then
-        ssh_change_port || ui_warning "      端口修改失败，继续后续步骤。"
-    else
-        echo "      跳过。"
-    fi
+    ssh_change_port || ui_warning "端口修改失败，继续后续步骤。"
 
     echo ""
     echo "[4/7] 配置 SSH 公钥..."
-    if ui_confirm "      是否配置 SSH 公钥？"; then
-        ssh_key_configure || ui_warning "      公钥配置失败，继续后续步骤。"
-    else
-        echo "      跳过。"
-    fi
+    ssh_key_configure || ui_warning "公钥配置失败，继续后续步骤。"
 
     echo ""
     echo "[5/7] 关闭密码登录..."
-    if ui_confirm "      是否关闭密码登录？"; then
-        if ! ssh_password_auth_has_pubkey; then
-            ui_error "      未检测到任何用户配置了 SSH 公钥。"
-            ui_info "      关闭密码登录后你将无法登录，跳过。"
+    if ssh_password_auth_has_pubkey; then
+        echo "      已检测到公钥，正在关闭..."
+        if ssh_password_auth_set "no"; then
+            ui_success "      密码登录已关闭。"
         else
-            if ssh_password_auth_set "no"; then
-                ui_success "      密码登录已关闭。"
-            else
-                ui_warning "      关闭失败，保持现状。"
-            fi
+            ui_warning "      关闭失败，保持现状。"
         fi
     else
-        echo "      跳过。"
+        echo "      未检测到公钥，跳过。"
     fi
 
     echo ""
