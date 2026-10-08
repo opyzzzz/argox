@@ -5,7 +5,7 @@ wget -O /usr/local/bin/argo https://raw.githubusercontent.com/opyzzzz/argox/refs
 `````
 ufwssh
 `````
-bash <(curl -fsSL https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/ufwssh.sh)
+curl -fsSL https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/ufwssh.sh | bash
 `````
 docker+komari+sublinkpro+cf隧道
 `````
