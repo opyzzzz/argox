@@ -5,8 +5,17 @@ wget -O /usr/local/bin/argo https://raw.githubusercontent.com/opyzzzz/argox/refs
 `````
 ufwssh
 `````
-curl -fsSL https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/ufwssh.sh | bash
+curl -fsSL -o /tmp/ufwssh.sh https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/ufwssh.sh && bash /tmp/ufwssh.sh && rm -f /tmp/ufwssh.sh
 `````
+ufwssh-jsdelivr-cdn
+`````
+curl -fsSL https://cdn.jsdelivr.net/gh/opyzzzz/argox@main/ufwssh.sh | bash
+`````
+
+
+
+
+
 docker+komari+sublinkpro+cf隧道
 `````
 curl -fsSL https://raw.githubusercontent.com/opyzzzz/argox/refs/heads/main/KSC-docker.sh -o /tmp/ksc.sh && bash /tmp/ksc.sh && rm -f /tmp/ksc.sh
