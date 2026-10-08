@@ -1,15 +1,25 @@
 #!/bin/bash
 #
-# UFW + SSH 交互式管理工具 v4.8.2
+# UFW + SSH 交互式管理工具 v4.8.3
 # Debian/Ubuntu: apt + systemd
 # Alpine Linux:  apk + OpenRC
 #
-# v4.8.2 修复：
-#   - 密码登录开关：改用 Match All 块覆盖全局（写入 sshd_config 主文件末尾）
-#     根因：sshd_config.d/00-*.conf 字母序最靠前，其 PasswordAuthentication 覆盖一切
-#     Match All 块是最终覆盖，不受 first-match wins 限制
-#     同时清理主文件里已有的裸 PasswordAuthentication 行（注释为 original）
-#   - 管理块标记：MANAGED_PW_BEGIN / MANAGED_PW_END
+# v4.8.3 修复：
+#   - P0: ssh_password_auth_original_comment 跳过 Match 块
+#        只注释第一个 Match 之前的裸 PasswordAuthentication 行
+#        避免误注释用户已有 Match 块内的 PasswordAuthentication
+#        $line 加 local
+#   - P0: ssh_password_auth_has_pubkey 检查 authorized_keys 权限
+#        权限非 600/400 时打印警告，视为不可用公钥
+#   - P1: ssh_optimize_security 检查 sshd_config.d/ 中字母序在 99 之前的
+#        文件是否包含冲突指令，警告用户本脚本配置可能不生效
+#   - P2: ssh_config_ports_managed_write 加前导 \n，避免与主文件末尾紧贴
+#   - P2: install_quick_init 的 [5/7] 先检查密码登录当前状态
+#
+# v4.8.2 变更：
+#   - 密码登录开关改用 Match All 块覆盖全局
+#   - 管理块标记 MANAGED_PW_BEGIN / MANAGED_PW_END
+#   - 清理主文件里已有的裸 PasswordAuthentication 行
 #
 # v4.8.1 变更：
 #   - 密码登录开关：改为直接修改 sshd_config 主文件（已废弃，改用 Match All）
@@ -41,7 +51,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH
 # 0. 常量
 # ============================================================
 
-SCRIPT_VERSION="v4.8.2"
+SCRIPT_VERSION="v4.8.3"
 SSHD_CONFIG="/etc/ssh/sshd_config"
 SSHD_CONFIG_DIR="/etc/ssh/sshd_config.d"
 UFW_DEFAULT="/etc/default/ufw"
@@ -792,7 +802,7 @@ ssh_config_ports_managed_write() {
     ssh_config_ports_managed_remove || return 1
 
     {
-        printf '%s\n' "$MANAGED_BLOCK_BEGIN"
+        printf '\n%s\n' "$MANAGED_BLOCK_BEGIN"
         for port in "$@"; do
             [[ "$port" =~ ^[0-9]+$ ]] || continue
             printf 'Port %s\n' "$port"
@@ -1431,6 +1441,31 @@ ssh_optimize_security() {
     ssh_config_ensure || return 1
     ssh_config_ensure_include || return 1
 
+    # 检查 sshd_config.d/ 中字母序在 99 之前的文件是否包含冲突指令
+    if [[ -d "$SSHD_CONFIG_DIR" ]]; then
+        local conflict_files=()
+        local d base
+        for d in "$SSHD_CONFIG_DIR"/*.conf; do
+            [[ -f "$d" ]] || continue
+            [[ "$d" == "$SECURITY_CONF" ]] && continue
+            base="$(basename "$d")"
+            # 只检查字母序在 "99-" 之前的文件
+            [[ "$base" < "99-" ]] || continue
+            if grep -qE '^[[:space:]]*(PubkeyAuthentication|PermitEmptyPasswords|MaxAuthTries|X11Forwarding|ChallengeResponseAuthentication|KbdInteractiveAuthentication|KerberosAuthentication|GSSAPIAuthentication)[[:space:]]' "$d"; then
+                conflict_files+=( "$d" )
+            fi
+        done
+        if (( ${#conflict_files[@]} > 0 )); then
+            ui_warning "以下文件包含与安全配置冲突的指令（字母序在 99 之前，会覆盖本脚本配置）："
+            local f
+            for f in "${conflict_files[@]}"; do
+                ui_warning "  $f"
+            done
+            ui_info "本脚本写入的 99-ufwssh-security.conf 部分指令可能不生效。"
+            ui_info "如需强制生效，可手动检查上述文件。"
+        fi
+    fi
+
     local backup
     backup="$(ssh_config_backup)" || return 1
     mkdir -p "$SSHD_CONFIG_DIR"
@@ -1472,7 +1507,8 @@ ssh_password_auth_is_enabled() {
 }
 
 ssh_password_auth_has_pubkey() {
-    local user home auth_keys
+    local user home auth_keys perm
+    local found_bad_perm=0
     local -a users=()
 
     users+=( "root" )
@@ -1492,14 +1528,23 @@ ssh_password_auth_has_pubkey() {
         home="$(getent passwd "$user" | cut -d: -f6 2>/dev/null || true)"
         [[ -n "$home" ]] || continue
         auth_keys="$home/.ssh/authorized_keys"
-        if [[ -s "$auth_keys" ]]; then
-            return 0
-        fi
+        [[ -s "$auth_keys" ]] || continue
+
+        perm="$(stat -c '%a' "$auth_keys" 2>/dev/null || echo "")"
+        case "$perm" in
+            600|400)
+                return 0
+                ;;
+            *)
+                ui_warning "公钥权限不正确（$perm）：$auth_keys（应为 600 或 400）"
+                found_bad_perm=1
+                ;;
+        esac
     done
+    (( found_bad_perm == 1 )) && return 1
     return 1
 }
 
-# 删除主文件里已有的 ufwssh 密码管理块
 ssh_password_auth_block_remove() {
     if grep -qF "$MANAGED_PW_BEGIN" "$SSHD_CONFIG"; then
         awk -v begin="$MANAGED_PW_BEGIN" -v end="$MANAGED_PW_END" '
@@ -1517,11 +1562,14 @@ ssh_password_auth_block_remove() {
 }
 
 # 注释主文件里已有的裸 PasswordAuthentication 行
+# 只处理第一个 Match 块之前的行，避免误伤 Match 块内配置
 ssh_password_auth_original_comment() {
+    local line
     local changed=0
 
-    # 第一遍：检查是否有需要注释的行
+    # 第一遍：检查第一个 Match 之前是否有裸 PasswordAuthentication 行
     while IFS= read -r line; do
+        [[ "$line" =~ ^[[:space:]]*Match[[:space:]] ]] && break
         [[ "$line" == "$ORIGINAL_PW_PREFIX"* ]] && continue
         [[ "$line" =~ ^[[:space:]]*# ]] && continue
         if [[ "$line" =~ ^[[:space:]]*PasswordAuthentication[[:space:]]+ ]]; then
@@ -1531,9 +1579,11 @@ ssh_password_auth_original_comment() {
     done < "$SSHD_CONFIG"
     (( changed == 0 )) && return 0
 
-    # 第二遍：注释生效行
+    # 第二遍：只注释第一个 Match 之前的裸行
     awk -v prefix="$ORIGINAL_PW_PREFIX" '
-        /^[[:space:]]*PasswordAuthentication[[:space:]]+/ {
+        BEGIN { in_match=0 }
+        /^[[:space:]]*Match[[:space:]]/ { in_match=1 }
+        !in_match && /^[[:space:]]*PasswordAuthentication[[:space:]]+/ {
             line=$0
             match(line, /^[[:space:]]*/); lead=substr(line, 1, RLENGTH)
             print lead prefix " " substr(line, RLENGTH+1)
@@ -1547,7 +1597,6 @@ ssh_password_auth_original_comment() {
     return 0
 }
 
-# 写入 Match All 块
 ssh_password_auth_write_block() {
     local enabled="$1"
 
@@ -1561,8 +1610,6 @@ ssh_password_auth_write_block() {
     return 0
 }
 
-# 设置密码登录
-# $1 = yes / no
 ssh_password_auth_set() {
     local enabled="$1"
     ssh_is_installed || { ui_error "SSH 尚未安装。"; return 1; }
@@ -1577,35 +1624,30 @@ ssh_password_auth_set() {
     local backup
     backup="$(ssh_config_backup)" || { ui_error "无法备份 SSH 配置。"; return 1; }
 
-    # 1. 删除旧管理块
     if ! ssh_password_auth_block_remove; then
         ssh_config_restore_backup "$backup" || true
         ui_error "删除旧管理块失败，已恢复。"
         return 1
     fi
 
-    # 2. 注释已有的裸 PasswordAuthentication 行
     if ! ssh_password_auth_original_comment; then
         ssh_config_restore_backup "$backup" || true
         ui_error "注释原有 PasswordAuthentication 行失败，已恢复。"
         return 1
     fi
 
-    # 3. 写入新管理块
     if ! ssh_password_auth_write_block "$enabled"; then
         ssh_config_restore_backup "$backup" || true
         ui_error "写入管理块失败，已恢复。"
         return 1
     fi
 
-    # 4. 语法检查
     if ! ssh_config_test; then
         ssh_config_restore_backup "$backup" || true
         ui_error "SSH 配置语法检查失败，已恢复。"
         return 1
     fi
 
-    # 5. 重启
     if ! ssh_restart; then
         ssh_config_restore_backup "$backup" || true
         ssh_restart >/dev/null 2>&1 || true
@@ -1615,7 +1657,6 @@ ssh_password_auth_set() {
 
     sleep 1
 
-    # 6. 验证
     local actual
     actual="$(sshd -T 2>/dev/null | awk '$1 == "passwordauthentication" {print $2; exit}')"
     if [[ "$actual" != "$enabled" ]]; then
@@ -1674,7 +1715,7 @@ ssh_password_auth_menu() {
                     continue
                 fi
                 if ! ssh_password_auth_has_pubkey; then
-                    ui_error "未检测到任何用户配置了 SSH 公钥。"
+                    ui_error "未检测到任何用户配置了有效 SSH 公钥（权限需为 600 或 400）。"
                     ui_info "关闭密码登录后你将无法登录。"
                     ui_info "请先用「配置 SSH 公钥」添加公钥。"
                     ui_pause
@@ -1882,7 +1923,9 @@ install_quick_init() {
 
     echo ""
     echo "[5/7] 关闭密码登录..."
-    if ssh_password_auth_has_pubkey; then
+    if ! ssh_password_auth_is_enabled; then
+        echo "      密码登录已关闭，跳过。"
+    elif ssh_password_auth_has_pubkey; then
         echo "      已检测到公钥，正在关闭..."
         if ssh_password_auth_set "no"; then
             ui_success "      密码登录已关闭。"
@@ -1890,7 +1933,7 @@ install_quick_init() {
             ui_warning "      关闭失败，保持现状。"
         fi
     else
-        echo "      未检测到公钥，跳过。"
+        echo "      未检测到有效公钥，跳过。"
     fi
 
     echo ""
