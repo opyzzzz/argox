@@ -1,10 +1,10 @@
 #!/bin/bash
 #
-# UFW + SSH 交互式管理工具 v4.8.3
+# UFW + SSH 交互式管理工具 v4.8.3.1
 # Debian/Ubuntu: apt + systemd
 # Alpine Linux:  apk + OpenRC
 #
-# v4.8.3 修复：
+# v4.8.3.1 修复：
 #   - P0: ssh_password_auth_original_comment 跳过 Match 块
 #        只注释第一个 Match 之前的裸 PasswordAuthentication 行
 #        避免误注释用户已有 Match 块内的 PasswordAuthentication
@@ -51,7 +51,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH
 # 0. 常量
 # ============================================================
 
-SCRIPT_VERSION="v4.8.3"
+SCRIPT_VERSION="v4.8.3.1"
 SSHD_CONFIG="/etc/ssh/sshd_config"
 SSHD_CONFIG_DIR="/etc/ssh/sshd_config.d"
 UFW_DEFAULT="/etc/default/ufw"
@@ -89,7 +89,7 @@ DEFAULT_SSH_USER="root"
 # ============================================================
 
 ui_print_banner() {
-    clear 2>/dev/null || true
+    printf '\033[H\033[2J' 2>/dev/null || true
     echo -e "$GREEN============================================================$NC"
     echo -e "$GREEN             UFW + SSH 管理工具 $SCRIPT_VERSION$NC"
     echo -e "$GREEN============================================================$NC"
